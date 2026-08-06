@@ -1,5 +1,17 @@
 """Deterministic evidence models for generic portal scraping."""
 
+from scraper.artifact_store import (
+    AppendReceipt,
+    ArtifactStore,
+    ArtifactStoreError,
+    RecordStream,
+    StoreAlreadyExistsError,
+    StoreCheckpoint,
+    StoreIntegrityError,
+    StoreIntegrityReport,
+    StoreNotFoundError,
+    StreamPosition,
+)
 from scraper.models import (
     ActionCandidate,
     ActionKind,
@@ -26,6 +38,9 @@ __all__ = [
     "ActionRisk",
     "ActionStatus",
     "ArtifactReference",
+    "AppendReceipt",
+    "ArtifactStore",
+    "ArtifactStoreError",
     "BrowserEvent",
     "BrowserEventKind",
     "CapturePolicy",
@@ -35,7 +50,14 @@ __all__ = [
     "FrameSnapshot",
     "InteractionTransition",
     "NetworkExchange",
+    "RecordStream",
     "ScrapeRun",
     "ScrapeRunStatus",
     "StateSnapshot",
+    "StoreAlreadyExistsError",
+    "StoreCheckpoint",
+    "StoreIntegrityError",
+    "StoreIntegrityReport",
+    "StoreNotFoundError",
+    "StreamPosition",
 ]

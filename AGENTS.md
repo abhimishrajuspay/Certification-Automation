@@ -6,9 +6,10 @@ Build a deterministic, scraping-first automation pipeline for generic CZ
 portals. The browser crawler must collect auditable evidence before any LLM,
 repository retrieval, MCP, testcase synthesis, or Postman generation occurs.
 
-## Active phase
+## Active foundation
 
-Phase 1 is the immutable evidence contract in `scraper/models.py`.
+Phase 1 is the immutable evidence contract in `scraper/models.py`. Phase 2 is
+the append-only, content-addressed store in `scraper/artifact_store.py`.
 
 Active code must not import from `.deprecated/`. The local legacy archive is
 for recovery and comparison only and is intentionally ignored by Git.
@@ -20,6 +21,9 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Evidence models are frozen, reject unknown fields, and use tuple collections.
 - Timestamps must be timezone-aware.
 - Large evidence is represented by content-addressed artifact references.
+- Structured evidence is persisted in homogeneous sequence-checked JSONL
+  streams; blobs are immutable and addressed by SHA-256.
+- Only manifests and checkpoints may use atomic replacement.
 - Plaintext secrets must never be retained in values marked as redacted.
 - The crawl graph and future testcase dependency graph are separate concepts.
 - Browser collection remains deterministic and LLM-free.
@@ -27,9 +31,9 @@ for recovery and comparison only and is intentionally ignored by Git.
 
 ## Validation
 
-- Focused tests: `venv/bin/python3 -m pytest -q tests/test_models.py`
+- Focused tests: `venv/bin/python3 -m pytest -q tests`
 - Compile check:
-  `venv/bin/python3 -m py_compile scraper/models.py scraper/__init__.py tests/test_models.py`
+  `venv/bin/python3 -m py_compile scraper/models.py scraper/artifact_store.py scraper/__init__.py`
 - Full checks when development tools are installed: `black --check .`,
   `flake8 .`, and `mypy .`
 

@@ -81,6 +81,16 @@ def test_sensitive_values_and_artifact_paths_are_guarded() -> None:
             byte_size=1,
         )
 
+    with pytest.raises(ValidationError, match="POSIX separators"):
+        ArtifactReference(
+            artifact_id="windows-escape",
+            kind=ArtifactKind.DOM,
+            relative_path="..\\outside.html",
+            sha256=SHA256,
+            media_type="text/html",
+            byte_size=1,
+        )
+
 
 def test_state_snapshot_round_trips_without_losing_types() -> None:
     artifact = make_artifact()
@@ -200,6 +210,29 @@ def test_terminal_run_requires_auditable_completion() -> None:
         ScrapeRun(
             run_id="run-2",
             root_url="https://other.example.test/start",
+            allowed_origins=("https://portal.example.test",),
+        )
+
+
+def test_urls_and_timestamps_are_normalized_without_leaking_credentials() -> None:
+    india = timezone(timedelta(hours=5, minutes=30))
+    run = ScrapeRun(
+        run_id="run-1",
+        root_url="https://PORTAL.Example.Test/start",
+        allowed_origins=("https://portal.example.test/",),
+        status=ScrapeRunStatus.RUNNING,
+        started_at=datetime(2026, 8, 6, 12, 30, tzinfo=india),
+    )
+
+    assert run.allowed_origins == ("https://portal.example.test",)
+    assert run.started_at == NOW
+    assert run.started_at is not None
+    assert run.started_at.tzinfo == timezone.utc
+
+    with pytest.raises(ValidationError, match="embedded credentials"):
+        ScrapeRun(
+            run_id="run-secret",
+            root_url="https://user:password@portal.example.test/start",
             allowed_origins=("https://portal.example.test",),
         )
 

@@ -229,8 +229,10 @@ class ArtifactReference(EvidenceModel):
     def validate_relative_path(cls, value: str) -> str:
         """Keep artifacts inside their run directory."""
 
+        if "\\" in value:
+            raise ValueError("artifact paths must use POSIX separators")
         path = PurePosixPath(value)
-        if path.is_absolute() or ".." in path.parts:
+        if path.is_absolute() or ".." in path.parts or str(path) in {"", "."}:
             raise ValueError("artifact path must be relative and cannot contain '..'")
         return str(path)
 
@@ -566,7 +568,6 @@ class ScrapeRun(EvidenceModel):
     transition_ids: tuple[str, ...] = ()
     checkpoint_sequence: int = Field(default=0, ge=0)
     completion_reason: Optional[str] = None
-    manifest_artifact: Optional[ArtifactReference] = None
 
     @field_validator("root_url")
     @classmethod
@@ -600,13 +601,14 @@ class ScrapeRun(EvidenceModel):
             raise ValueError("running scrape runs require started_at")
         if self.status in terminal:
             if self.started_at is None or self.ended_at is None:
-                raise ValueError("terminal scrape runs require start and end timestamps")
+                raise ValueError(
+                    "terminal scrape runs require start and end timestamps"
+                )
             if not self.completion_reason:
                 raise ValueError("terminal scrape runs require a completion_reason")
         if self.started_at and self.ended_at and self.ended_at < self.started_at:
             raise ValueError("ended_at cannot precede started_at")
-        parsed_root = urlparse(self.root_url)
-        root_origin = f"{parsed_root.scheme}://{parsed_root.netloc}"
+        root_origin = _origin_from_url(self.root_url)
         if root_origin not in self.allowed_origins:
             raise ValueError("root_url origin must be included in allowed_origins")
         if len(self.state_ids) != len(set(self.state_ids)):
@@ -662,11 +664,11 @@ class CoverageReport(EvidenceModel):
 
 
 def _require_aware_datetime(value: datetime) -> datetime:
-    """Reject ambiguous timestamps so action ordering remains deterministic."""
+    """Reject ambiguous timestamps and normalize valid values to UTC."""
 
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamps must include timezone information")
-    return value
+    return value.astimezone(timezone.utc)
 
 
 def _require_http_url(value: str, field_name: str) -> str:
@@ -675,6 +677,8 @@ def _require_http_url(value: str, field_name: str) -> str:
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError(f"{field_name} must be an absolute HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"{field_name} must not contain embedded credentials")
     return value
 
 
@@ -684,9 +688,23 @@ def _require_origin(value: str) -> str:
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("allowed origins must be absolute HTTP(S) origins")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("allowed origins must not contain embedded credentials")
     if parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment:
         raise ValueError("allowed origins cannot contain paths, queries, or fragments")
-    return f"{parsed.scheme}://{parsed.netloc}"
+    return _origin_from_url(value)
+
+
+def _origin_from_url(value: str) -> str:
+    """Return a canonical, credential-free origin for an HTTP(S) URL."""
+
+    parsed = urlparse(value)
+    hostname = parsed.hostname
+    if hostname is None:
+        raise ValueError("URL must contain a hostname")
+    host = f"[{hostname.lower()}]" if ":" in hostname else hostname.lower()
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return f"{parsed.scheme.lower()}://{host}{port}"
 
 
 __all__ = [
