@@ -13,6 +13,7 @@ from scraper.models import (
     ActionRisk,
     ActionStatus,
     CapturePolicy,
+    ElementContext,
     ElementSnapshot,
     FrameSnapshot,
     LocatorCandidate,
@@ -35,6 +36,7 @@ def _element(
     tag: str = "button",
     role: str = "button",
     name: str,
+    title: str | None = None,
     visible: bool = True,
     enabled: bool = True,
     attributes: tuple[ValueCapture, ...] = (),
@@ -44,6 +46,7 @@ def _element(
     interaction_signals: tuple[str, ...] | None = None,
     css_path: str | None = None,
     parent_css_path: str | None = None,
+    row_label: str | None = None,
 ) -> ElementSnapshot:
     signals = interaction_signals or (f"role:{role}",)
     locators = (
@@ -65,6 +68,7 @@ def _element(
         tag=tag,
         role=role,
         accessible_name=name,
+        title=title,
         input_type=input_type,
         attributes=attributes,
         interactive=True,
@@ -75,6 +79,7 @@ def _element(
         options=options,
         locators=locators,
         parent_css_path=parent_css_path,
+        context=ElementContext(row_label=row_label),
     )
 
 
@@ -255,6 +260,108 @@ async def test_authentication_and_structural_submit_actions_require_review(
     assert candidates["login"].status == ActionStatus.SKIPPED
     assert candidates["unnamed-submit"].risk == ActionRisk.REVIEW_REQUIRED
     assert candidates["unnamed-submit"].policy_rule == "form.submit_requires_review"
+
+
+@pytest.mark.asyncio
+async def test_test_execution_requires_review_but_navigation_and_details_are_safe(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore.create(
+        tmp_path / "crawls",
+        ScrapeRun(
+            run_id="test-control-safety",
+            root_url="https://portal.test/start",
+            allowed_origins=("https://portal.test",),
+        ),
+    )
+    elements = (
+        _element(
+            "category",
+            tag="a",
+            role="link",
+            name="▶",
+            title="Test",
+            attributes=(
+                ValueCapture(name="href", value="/TestCases/Cases?api=BillFetch"),
+            ),
+        ),
+        _element(
+            "execute",
+            tag="button",
+            role="button",
+            name="▶",
+            title="Test",
+            input_type="button",
+        ),
+        _element(
+            "details",
+            tag="a",
+            role="link",
+            name="i",
+            title="Test case details",
+            attributes=(ValueCapture(name="href", value="#"),),
+        ),
+    )
+
+    planned = await ActionPlanner(store).plan(_capture(store, elements))
+    candidates = {item.element.element_id: item.candidate for item in planned}
+
+    assert candidates["category"].risk == ActionRisk.SAFE
+    assert candidates["category"].status == ActionStatus.PENDING
+    assert candidates["execute"].risk == ActionRisk.REVIEW_REQUIRED
+    assert candidates["execute"].status == ActionStatus.SKIPPED
+    assert candidates["execute"].policy_rule == "semantic.review.test_execution"
+    assert candidates["details"].risk == ActionRisk.SAFE
+    assert candidates["details"].status == ActionStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_table_row_observations_are_planned_before_navigation(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore.create(
+        tmp_path / "crawls",
+        ScrapeRun(
+            run_id="observation-priority",
+            root_url="https://portal.test/start",
+            allowed_origins=("https://portal.test",),
+        ),
+    )
+    elements = (
+        _element(
+            "unrelated-listener",
+            tag="div",
+            role="button",
+            name="Toggle sidebar",
+            interaction_signals=("listener:click",),
+        ),
+        _element(
+            "next-page",
+            tag="a",
+            role="link",
+            name="Next",
+            attributes=(ValueCapture(name="href", value="/cases?page=2"),),
+        ),
+        _element(
+            "row-details",
+            tag="a",
+            role="link",
+            name="Information",
+            attributes=(ValueCapture(name="href", value="#"),),
+            # Many portals use a delegated listener on the table instead of a
+            # listener attached directly to each details anchor.
+            interaction_signals=("native-control", "role:link"),
+            row_label="case-1",
+        ),
+    )
+
+    planned = await ActionPlanner(store).plan(_capture(store, elements))
+
+    assert [item.element.element_id for item in planned] == [
+        "row-details",
+        "next-page",
+        "unrelated-listener",
+    ]
 
 
 @pytest.mark.asyncio

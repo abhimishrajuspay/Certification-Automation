@@ -584,7 +584,6 @@ class PageStateExtractor:
             scroll=scroll,
             frames=raw_frames,
             elements=all_elements,
-            active_element_id=active_element_id,
             storage_fingerprint=storage_fingerprint,
             stable=stable,
         )
@@ -1338,7 +1337,6 @@ class PageStateExtractor:
         scroll: ScrollPosition,
         frames: tuple[_RawFrame, ...],
         elements: list[ElementSnapshot],
-        active_element_id: Optional[str],
         storage_fingerprint: Optional[str],
         stable: bool,
     ) -> str:
@@ -1411,7 +1409,6 @@ class PageStateExtractor:
                 }
                 for element in elements
             ],
-            "active_element_id": active_element_id,
             "storage_fingerprint": storage_fingerprint,
             "stable": stable,
         }

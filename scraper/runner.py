@@ -381,6 +381,7 @@ class CrawlRunner:
             action=ActionBehaviorPolicy(
                 blocked_keywords=action.blocked_keywords,
                 review_keywords=action.review_keywords,
+                execution_control_keywords=action.execution_control_keywords,
                 allow_hidden_actions=action.allow_hidden_actions,
                 allow_disabled_actions=action.allow_disabled_actions,
                 include_hover_actions=action.include_hover_actions,

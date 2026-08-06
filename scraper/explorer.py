@@ -28,6 +28,7 @@ from scraper.models import (
     BrowserEvent,
     BrowserEventKind,
     CoverageReport,
+    EffectKind,
     InteractionTransition,
     ScrapeRunStatus,
     utc_now,
@@ -152,6 +153,8 @@ class StateGraphExplorer:
         frontier: deque[_GraphNode] = deque(
             [_GraphNode(capture=root_capture, path=(), depth=0)]
         )
+        navigation_frontier: deque[_GraphNode] = deque()
+        observation_frontier: deque[_GraphNode] = deque()
         completion_reason = "frontier exhausted"
         runtime_limited = False
         attempted_actions = 0
@@ -159,13 +162,18 @@ class StateGraphExplorer:
         deadline = loop.time() + self.limits.maximum_runtime_seconds
 
         try:
-            while frontier:
+            while observation_frontier or navigation_frontier or frontier:
                 if loop.time() >= deadline:
                     completion_reason = "maximum runtime reached"
                     ledger.limitations.add(completion_reason)
                     runtime_limited = True
                     break
-                node = frontier.popleft()
+                if observation_frontier:
+                    node = observation_frontier.popleft()
+                elif navigation_frontier:
+                    node = navigation_frontier.popleft()
+                else:
+                    node = frontier.popleft()
                 planned_actions = await self.planner.plan(node.capture)
                 ledger.actions.extend(planned.candidate for planned in planned_actions)
 
@@ -223,13 +231,21 @@ class StateGraphExplorer:
                             "to prevent repeated external side effects"
                         )
                         continue
-                    frontier.append(
-                        _GraphNode(
-                            capture=capture,
-                            path=(*node.path, planned),
-                            depth=node.depth + 1,
-                        )
+                    child = _GraphNode(
+                        capture=capture,
+                        path=(*node.path, planned),
+                        depth=node.depth + 1,
                     )
+                    navigated = any(
+                        effect.kind == EffectKind.NAVIGATION
+                        for effect in outcome.transition.effects
+                    )
+                    if navigated and _has_row_observation_controls(capture):
+                        observation_frontier.append(child)
+                    elif navigated:
+                        navigation_frontier.append(child)
+                    else:
+                        frontier.append(child)
                 if runtime_limited:
                     break
         except Exception as exc:
@@ -486,13 +502,7 @@ class StateGraphExplorer:
             actions_pending=len(pending_ids),
             routes_discovered=len({capture.state.url for capture in captures}),
             frames_discovered=sum(len(capture.state.frames) for capture in captures),
-            tables_discovered=len(
-                {
-                    element.context.table_id
-                    for element in elements
-                    if element.context.table_id
-                }
-            ),
+            tables_discovered=len(_table_identities(captures)),
             modals_discovered=sum(capture.state.modal_count for capture in captures),
             downloads_observed=sum(
                 event.kind == BrowserEventKind.DOWNLOAD for event in events
@@ -554,6 +564,48 @@ class StateGraphExplorer:
 
         visit(main_frame, "main")
         return result
+
+
+def _table_identities(
+    captures: tuple[CapturedState, ...],
+) -> set[tuple[str, ...]]:
+    """Identify named and anonymous HTML/ARIA tables across captured routes."""
+
+    identities: set[tuple[str, ...]] = set()
+    for capture in captures:
+        for element in capture.elements:
+            if element.context.table_id:
+                identities.add(("named", element.frame_id, element.context.table_id))
+            elif element.tag == "table" or (element.role or "").lower() == "table":
+                identities.add(
+                    (
+                        "anonymous",
+                        capture.state.url,
+                        element.frame_id,
+                        element.element_id,
+                    )
+                )
+    return identities
+
+
+def _has_row_observation_controls(capture: CapturedState) -> bool:
+    """Detect table controls that reveal context without leaving the page."""
+
+    inert_destinations = {"", "#", "javascript:void(0)"}
+    for element in capture.elements:
+        if element.context.row_label is None or element.tag != "a":
+            continue
+        href = next(
+            (
+                attribute.value or attribute.safe_value or ""
+                for attribute in element.attributes
+                if attribute.name.lower() == "href"
+            ),
+            None,
+        )
+        if href is not None and href.strip().lower() in inert_destinations:
+            return True
+    return False
 
 
 def _origin(url: str) -> Optional[str]:

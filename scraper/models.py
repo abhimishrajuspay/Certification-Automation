@@ -699,6 +699,10 @@ class ActionBehaviorPolicy(EvidenceModel):
         "update",
         "upload",
     )
+    execution_control_keywords: tuple[str, ...] = (
+        "test",
+        "trigger",
+    )
     allow_hidden_actions: bool = False
     allow_disabled_actions: bool = False
     include_hover_actions: bool = True
@@ -714,6 +718,7 @@ class ActionBehaviorPolicy(EvidenceModel):
         for name, keywords in (
             ("blocked_keywords", self.blocked_keywords),
             ("review_keywords", self.review_keywords),
+            ("execution_control_keywords", self.execution_control_keywords),
         ):
             if any(not keyword.strip() for keyword in keywords):
                 raise ValueError(f"{name} cannot contain empty values")

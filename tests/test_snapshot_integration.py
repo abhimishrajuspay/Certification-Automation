@@ -192,6 +192,8 @@ async def test_real_page_snapshot_is_complete_stable_and_secret_safe(
         )
         first = await extractor.capture(page, sequence=0)
         second = await extractor.capture(page, sequence=1)
+        await page.locator('[data-testid="run-case"]').focus()
+        focused = await extractor.capture(page, sequence=2)
     finally:
         await manager.stop()
 
@@ -199,6 +201,9 @@ async def test_real_page_snapshot_is_complete_stable_and_secret_safe(
     assert first.state.fingerprint == second.state.fingerprint
     assert first.state.state_id == second.state.state_id
     assert first.state.element_ids == second.state.element_ids
+    assert focused.state.active_element_id != first.state.active_element_id
+    assert focused.state.fingerprint == first.state.fingerprint
+    assert focused.state.state_id == first.state.state_id
     assert first.receipt.sequence == 0
     assert second.receipt.sequence == 1
 
@@ -305,5 +310,5 @@ async def test_real_page_snapshot_is_complete_stable_and_secret_safe(
         )
 
     states = list(store.iter_records(StateSnapshot))
-    assert states == [first.state, second.state]
+    assert states == [first.state, second.state, focused.state]
     assert store.verify_integrity(strict=True).valid is True

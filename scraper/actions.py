@@ -91,6 +91,10 @@ class ActionPolicyConfig:
         "update",
         "upload",
     )
+    execution_control_keywords: tuple[str, ...] = (
+        "test",
+        "trigger",
+    )
     allow_hidden_actions: bool = False
     allow_disabled_actions: bool = False
     include_hover_actions: bool = True
@@ -372,6 +376,23 @@ class ActionPlanner:
                 "form.submit_requires_review",
                 "form submission can cause authentication or server-side effects",
             )
+        execution_control = _matching_keyword(
+            description,
+            self.config.execution_control_keywords,
+        )
+        role = (element.role or "").lower()
+        if (
+            kind == ActionKind.CLICK
+            and href is None
+            and (element.tag in {"button", "input"} or role == "button")
+            and execution_control
+        ):
+            return (
+                ActionRisk.REVIEW_REQUIRED,
+                f"semantic.review.{_rule_token(execution_control)}_execution",
+                "non-navigation control appears to execute a testcase or "
+                f"trigger operation '{execution_control}'",
+            )
         review = _matching_keyword(description, self.config.review_keywords)
         if review:
             return (
@@ -476,10 +497,37 @@ class ActionPlanner:
         return f"action-{hash_text(payload)[:32]}"
 
     @staticmethod
-    def _sort_key(planned: PlannedAction) -> tuple[int, str, str]:
+    def _sort_key(planned: PlannedAction) -> tuple[int, int, str, str]:
         status_order = 0 if planned.candidate.status == ActionStatus.PENDING else 1
+        href = _attribute_value(planned.element, "href")
+        signals = set(planned.element.interaction_signals)
+        has_click_listener = any(
+            signal in {"listener:click", "inline:click"} for signal in signals
+        )
+        inert_href = href is None or href.strip().lower() in {
+            "",
+            "#",
+            "javascript:void(0)",
+        }
+        row_observation = (
+            planned.element.context.row_label is not None
+            and inert_href
+            and (has_click_listener or planned.element.tag == "a")
+        )
+        observational_listener = has_click_listener and inert_href
+        if row_observation:
+            action_order = 0
+        elif href:
+            action_order = 1
+        elif observational_listener:
+            action_order = 2
+        elif planned.candidate.kind == ActionKind.SCROLL:
+            action_order = 4
+        else:
+            action_order = 3
         return (
             status_order,
+            action_order,
             planned.frame_path,
             planned.candidate.action_id,
         )

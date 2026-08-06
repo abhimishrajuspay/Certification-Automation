@@ -104,6 +104,7 @@ _EXPLORER_HTML = """<!doctype html>
     <iframe src="/frame"></iframe>
   </div>
   <main id="view"><p>Root view</p></main>
+  <table><tbody><tr><td>Anonymous table evidence</td></tr></tbody></table>
   <script>
     const controls = document.querySelector('#controls');
     const view = document.querySelector('#view');
@@ -230,11 +231,14 @@ async def test_real_graph_exploration_restores_parents_and_records_effects(
     assert result.coverage.actions_pending == 0
     assert result.coverage.actions_failed == 0
     assert result.coverage.actions_succeeded >= 7
+    assert result.coverage.tables_discovered == 1
     assert len(result.state_ids) >= 8
     assert store.run.status == ScrapeRunStatus.COMPLETED
 
     review_action = next(
-        action for action in actions if action.policy_rule == "semantic.review.run"
+        action
+        for action in actions
+        if action.policy_rule == "semantic.review.test_execution"
     )
     destructive_action = next(
         action for action in actions if action.policy_rule == "semantic.blocked.delete"
