@@ -6,7 +6,8 @@ pipeline for generic CZ portals.
 The active implementation contains the immutable evidence contract, durable
 artifact store, pre-navigation Playwright recorder, deterministic page
 snapshotter, action safety policy, bounded state-graph explorer, and production
-crawl runner.
+crawl runner. The runner can explicitly export a private authenticated session
+for reuse without mixing raw session material into crawl evidence.
 
 ## Active architecture
 
@@ -93,20 +94,40 @@ python -m scraper \
   --ready-selector "[data-portal-ready]"
 ```
 
+To create a reusable session during that manual login, choose an explicit
+ignored output under `artifacts/`:
+
+```bash
+python -m scraper \
+  --url "https://portal.example.test/start" \
+  --run-id portal-login \
+  --auth manual --headed \
+  --save-storage-state artifacts/sessions/portal.json
+```
+
+Press Enter only after the authenticated portal page is visible. The exported
+file contains raw cookies and Web Storage credentials, is written with owner-only
+permissions on POSIX systems, and is not part of the content-addressed evidence
+store or manifest. It must be treated like a password. An existing output is
+never replaced unless `--overwrite-storage-state` is supplied explicitly.
+
 An existing Playwright storage-state file can instead be injected at runtime:
 
 ```bash
 python -m scraper \
   --url "https://portal.example.test/start" \
   --auth storage_state \
-  --storage-state ./local/session.json
+  --storage-state artifacts/sessions/portal.json
 ```
 
-The storage-state path is not written to the manifest or printed by
-`--validate-only`. Runtime URL values matching the redaction vocabulary are
-redacted before the root URL enters evidence. Storage artifacts contain hashes,
-not cookie or Web Storage plaintext. Screenshots and raw traces can still show
-sensitive rendered data and must be protected.
+Storage-state input and output paths are not written to the manifest or printed
+by `--validate-only`. The manifest records only secret-free behavior, including
+whether external session state was configured and a hash—not the text—of an
+optional readiness selector. Runtime URL values matching the redaction
+vocabulary are redacted before the root URL enters evidence. Normal crawl
+storage artifacts contain hashes, not cookie or Web Storage plaintext. The
+explicit reusable session export is the intentional exception. Screenshots and
+raw traces can still show sensitive rendered data and must be protected.
 
 Run IDs are exclusive by default. `--existing-run return_completed` verifies
 integrity and returns an already completed compatible run without launching a
@@ -115,9 +136,11 @@ overwriting prior evidence. Resuming a partial live browser frontier is
 intentionally unsupported because credentials and live page state are not
 persisted; start a new attempt instead.
 
-The production path has been verified end to end with a local CZ-like HTTP
-fixture and real Chromium. A smoke run against an actual CZ environment remains
-deferred until a portal URL and authentication session are available.
+The production path has been verified end to end with local HTTP fixtures and
+real Chromium, including authenticated-session export followed by reuse in a fresh
+browser context. Authenticated state extraction has also been smoke-tested on an
+actual CZ environment. Deeper live traversal remains deferred until that portal
+contains representative test cases.
 
 ## Evidence storage
 
@@ -167,11 +190,17 @@ Safe clicks, toggles, selects, registered hover/double-click handlers, iframe
 controls, popups, and bounded page scrolling can be executed. Each action runs
 inside its recorder scope, captures the resulting state, correlates browser and
 network evidence, and persists a causal transition with normalized effects.
+Nested visual nodes inside one activatable control remain in the evidence but
+are skipped as duplicate click targets. Broad delegated-listener containers with
+multiple interactive descendants are also retained but not clicked because no
+single deterministic target can be inferred.
 
 Before each safe sibling action, the explorer restores the root cookies and
 root-state Web Storage, reloads the root page, then replays the safe locator
 path to the parent. Detached iframe predecessors are excluded so frame paths and
-state fingerprints remain stable across reloads. Review-required actions are
+state fingerprints remain stable across reloads. Popup creation is observed
+from before the triggering action so initial execution and replay select the
+same resulting page. Review-required actions are
 disabled by default; when explicitly enabled, their immediate result is
 captured once and the branch is terminal so a potentially external side effect
 is never replayed automatically. Destructive and disallowed cross-origin

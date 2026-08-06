@@ -25,6 +25,7 @@ from scraper.models import (
     InteractionTransition,
     ScrapeRun,
     ScrapeRunStatus,
+    StateSnapshot,
 )
 
 
@@ -263,6 +264,7 @@ async def test_real_graph_exploration_restores_parents_and_records_effects(
         any(effect.kind == EffectKind.POPUP_OPENED for effect in transition.effects)
         for transition in succeeded
     )
+    assert any(state.title == "Help" for state in store.iter_records(StateSnapshot))
     assert any(
         transition.parent_state_id != result.root_state_id for transition in succeeded
     )

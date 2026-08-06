@@ -96,6 +96,8 @@ class ActionPolicyConfig:
     include_hover_actions: bool = True
     include_scroll_actions: bool = True
     scroll_viewport_fraction: float = 0.8
+    deduplicate_nested_targets: bool = True
+    skip_ambiguous_delegated_containers: bool = True
 
     def __post_init__(self) -> None:
         if not 0 < self.scroll_viewport_fraction <= 1:
@@ -169,6 +171,15 @@ class ActionPlanner:
                 ):
                     status = ActionStatus.SKIPPED
                     rationale = f"{rationale}; manual-review actions are disabled"
+                if status == ActionStatus.PENDING:
+                    policy_skip = self._canonicalization_skip(
+                        element,
+                        kind,
+                        capture.elements,
+                    )
+                    if policy_skip is not None:
+                        status = ActionStatus.SKIPPED
+                        rule, rationale = policy_skip
 
                 action_id = self._action_id(
                     capture.state.state_id,
@@ -208,6 +219,33 @@ class ActionPlanner:
 
         planned.sort(key=self._sort_key)
         return tuple(planned)
+
+    def _canonicalization_skip(
+        self,
+        element: ElementSnapshot,
+        kind: ActionKind,
+        elements: tuple[ElementSnapshot, ...],
+    ) -> Optional[tuple[str, str]]:
+        if kind != ActionKind.CLICK:
+            return None
+        if self.config.deduplicate_nested_targets:
+            ancestor = _activation_ancestor(element, elements)
+            if ancestor is not None:
+                return (
+                    "dedup.nested_target",
+                    "nested visual target delegates activation to canonical ancestor "
+                    f"{ancestor.element_id}",
+                )
+        if (
+            self.config.skip_ambiguous_delegated_containers
+            and _is_ambiguous_delegated_container(element, elements)
+        ):
+            return (
+                "delegation.ambiguous_container",
+                "delegated container has multiple interactive descendants and "
+                "cannot be activated deterministically",
+            )
+        return None
 
     def _action_shapes(
         self,
@@ -457,13 +495,17 @@ class ActionExecutor:
         extractor: PageStateExtractor,
         *,
         action_timeout_ms: int = 10_000,
+        popup_detection_timeout_ms: int = 100,
     ) -> None:
         if action_timeout_ms <= 0:
             raise ValueError("action_timeout_ms must be positive")
+        if popup_detection_timeout_ms <= 0:
+            raise ValueError("popup_detection_timeout_ms must be positive")
         self.store = store
         self.recorder = recorder
         self.extractor = extractor
         self.action_timeout_ms = action_timeout_ms
+        self.popup_detection_timeout_ms = popup_detection_timeout_ms
 
     async def execute(
         self,
@@ -489,10 +531,12 @@ class ActionExecutor:
         active_page = page
         try:
             async with self.recorder.action_scope(candidate.action_id):
-                pages_before = set(page.context.pages)
                 locator, locator_used = await self._resolve_locator(page, planned)
-                await self._perform(page, locator, candidate)
-                active_page = await self._result_page(page, pages_before)
+                active_page = await self._perform_and_result_page(
+                    page,
+                    locator,
+                    candidate,
+                )
                 capture = await self.extractor.capture(
                     active_page,
                     sequence=sequence,
@@ -658,14 +702,41 @@ class ActionExecutor:
     async def replay(self, page: Page, planned: PlannedAction) -> Page:
         """Replay an already-approved path step without creating graph records."""
 
-        pages_before = set(page.context.pages)
         locator, _ = await self._resolve_locator(page, planned)
-        await self._perform(page, locator, planned.candidate)
-        active_page = await self._result_page(page, pages_before)
+        active_page = await self._perform_and_result_page(
+            page,
+            locator,
+            planned.candidate,
+        )
         await self.extractor.wait_for_quiet(active_page)
         await self.recorder.drain_mutations(active_page)
         await self.recorder.flush()
         return active_page
+
+    async def _perform_and_result_page(
+        self,
+        page: Page,
+        locator: Optional[Locator],
+        candidate: ActionCandidate,
+    ) -> Page:
+        """Perform one action while deterministically tracking popup creation."""
+
+        pages_before = set(page.context.pages)
+        loop = asyncio.get_running_loop()
+        popup: asyncio.Future[Page] = loop.create_future()
+
+        def observe_popup(candidate_page: Page) -> None:
+            if candidate_page not in pages_before and not popup.done():
+                popup.set_result(candidate_page)
+
+        page.context.on("page", observe_popup)
+        try:
+            await self._perform(page, locator, candidate)
+            return await self._result_page(page, pages_before, popup)
+        finally:
+            page.context.remove_listener("page", observe_popup)
+            if not popup.done():
+                popup.cancel()
 
     async def _resolve_locator(
         self,
@@ -810,14 +881,34 @@ class ActionExecutor:
         else:
             raise ActionExecutionError(f"unsupported action kind: {kind.value}")
 
-    async def _result_page(self, page: Page, pages_before: set[Page]) -> Page:
+    async def _result_page(
+        self,
+        page: Page,
+        pages_before: set[Page],
+        popup: asyncio.Future[Page],
+    ) -> Page:
         await asyncio.sleep(0)
         new_pages = [
             candidate
             for candidate in page.context.pages
             if candidate not in pages_before
         ]
-        result = new_pages[-1] if new_pages else page
+        if new_pages:
+            result = new_pages[-1]
+        elif popup.done() and not popup.cancelled():
+            result = popup.result()
+        else:
+            # A popup may be scheduled by the click handler just after Playwright's
+            # action promise resolves. The listener was installed before the action,
+            # so this bounded wait removes the execution/replay race without relying
+            # on an arbitrary sleep for popup-producing actions.
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(popup),
+                    timeout=self.popup_detection_timeout_ms / 1000,
+                )
+            except TimeoutError:
+                result = page
         if result.is_closed():
             remaining = [
                 candidate
@@ -960,6 +1051,136 @@ def _attribute_value(element: ElementSnapshot, name: str) -> Optional[str]:
             attribute.value or attribute.safe_value
             for attribute in element.attributes
             if attribute.name.lower() == name.lower()
+        ),
+        None,
+    )
+
+
+def _activation_ancestor(
+    element: ElementSnapshot,
+    elements: tuple[ElementSnapshot, ...],
+) -> Optional[ElementSnapshot]:
+    if _has_direct_activation_signal(element):
+        return None
+    ancestors = [
+        candidate
+        for candidate in _element_ancestors(element, elements)
+        if candidate.visible
+        and candidate.enabled
+        and _has_direct_activation_signal(candidate)
+    ]
+    return ancestors[0] if ancestors else None
+
+
+def _element_ancestors(
+    element: ElementSnapshot,
+    elements: tuple[ElementSnapshot, ...],
+) -> tuple[ElementSnapshot, ...]:
+    same_frame = tuple(
+        candidate
+        for candidate in elements
+        if candidate.frame_id == element.frame_id
+        and candidate.element_id != element.element_id
+    )
+    by_path = {
+        path: candidate
+        for candidate in same_frame
+        if (path := _css_path(candidate)) is not None
+    }
+    ancestors: list[ElementSnapshot] = []
+    seen_paths: set[str] = set()
+    parent_path = element.parent_css_path
+    while parent_path and parent_path not in seen_paths:
+        seen_paths.add(parent_path)
+        parent = by_path.get(parent_path)
+        if parent is None:
+            break
+        ancestors.append(parent)
+        parent_path = parent.parent_css_path
+    if ancestors:
+        return tuple(ancestors)
+
+    # Backward-compatible fallback for captures without explicit parent
+    # provenance and for generated CSS paths that encode their ancestry.
+    path = _css_path(element)
+    if path is None:
+        return ()
+    return tuple(
+        sorted(
+            (
+                candidate
+                for candidate in same_frame
+                if (candidate_path := _css_path(candidate)) is not None
+                and path.startswith(f"{candidate_path} > ")
+            ),
+            key=lambda candidate: len(_css_path(candidate) or ""),
+            reverse=True,
+        )
+    )
+
+
+def _is_descendant(
+    element: ElementSnapshot,
+    ancestor: ElementSnapshot,
+    elements: tuple[ElementSnapshot, ...],
+) -> bool:
+    return any(
+        candidate.element_id == ancestor.element_id
+        for candidate in _element_ancestors(element, elements)
+    )
+
+
+def _is_ambiguous_delegated_container(
+    element: ElementSnapshot,
+    elements: tuple[ElementSnapshot, ...],
+) -> bool:
+    signals = set(element.interaction_signals)
+    if element.tag not in {"body", "div", "html", "main", "section"}:
+        return False
+    if not any(signal in {"listener:click", "inline:click"} for signal in signals):
+        return False
+    interactive_descendants = {
+        candidate.element_id
+        for candidate in elements
+        if candidate.frame_id == element.frame_id
+        and candidate.element_id != element.element_id
+        and candidate.visible
+        and candidate.interactive
+        and _is_descendant(candidate, element, elements)
+    }
+    return len(interactive_descendants) > 1
+
+
+def _has_direct_activation_signal(element: ElementSnapshot) -> bool:
+    signals = set(element.interaction_signals)
+    activation_roles = {
+        "role:button",
+        "role:checkbox",
+        "role:combobox",
+        "role:link",
+        "role:listbox",
+        "role:menuitem",
+        "role:option",
+        "role:radio",
+        "role:switch",
+        "role:tab",
+        "role:treeitem",
+    }
+    return element.tag in {"a", "area", "button", "input", "select", "summary"} or any(
+        signal == "native-control"
+        or signal in activation_roles
+        or signal in {"listener:click", "inline:click"}
+        or signal.startswith("tabindex:")
+        for signal in signals
+    )
+
+
+def _css_path(element: ElementSnapshot) -> Optional[str]:
+    return next(
+        (
+            locator.value
+            for locator in element.locators
+            if locator.strategy == LocatorStrategy.CSS
         ),
         None,
     )

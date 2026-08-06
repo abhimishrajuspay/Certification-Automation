@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import PurePosixPath
-from typing import Optional
+from typing import Literal, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -320,6 +320,7 @@ class ElementSnapshot(EvidenceModel):
     read_only: Optional[bool] = None
     bounding_box: Optional[BoundingBox] = None
     shadow_host_path: tuple[str, ...] = ()
+    parent_css_path: Optional[str] = None
     context: ElementContext = Field(default_factory=ElementContext)
     options: tuple[SelectOptionSnapshot, ...] = ()
     locators: tuple[LocatorCandidate, ...] = ()
@@ -610,6 +611,133 @@ class CapturePolicy(EvidenceModel):
     )
 
 
+class BrowserBehaviorPolicy(EvidenceModel):
+    """Secret-free browser and authentication settings affecting a run."""
+
+    browser_name: Literal["chromium", "firefox", "webkit"] = "chromium"
+    headless: bool = True
+    viewport_width: int = Field(default=1920, gt=0)
+    viewport_height: int = Field(default=1080, gt=0)
+    device_scale_factor: float = Field(default=1.0, gt=0)
+    ignore_https_errors: bool = False
+    default_timeout_ms: int = Field(default=30_000, gt=0)
+    authentication_timeout_ms: int = Field(default=300_000, gt=0)
+    authentication_mode: Literal[
+        "none",
+        "storage_state",
+        "manual",
+        "callback",
+    ] = "none"
+    ready_selector_configured: bool = False
+    ready_selector_sha256: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[a-f0-9]{64}$",
+    )
+    storage_state_input_configured: bool = False
+    storage_state_output_configured: bool = False
+
+    @model_validator(mode="after")
+    def validate_ready_selector_marker(self) -> "BrowserBehaviorPolicy":
+        if self.ready_selector_configured != (self.ready_selector_sha256 is not None):
+            raise ValueError(
+                "ready selector configuration requires a matching selector hash"
+            )
+        return self
+
+
+class SnapshotBehaviorPolicy(EvidenceModel):
+    """Serializable page-state extraction behavior."""
+
+    maximum_elements_per_frame: int = Field(default=50_000, gt=0)
+    maximum_text_chars: int = Field(default=4_000, gt=0)
+    quiet_window_ms: int = Field(default=400, ge=0)
+    quiet_timeout_ms: int = Field(default=5_000, gt=0)
+    quiet_poll_interval_ms: int = Field(default=100, gt=0)
+    full_page_screenshot: bool = True
+
+
+class ActionBehaviorPolicy(EvidenceModel):
+    """Serializable interaction discovery and safety behavior."""
+
+    blocked_keywords: tuple[str, ...] = (
+        "delete",
+        "destroy",
+        "erase",
+        "logout",
+        "purge",
+        "remove account",
+        "revoke",
+        "sign out",
+        "terminate",
+        "wipe",
+    )
+    review_keywords: tuple[str, ...] = (
+        "approve",
+        "complete",
+        "confirm",
+        "create",
+        "download",
+        "execute",
+        "authenticate",
+        "log in",
+        "login",
+        "pay",
+        "play",
+        "production",
+        "publish",
+        "refund",
+        "reject",
+        "run",
+        "save",
+        "send",
+        "sign in",
+        "start",
+        "submit",
+        "transfer",
+        "update",
+        "upload",
+    )
+    allow_hidden_actions: bool = False
+    allow_disabled_actions: bool = False
+    include_hover_actions: bool = True
+    include_scroll_actions: bool = True
+    scroll_viewport_fraction: float = Field(default=0.8, gt=0, le=1)
+    deduplicate_nested_targets: bool = True
+    skip_ambiguous_delegated_containers: bool = True
+    execution_timeout_ms: int = Field(default=10_000, gt=0)
+    popup_detection_timeout_ms: int = Field(default=100, gt=0)
+
+    @model_validator(mode="after")
+    def validate_keywords(self) -> "ActionBehaviorPolicy":
+        for name, keywords in (
+            ("blocked_keywords", self.blocked_keywords),
+            ("review_keywords", self.review_keywords),
+        ):
+            if any(not keyword.strip() for keyword in keywords):
+                raise ValueError(f"{name} cannot contain empty values")
+            if len(keywords) != len(set(keywords)):
+                raise ValueError(f"{name} must be unique")
+        return self
+
+
+class ExplorerBehaviorPolicy(EvidenceModel):
+    """Serializable graph restoration behavior not represented by limits."""
+
+    restore_timeout_ms: int = Field(default=15_000, gt=0)
+    capture_initial_state: bool = True
+
+
+class CrawlBehaviorPolicy(EvidenceModel):
+    """Complete secret-free behavior snapshot for reproducible crawling."""
+
+    browser: BrowserBehaviorPolicy = Field(default_factory=BrowserBehaviorPolicy)
+    snapshot: SnapshotBehaviorPolicy = Field(default_factory=SnapshotBehaviorPolicy)
+    action: ActionBehaviorPolicy = Field(default_factory=ActionBehaviorPolicy)
+    explorer: ExplorerBehaviorPolicy = Field(default_factory=ExplorerBehaviorPolicy)
+
+
 class ScrapeRun(EvidenceModel):
     """Top-level manifest model for a deterministic scrape run."""
 
@@ -622,6 +750,7 @@ class ScrapeRun(EvidenceModel):
     ended_at: Optional[datetime] = None
     limits: CrawlLimits = Field(default_factory=CrawlLimits)
     capture_policy: CapturePolicy = Field(default_factory=CapturePolicy)
+    behavior_policy: CrawlBehaviorPolicy = Field(default_factory=CrawlBehaviorPolicy)
     state_ids: tuple[str, ...] = ()
     transition_ids: tuple[str, ...] = ()
     checkpoint_sequence: int = Field(default=0, ge=0)
@@ -776,22 +905,27 @@ __all__ = [
     "BoundingBox",
     "BrowserEvent",
     "BrowserEventKind",
+    "BrowserBehaviorPolicy",
     "CapturePolicy",
+    "CrawlBehaviorPolicy",
     "CoverageReport",
     "CrawlLimits",
     "EffectKind",
     "ElementContext",
     "ElementSnapshot",
+    "ExplorerBehaviorPolicy",
     "FrameElementCollection",
     "FrameSnapshot",
     "InteractionTransition",
     "LocatorCandidate",
     "LocatorStrategy",
     "NetworkExchange",
+    "ActionBehaviorPolicy",
     "ScrapeRun",
     "ScrapeRunStatus",
     "ScrollPosition",
     "SelectOptionSnapshot",
+    "SnapshotBehaviorPolicy",
     "StateSnapshot",
     "TransitionEffect",
     "ValueCapture",

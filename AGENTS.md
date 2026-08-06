@@ -17,6 +17,9 @@ Phase 5 is safe action planning/execution and bounded graph exploration in
 `scraper/actions.py` and `scraper/explorer.py`. Phase 6 is the typed production
 runner, authentication boundary, existing-run policy, and CLI in
 `scraper/runner.py`, `scraper/cli.py`, and `scraper/__main__.py`.
+Phase 6.1 hardens reproducibility with a secret-free behavior manifest,
+explicit owner-only storage-state export/reuse, canonical nested targets, and
+deterministic popup execution/replay.
 
 Active code must not import from `.deprecated/`. The local legacy archive is
 for recovery and comparison only and is intentionally ignored by Git.
@@ -51,6 +54,8 @@ for recovery and comparison only and is intentionally ignored by Git.
   pseudo-elements, and off-DOM virtualized content must be reported honestly.
 - Action candidates are derived from structured evidence, never hardcoded portal
   selectors. Hidden/disabled/blocked/review candidates remain auditable records.
+- Nested/delegated candidate records remain auditable even when canonicalization
+  prevents duplicate or ambiguous clicks.
 - Blocked actions never execute. Review-required actions execute only when the
   run policy explicitly permits them and their result is a terminal branch.
 - Every safe sibling action starts from an independently restored parent path;
@@ -60,6 +65,11 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Runtime output belongs under `artifacts/` and stays out of Git.
 - Authentication credentials must not be accepted as CLI flags or persisted.
   Runtime storage-state paths stay outside manifests and command output.
+- Reusable raw storage state is exported only to an explicit caller-owned path,
+  with owner-only permissions and no implicit overwrite; it never enters crawl
+  evidence. Treat it as a credential.
+- Behavior-affecting runner, snapshot, action, and restoration configuration is
+  persisted in the manifest without secret paths or selector plaintext.
 - Runtime root URLs may contain session query values; persist only the redacted
   evidence URL while using the original URL in memory for navigation.
 - Existing completed runs may be returned only after strict integrity and
@@ -82,3 +92,5 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Treat browser cookies, authorization headers, request bodies, screenshots,
   and storage state as potentially sensitive.
 - Do not restore or reactivate legacy modules unless the user explicitly asks.
+- Do not inspect, import, or test user data under `dummy-portal/` or
+  `dummy_portal/`; both locations are intentionally gitignored.

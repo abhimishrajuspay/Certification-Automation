@@ -58,6 +58,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="existing Playwright storage-state JSON (path is never persisted)",
     )
     parser.add_argument(
+        "--save-storage-state",
+        type=Path,
+        help=(
+            "explicit sensitive output for reusable Playwright session state; "
+            "written with owner-only permissions and never added to crawl evidence"
+        ),
+    )
+    parser.add_argument(
+        "--overwrite-storage-state",
+        action="store_true",
+        help="allow replacing an existing --save-storage-state file",
+    )
+    parser.add_argument(
         "--headed",
         action="store_true",
         help="show the browser; required for manual authentication",
@@ -183,6 +196,8 @@ def request_from_args(args: argparse.Namespace) -> CrawlRequest:
         allowed_origins=allowed_origins,
         authentication_mode=AuthenticationMode(args.auth),
         storage_state_path=args.storage_state,
+        storage_state_output_path=args.save_storage_state,
+        overwrite_storage_state_output=args.overwrite_storage_state,
         existing_run_policy=ExistingRunPolicy(args.existing_run),
         browser_name=cast(BrowserName, args.browser),
         headless=not args.headed,
@@ -255,6 +270,9 @@ def _validation_summary(request: CrawlRequest) -> dict[str, object]:
         "allowed_origins": request.effective_allowed_origins,
         "authentication_mode": request.authentication_mode.value,
         "storage_state_configured": request.storage_state_path is not None,
+        "storage_state_output_configured": (
+            request.storage_state_output_path is not None
+        ),
         "headless": request.headless,
         "browser": request.browser_name,
         "ready_selector_configured": request.ready_selector is not None,

@@ -15,6 +15,8 @@ from scraper.models import (
     CapturePolicy,
     ElementSnapshot,
     FrameSnapshot,
+    LocatorCandidate,
+    LocatorStrategy,
     ScrapeRun,
     ScrollPosition,
     SelectOptionSnapshot,
@@ -39,7 +41,24 @@ def _element(
     checked: bool | None = None,
     options: tuple[SelectOptionSnapshot, ...] = (),
     input_type: str | None = None,
+    interaction_signals: tuple[str, ...] | None = None,
+    css_path: str | None = None,
+    parent_css_path: str | None = None,
 ) -> ElementSnapshot:
+    signals = interaction_signals or (f"role:{role}",)
+    locators = (
+        (
+            LocatorCandidate(
+                strategy=LocatorStrategy.CSS,
+                value=css_path,
+                confidence=0.5,
+                unique_match_count=1,
+                is_primary=True,
+            ),
+        )
+        if css_path is not None
+        else ()
+    )
     return ElementSnapshot(
         element_id=element_id,
         frame_id="frame-main",
@@ -49,11 +68,13 @@ def _element(
         input_type=input_type,
         attributes=attributes,
         interactive=True,
-        interaction_signals=(f"role:{role}",),
+        interaction_signals=signals,
         visible=visible,
         enabled=enabled,
         checked=checked,
         options=options,
+        locators=locators,
+        parent_css_path=parent_css_path,
     )
 
 
@@ -234,3 +255,96 @@ async def test_authentication_and_structural_submit_actions_require_review(
     assert candidates["login"].status == ActionStatus.SKIPPED
     assert candidates["unnamed-submit"].risk == ActionRisk.REVIEW_REQUIRED
     assert candidates["unnamed-submit"].policy_rule == "form.submit_requires_review"
+
+
+@pytest.mark.asyncio
+async def test_nested_visual_targets_are_recorded_but_not_executed_twice(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore.create(
+        tmp_path / "crawls",
+        ScrapeRun(
+            run_id="nested-targets",
+            root_url="https://portal.test/start",
+            allowed_origins=("https://portal.test",),
+        ),
+    )
+    elements = (
+        _element(
+            "link",
+            tag="a",
+            role="link",
+            name="Dashboard",
+            interaction_signals=("cursor:pointer", "native-control", "role:link"),
+            css_path="#dashboard",
+            parent_css_path="html > body",
+        ),
+        _element(
+            "label",
+            tag="span",
+            role="",
+            name="Dashboard",
+            interaction_signals=("cursor:pointer",),
+            css_path="#dashboard-label",
+            parent_css_path="#dashboard",
+        ),
+    )
+
+    planned = await ActionPlanner(store).plan(_capture(store, elements))
+    candidates = {item.element.element_id: item.candidate for item in planned}
+
+    assert candidates["link"].status == ActionStatus.PENDING
+    assert candidates["label"].status == ActionStatus.SKIPPED
+    assert candidates["label"].policy_rule == "dedup.nested_target"
+    assert len(list(store.iter_records(ActionCandidate))) == 2
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_delegated_container_is_audited_but_skipped(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore.create(
+        tmp_path / "crawls",
+        ScrapeRun(
+            run_id="delegated-container",
+            root_url="https://portal.test/start",
+            allowed_origins=("https://portal.test",),
+        ),
+    )
+    elements = (
+        _element(
+            "container",
+            tag="div",
+            role="",
+            name="Portal navigation",
+            interaction_signals=("listener:click",),
+            css_path="#portal-navigation",
+            parent_css_path="html > body",
+        ),
+        _element(
+            "first",
+            tag="a",
+            role="link",
+            name="First",
+            interaction_signals=("native-control", "role:link"),
+            css_path="#first",
+            parent_css_path="#portal-navigation",
+        ),
+        _element(
+            "second",
+            tag="a",
+            role="link",
+            name="Second",
+            interaction_signals=("native-control", "role:link"),
+            css_path="#second",
+            parent_css_path="#portal-navigation",
+        ),
+    )
+
+    planned = await ActionPlanner(store).plan(_capture(store, elements))
+    candidates = {item.element.element_id: item.candidate for item in planned}
+
+    assert candidates["container"].status == ActionStatus.SKIPPED
+    assert candidates["container"].policy_rule == "delegation.ambiguous_container"
+    assert candidates["first"].status == ActionStatus.PENDING
+    assert candidates["second"].status == ActionStatus.PENDING

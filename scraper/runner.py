@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
+import tempfile
 import threading
 import uuid
 from collections.abc import Awaitable, Callable
@@ -26,16 +29,21 @@ from scraper.browser import BrowserLaunchConfig, BrowserManager, BrowserName
 from scraper.explorer import ExplorerConfig, ExplorationResult, StateGraphExplorer
 from scraper.extractor import PageStateExtractor, SnapshotConfig
 from scraper.models import (
+    ActionBehaviorPolicy,
     ActionCandidate,
+    BrowserBehaviorPolicy,
     CapturePolicy,
     CoverageReport,
+    CrawlBehaviorPolicy,
     CrawlLimits,
+    ExplorerBehaviorPolicy,
     ScrapeRun,
     ScrapeRunStatus,
+    SnapshotBehaviorPolicy,
     StateSnapshot,
     utc_now,
 )
-from scraper.redaction import redact_text, redact_url
+from scraper.redaction import hash_text, redact_text, redact_url
 
 
 _RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -51,6 +59,10 @@ class AuthenticationError(CrawlRunnerError):
 
 class ResumeUnavailableError(CrawlRunnerError):
     """Raised when an existing run cannot be safely reused or resumed."""
+
+
+class StorageStateExportError(CrawlRunnerError):
+    """Raised when an explicitly requested reusable session cannot be saved."""
 
 
 class AuthenticationMode(str, Enum):
@@ -84,6 +96,8 @@ class CrawlRequest:
     allowed_origins: tuple[str, ...] = ()
     authentication_mode: AuthenticationMode = AuthenticationMode.NONE
     storage_state_path: Optional[Path] = None
+    storage_state_output_path: Optional[Path] = None
+    overwrite_storage_state_output: bool = False
     existing_run_policy: ExistingRunPolicy = ExistingRunPolicy.ERROR
     browser_name: BrowserName = "chromium"
     headless: bool = True
@@ -92,6 +106,8 @@ class CrawlRequest:
     ignore_https_errors: bool = False
     default_timeout_ms: int = 30_000
     authentication_timeout_ms: int = 300_000
+    action_timeout_ms: int = 10_000
+    popup_detection_timeout_ms: int = 100
     ready_selector: Optional[str] = None
     limits: CrawlLimits = field(default_factory=CrawlLimits)
     capture_policy: CapturePolicy = field(default_factory=CapturePolicy)
@@ -108,6 +124,10 @@ class CrawlRequest:
             )
         if self.authentication_timeout_ms <= 0:
             raise ValueError("authentication_timeout_ms must be positive")
+        if self.action_timeout_ms <= 0:
+            raise ValueError("action_timeout_ms must be positive")
+        if self.popup_detection_timeout_ms <= 0:
+            raise ValueError("popup_detection_timeout_ms must be positive")
         if self.ready_selector is not None and not self.ready_selector.strip():
             raise ValueError("ready_selector cannot be empty")
         if self.authentication_mode == AuthenticationMode.MANUAL and self.headless:
@@ -122,6 +142,19 @@ class CrawlRequest:
         elif self.storage_state_path is not None:
             raise ValueError(
                 "storage_state_path is only valid with storage_state authentication"
+            )
+        if self.storage_state_output_path is not None:
+            output = self.storage_state_output_path.expanduser()
+            if output.exists() and not output.is_file():
+                raise ValueError("storage_state_output_path must reference a file")
+            if output.exists() and not self.overwrite_storage_state_output:
+                raise ValueError(
+                    "storage_state_output_path already exists; explicit overwrite "
+                    "permission is required"
+                )
+        elif self.overwrite_storage_state_output:
+            raise ValueError(
+                "overwrite_storage_state_output requires storage_state_output_path"
             )
         if not self.explorer_config.capture_initial_state:
             raise ValueError("the crawl runner requires capture_initial_state=True")
@@ -211,6 +244,7 @@ class CrawlRunner:
             page = await manager.start()
             await manager.navigate(self.request.root_url)
             await self._authenticate(page)
+            await self._export_storage_state(page)
 
             extractor = PageStateExtractor(
                 store,
@@ -218,7 +252,13 @@ class CrawlRunner:
                 self.request.snapshot_config,
             )
             planner = ActionPlanner(store, self.request.action_policy_config)
-            executor = ActionExecutor(store, manager.recorder, extractor)
+            executor = ActionExecutor(
+                store,
+                manager.recorder,
+                extractor,
+                action_timeout_ms=self.request.action_timeout_ms,
+                popup_detection_timeout_ms=(self.request.popup_detection_timeout_ms),
+            )
             result = await StateGraphExplorer(
                 store,
                 manager.recorder,
@@ -278,6 +318,7 @@ class CrawlRunner:
             allowed_origins=self.request.effective_allowed_origins,
             limits=self.request.limits,
             capture_policy=self.request.capture_policy,
+            behavior_policy=self._behavior_policy(),
         )
         return ArtifactStore.create(self.request.artifact_root, run), False
 
@@ -287,18 +328,76 @@ class CrawlRunner:
             self.request.effective_allowed_origins,
             self.request.limits,
             self.request.capture_policy,
+            self._behavior_policy(),
         )
         actual = (
             store.run.root_url,
             store.run.allowed_origins,
             store.run.limits,
             store.run.capture_policy,
+            store.run.behavior_policy,
         )
         if actual != expected:
             raise ResumeUnavailableError(
                 "existing run configuration does not match the requested portal, "
-                "origin scope, limits, or capture policy"
+                "origin scope, limits, capture policy, or behavior policy"
             )
+
+    def _behavior_policy(self) -> CrawlBehaviorPolicy:
+        snapshot = self.request.snapshot_config
+        action = self.request.action_policy_config
+        explorer = self.request.explorer_config
+        return CrawlBehaviorPolicy(
+            browser=BrowserBehaviorPolicy(
+                browser_name=self.request.browser_name,
+                headless=self.request.headless,
+                viewport_width=self.request.viewport_width,
+                viewport_height=self.request.viewport_height,
+                ignore_https_errors=self.request.ignore_https_errors,
+                default_timeout_ms=self.request.default_timeout_ms,
+                authentication_timeout_ms=self.request.authentication_timeout_ms,
+                authentication_mode=self.request.authentication_mode.value,
+                ready_selector_configured=self.request.ready_selector is not None,
+                ready_selector_sha256=(
+                    hash_text(self.request.ready_selector)
+                    if self.request.ready_selector is not None
+                    else None
+                ),
+                storage_state_input_configured=(
+                    self.request.storage_state_path is not None
+                ),
+                storage_state_output_configured=(
+                    self.request.storage_state_output_path is not None
+                ),
+            ),
+            snapshot=SnapshotBehaviorPolicy(
+                maximum_elements_per_frame=snapshot.maximum_elements_per_frame,
+                maximum_text_chars=snapshot.maximum_text_chars,
+                quiet_window_ms=snapshot.quiet_window_ms,
+                quiet_timeout_ms=snapshot.quiet_timeout_ms,
+                quiet_poll_interval_ms=snapshot.quiet_poll_interval_ms,
+                full_page_screenshot=snapshot.full_page_screenshot,
+            ),
+            action=ActionBehaviorPolicy(
+                blocked_keywords=action.blocked_keywords,
+                review_keywords=action.review_keywords,
+                allow_hidden_actions=action.allow_hidden_actions,
+                allow_disabled_actions=action.allow_disabled_actions,
+                include_hover_actions=action.include_hover_actions,
+                include_scroll_actions=action.include_scroll_actions,
+                scroll_viewport_fraction=action.scroll_viewport_fraction,
+                deduplicate_nested_targets=action.deduplicate_nested_targets,
+                skip_ambiguous_delegated_containers=(
+                    action.skip_ambiguous_delegated_containers
+                ),
+                execution_timeout_ms=self.request.action_timeout_ms,
+                popup_detection_timeout_ms=(self.request.popup_detection_timeout_ms),
+            ),
+            explorer=ExplorerBehaviorPolicy(
+                restore_timeout_ms=explorer.restore_timeout_ms,
+                capture_initial_state=explorer.capture_initial_state,
+            ),
+        )
 
     def _open_if_present(self, run_id: str) -> Optional[ArtifactStore]:
         try:
@@ -388,6 +487,32 @@ class CrawlRunner:
             )
             raise AuthenticationError(
                 f"authentication readiness failed: {safe_error}"
+            ) from exc
+
+    async def _export_storage_state(self, page: Page) -> None:
+        output_path = self.request.storage_state_output_path
+        if output_path is None:
+            return
+        try:
+            state = await page.context.storage_state()
+            payload = json.dumps(
+                state,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            await asyncio.to_thread(
+                _write_private_file,
+                output_path,
+                payload,
+                overwrite=self.request.overwrite_storage_state_output,
+            )
+        except StorageStateExportError:
+            raise
+        except Exception as exc:
+            raise StorageStateExportError(
+                "failed to export reusable storage state"
             ) from exc
 
     async def _finalize_early_failure(
@@ -493,6 +618,49 @@ def _new_run_id() -> str:
     return f"crawl-{timestamp}-{uuid.uuid4().hex[:8]}"
 
 
+def _write_private_file(path: Path, data: bytes, *, overwrite: bool) -> Path:
+    destination = path.expanduser().absolute()
+    if destination.is_symlink():
+        raise StorageStateExportError("storage state output cannot be a symbolic link")
+    if destination.exists() and not overwrite:
+        raise StorageStateExportError(
+            "storage state output already exists; overwrite was not authorized"
+        )
+    if destination.exists() and not destination.is_file():
+        raise StorageStateExportError("storage state output must be a regular file")
+    destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if overwrite:
+            os.replace(temporary, destination)
+        else:
+            try:
+                os.link(temporary, destination)
+            except FileExistsError as exc:
+                raise StorageStateExportError(
+                    "storage state output already exists; overwrite was not authorized"
+                ) from exc
+            temporary.unlink()
+        os.chmod(destination, 0o600)
+        return destination
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def _origin_from_url(url: str) -> str:
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -532,4 +700,5 @@ __all__ = [
     "LoginCallback",
     "ManualConfirmation",
     "ResumeUnavailableError",
+    "StorageStateExportError",
 ]

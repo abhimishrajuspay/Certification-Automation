@@ -282,6 +282,10 @@ FRAME_EXTRACTION_SCRIPT = r"""
         const ariaExpanded = element.getAttribute('aria-expanded');
         return {
             domPath: cssPath(element),
+            parentDomPath: cssPath(
+                element.parentElement
+                || (element.getRootNode && element.getRootNode().host)
+            ),
             shadowHostPath: shadowHosts,
             tag: element.tagName.toLowerCase(),
             role: elementRole,
@@ -842,6 +846,7 @@ class PageStateExtractor:
                         redact_text(item, self.policy.redacted_names)
                         for item in shadow_path
                     ),
+                    parent_css_path=self._safe_optional(raw.get("parentDomPath")),
                     context=ElementContext(
                         section_heading=self._safe_optional(
                             context.get("sectionHeading")

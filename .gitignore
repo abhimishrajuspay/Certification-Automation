@@ -28,3 +28,7 @@ logs/
 
 # Recoverable legacy archive; intentionally local-only
 .deprecated/
+
+# User-provided dummy portal; intentionally outside crawler source and tests
+dummy-portal/
+dummy_portal/

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,8 +13,11 @@ from typing import cast
 import pytest
 from playwright.async_api import Page
 
+from scraper.actions import ActionPolicyConfig
 from scraper.artifact_store import ArtifactStore
 from scraper.cli import async_main
+from scraper.explorer import ExplorerConfig
+from scraper.extractor import SnapshotConfig
 from scraper.models import (
     CoverageReport,
     ScrapeRun,
@@ -27,12 +32,32 @@ from scraper.runner import (
     CrawlRunner,
     ExistingRunPolicy,
     ResumeUnavailableError,
+    StorageStateExportError,
 )
 
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
 PORTAL_URL = "https://portal.example.test/start"
 ORIGIN = "https://portal.example.test"
+
+
+class _StorageContext:
+    async def storage_state(self) -> dict[str, object]:
+        return {
+            "cookies": [
+                {
+                    "name": "session",
+                    "value": "session-secret",
+                    "domain": "portal.example.test",
+                    "path": "/",
+                }
+            ],
+            "origins": [],
+        }
+
+
+class _StoragePage:
+    context = _StorageContext()
 
 
 def test_request_rejects_unsafe_or_incomplete_authentication_config(
@@ -61,6 +86,26 @@ def test_request_rejects_unsafe_or_incomplete_authentication_config(
 
     with pytest.raises(ValueError, match="run_id"):
         CrawlRequest(root_url=PORTAL_URL, run_id="../escape")
+
+    existing_output = tmp_path / "existing-session.json"
+    existing_output.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="already exists"):
+        CrawlRequest(
+            root_url=PORTAL_URL,
+            storage_state_output_path=existing_output,
+        )
+    overwrite = CrawlRequest(
+        root_url=PORTAL_URL,
+        storage_state_output_path=existing_output,
+        overwrite_storage_state_output=True,
+    )
+    assert overwrite.overwrite_storage_state_output is True
+
+    with pytest.raises(ValueError, match="requires"):
+        CrawlRequest(
+            root_url=PORTAL_URL,
+            overwrite_storage_state_output=True,
+        )
 
 
 def test_callback_mode_requires_and_exclusively_owns_callback() -> None:
@@ -127,6 +172,70 @@ async def test_console_confirmation_timeout_does_not_block_event_loop(
         assert started.is_set()
     finally:
         release.set()
+
+
+@pytest.mark.asyncio
+async def test_explicit_storage_state_export_is_private_and_not_manifested(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "private" / "session.json"
+    request = CrawlRequest(
+        root_url=PORTAL_URL,
+        artifact_root=tmp_path / "crawls",
+        run_id="storage-export",
+        storage_state_output_path=output_path,
+    )
+    runner = CrawlRunner(request)
+    store, reused = runner._prepare_store()
+
+    await runner._export_storage_state(cast(Page, _StoragePage()))
+
+    assert reused is False
+    assert (
+        json.loads(output_path.read_text(encoding="utf-8"))["cookies"][0]["value"]
+        == "session-secret"
+    )
+    if os.name != "nt":
+        assert stat.S_IMODE(output_path.stat().st_mode) == 0o600
+    manifest = (store.run_directory / "manifest.json").read_text(encoding="utf-8")
+    assert str(output_path) not in manifest
+    assert "session-secret" not in manifest
+    assert store.run.behavior_policy.browser.storage_state_output_configured is True
+
+    with pytest.raises(StorageStateExportError, match="already exists"):
+        await runner._export_storage_state(cast(Page, _StoragePage()))
+
+
+def test_manifest_persists_complete_behavior_policy(tmp_path: Path) -> None:
+    request = CrawlRequest(
+        root_url=PORTAL_URL,
+        artifact_root=tmp_path / "crawls",
+        run_id="behavior-policy",
+        authentication_timeout_ms=42_000,
+        ready_selector="[data-ready='true']",
+        action_timeout_ms=8_000,
+        popup_detection_timeout_ms=250,
+        snapshot_config=SnapshotConfig(quiet_window_ms=250),
+        action_policy_config=ActionPolicyConfig(
+            include_hover_actions=False,
+            deduplicate_nested_targets=False,
+        ),
+        explorer_config=ExplorerConfig(restore_timeout_ms=9_000),
+    )
+
+    store, _ = CrawlRunner(request)._prepare_store()
+    behavior = store.run.behavior_policy
+
+    assert behavior.browser.authentication_timeout_ms == 42_000
+    assert behavior.browser.ready_selector_configured is True
+    assert behavior.browser.ready_selector_sha256 is not None
+    assert "data-ready" not in json.dumps(behavior.model_dump(mode="json"))
+    assert behavior.snapshot.quiet_window_ms == 250
+    assert behavior.action.include_hover_actions is False
+    assert behavior.action.deduplicate_nested_targets is False
+    assert behavior.action.execution_timeout_ms == 8_000
+    assert behavior.action.popup_detection_timeout_ms == 250
+    assert behavior.explorer.restore_timeout_ms == 9_000
 
 
 @pytest.mark.asyncio
@@ -239,6 +348,7 @@ async def test_validate_only_does_not_expose_url_secret_or_storage_path(
 ) -> None:
     storage_path = tmp_path / "sensitive-session-name.json"
     storage_path.write_text("{}", encoding="utf-8")
+    output_path = tmp_path / "sensitive-session-output.json"
 
     status = await async_main(
         [
@@ -248,6 +358,8 @@ async def test_validate_only_does_not_expose_url_secret_or_storage_path(
             "storage_state",
             "--storage-state",
             str(storage_path),
+            "--save-storage-state",
+            str(output_path),
             "--validate-only",
         ]
     )
@@ -257,10 +369,12 @@ async def test_validate_only_does_not_expose_url_secret_or_storage_path(
     assert status == 0
     assert summary["valid"] is True
     assert summary["storage_state_configured"] is True
+    assert summary["storage_state_output_configured"] is True
     assert summary["root_target"] == PORTAL_URL
     assert "must-not-appear" not in output
     assert "also-hidden" not in output
     assert str(storage_path) not in output
+    assert str(output_path) not in output
 
 
 @pytest.mark.asyncio
