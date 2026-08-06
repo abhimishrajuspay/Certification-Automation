@@ -13,6 +13,8 @@ the append-only, content-addressed store in `scraper/artifact_store.py`. Phase 3
 is the pre-navigation Playwright lifecycle and browser recorder in
 `scraper/browser.py`, `scraper/recorder.py`, and `scraper/redaction.py`. Phase 4
 is deterministic page-state extraction in `scraper/extractor.py`.
+Phase 5 is safe action planning/execution and bounded graph exploration in
+`scraper/actions.py` and `scraper/explorer.py`.
 
 Active code must not import from `.deprecated/`. The local legacy archive is
 for recovery and comparison only and is intentionally ignored by Git.
@@ -42,13 +44,21 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Live form/storage values are hashed, not persisted as plaintext.
 - Browser limitations such as closed shadow roots, delegated listeners, canvas,
   pseudo-elements, and off-DOM virtualized content must be reported honestly.
+- Action candidates are derived from structured evidence, never hardcoded portal
+  selectors. Hidden/disabled/blocked/review candidates remain auditable records.
+- Blocked actions never execute. Review-required actions execute only when the
+  run policy explicitly permits them and their result is a terminal branch.
+- Every safe sibling action starts from an independently restored parent path;
+  only live frames participate in deterministic frame paths.
+- Every attempted or skipped candidate produces one causal transition. Crawl
+  limits and incomplete restoration boundaries must appear in coverage.
 - Runtime output belongs under `artifacts/` and stays out of Git.
 
 ## Validation
 
 - Focused tests: `venv/bin/python3 -m pytest -q tests`
 - Real browser test:
-  `CZ_RUN_BROWSER_TESTS=1 venv/bin/python3 -m pytest -q tests/test_browser_integration.py tests/test_snapshot_integration.py`
+  `CZ_RUN_BROWSER_TESTS=1 venv/bin/python3 -m pytest -q tests/test_browser_integration.py tests/test_snapshot_integration.py tests/test_explorer_integration.py`
 - Compile check:
   `venv/bin/python3 -m py_compile scraper/*.py`
 - Full checks when development tools are installed: `ruff check .`,

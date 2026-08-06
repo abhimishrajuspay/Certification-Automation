@@ -495,7 +495,7 @@ class PageStateExtractor:
         if sequence < 0:
             raise ValueError("sequence cannot be negative")
         limitations: list[str] = []
-        stable = await self._wait_for_quiet(page)
+        stable = await self.wait_for_quiet(page)
         if not stable:
             limitations.append("page did not reach the configured DOM quiet window")
 
@@ -596,7 +596,9 @@ class PageStateExtractor:
             receipt=receipt,
         )
 
-    async def _wait_for_quiet(self, page: Page) -> bool:
+    async def wait_for_quiet(self, page: Page) -> bool:
+        """Return whether every current frame reaches the configured quiet window."""
+
         if self.config.quiet_window_ms == 0:
             return True
         loop = asyncio.get_running_loop()
@@ -681,7 +683,10 @@ class PageStateExtractor:
 
         def visit(frame: Frame, key: str) -> None:
             result.append((key, frame))
-            for index, child in enumerate(frame.child_frames):
+            active_children = [
+                child for child in frame.child_frames if not child.is_detached()
+            ]
+            for index, child in enumerate(active_children):
                 visit(child, f"{key}/{index}")
 
         visit(main_frame, "main")
@@ -732,6 +737,7 @@ class PageStateExtractor:
         frame_origin = _origin(raw_frame.frame.url)
         snapshot = FrameSnapshot(
             frame_id=raw_frame.frame_id,
+            frame_path=raw_frame.frame_key,
             parent_frame_id=raw_frame.parent_frame_id,
             name=redact_text(raw_frame.frame.name, self.policy.redacted_names) or None,
             url=safe_url or "about:blank",
@@ -883,6 +889,7 @@ class PageStateExtractor:
                     captured.append(
                         ValueCapture(
                             name=name,
+                            safe_value=safe,
                             value_hash=hash_text(raw),
                             redacted=True,
                         )

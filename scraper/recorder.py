@@ -443,10 +443,6 @@ class BrowserRecorder:
     async def _finalize_response(self, response: Response) -> None:
         request = response.request
         capture = await self._request_capture(request)
-        try:
-            await response.finished()
-        except PlaywrightError:
-            pass
         headers = await self._response_headers(response)
         body = await self._capture_response_body(response, headers)
         completed_at = utc_now()

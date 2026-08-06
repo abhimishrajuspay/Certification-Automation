@@ -173,6 +173,7 @@ class ValueCapture(EvidenceModel):
 
     name: str = Field(min_length=1)
     value: Optional[str] = None
+    safe_value: Optional[str] = None
     value_hash: Optional[str] = Field(default=None, pattern=SHA256_PATTERN)
     redacted: bool = False
 
@@ -182,6 +183,13 @@ class ValueCapture(EvidenceModel):
 
         if self.redacted and self.value is not None:
             raise ValueError("redacted values must not contain plaintext")
+        if self.safe_value is not None and not self.redacted:
+            raise ValueError("safe_value is only valid for redacted values")
+        if self.safe_value is not None and not any(
+            marker in self.safe_value.lower()
+            for marker in ("[redacted]", "%5bredacted%5d")
+        ):
+            raise ValueError("safe_value must contain an explicit redaction marker")
         return self
 
 
@@ -349,6 +357,7 @@ class FrameSnapshot(EvidenceModel):
     """Evidence for one frame in a browser state."""
 
     frame_id: str = Field(min_length=1)
+    frame_path: str = Field(default="main", min_length=1)
     parent_frame_id: Optional[str] = None
     name: Optional[str] = None
     url: str = Field(min_length=1)

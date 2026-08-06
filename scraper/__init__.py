@@ -12,6 +12,15 @@ from scraper.artifact_store import (
     StoreNotFoundError,
     StreamPosition,
 )
+from scraper.actions import (
+    ActionExecutionError,
+    ActionExecutionOutcome,
+    ActionExecutor,
+    ActionPlanner,
+    ActionPlanningError,
+    ActionPolicyConfig,
+    PlannedAction,
+)
 from scraper.browser import (
     BrowserLaunchConfig,
     BrowserLifecycleError,
@@ -24,6 +33,12 @@ from scraper.extractor import (
     PageStateExtractor,
     SnapshotConfig,
     SnapshotExtractionError,
+)
+from scraper.explorer import (
+    ExplorerConfig,
+    ExplorationError,
+    ExplorationResult,
+    StateGraphExplorer,
 )
 from scraper.models import (
     ActionCandidate,
@@ -54,7 +69,13 @@ from scraper.recorder import (
 
 __all__ = [
     "ActionCandidate",
+    "ActionExecutionError",
+    "ActionExecutionOutcome",
+    "ActionExecutor",
     "ActionKind",
+    "ActionPlanner",
+    "ActionPlanningError",
+    "ActionPolicyConfig",
     "ActionRisk",
     "ActionStatus",
     "ArtifactReference",
@@ -73,18 +94,23 @@ __all__ = [
     "CoverageReport",
     "CrawlLimits",
     "ElementSnapshot",
+    "ExplorerConfig",
+    "ExplorationError",
+    "ExplorationResult",
     "FrameElementCollection",
     "FrameSnapshot",
     "InteractionTransition",
     "NetworkExchange",
     "MUTATION_INIT_SCRIPT",
     "PageStateExtractor",
+    "PlannedAction",
     "RecordStream",
     "ScrapeRun",
     "ScrapeRunStatus",
     "SnapshotConfig",
     "SnapshotExtractionError",
     "StateSnapshot",
+    "StateGraphExplorer",
     "StoreAlreadyExistsError",
     "StoreCheckpoint",
     "StoreIntegrityError",

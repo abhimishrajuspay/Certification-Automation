@@ -73,6 +73,25 @@ def test_sensitive_values_and_artifact_paths_are_guarded() -> None:
     )
     assert redacted.value is None
 
+    safe_url = ValueCapture(
+        name="href",
+        safe_value="/next?token=[REDACTED]",
+        value_hash=SHA256,
+        redacted=True,
+    )
+    assert safe_url.safe_value == "/next?token=[REDACTED]"
+
+    with pytest.raises(ValidationError, match="only valid for redacted"):
+        ValueCapture(name="href", safe_value="/unsafe", redacted=False)
+
+    with pytest.raises(ValidationError, match="explicit redaction marker"):
+        ValueCapture(
+            name="href",
+            safe_value="/still-plaintext",
+            value_hash=SHA256,
+            redacted=True,
+        )
+
     with pytest.raises(ValidationError, match="must be relative"):
         ArtifactReference(
             artifact_id="escape",
