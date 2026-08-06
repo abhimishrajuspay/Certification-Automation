@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cz-certification-automation"
-version = "0.4.0"
-description = "Deterministic evidence crawler for generic CZ portals"
+version = "0.5.0"
+description = "Deterministic evidence and knowledge pipeline for generic CZ portals"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 cz-crawl = "scraper.cli:entrypoint"
+cz-normalize = "knowledge.cli:entrypoint"
 
 [project.optional-dependencies]
 dev = [
@@ -28,7 +29,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["scraper*"]
+include = ["scraper*", "knowledge*"]
 exclude = ["tests*"]
 
 [tool.pytest.ini_options]

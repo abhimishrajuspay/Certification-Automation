@@ -148,7 +148,11 @@ async def test_runner_crawls_local_portal_and_finalizes_integrity(
     assert result.exploration.coverage.bounded_complete is True
     assert result.exploration.coverage.actions_succeeded >= 1
     assert result.exploration.coverage.actions_failed == 0
-    review = next(action for action in actions if action.policy_rule.endswith(".run"))
+    review = next(
+        action
+        for action in actions
+        if action.policy_rule == "semantic.review.test_execution"
+    )
     assert review.status == ActionStatus.SKIPPED
     assert store.verify_integrity(strict=True).valid is True
 

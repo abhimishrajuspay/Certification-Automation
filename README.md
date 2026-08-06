@@ -6,8 +6,10 @@ pipeline for generic CZ portals.
 The active implementation contains the immutable evidence contract, durable
 artifact store, pre-navigation Playwright recorder, deterministic page
 snapshotter, action safety policy, bounded state-graph explorer, and production
-crawl runner. The runner can explicitly export a private authenticated session
-for reuse without mixing raw session material into crawl evidence.
+crawl runner. It now also includes the deterministic normalization boundary
+that turns immutable crawl evidence into cited, LLM-ready portal knowledge. The
+runner can explicitly export a private authenticated session for reuse without
+mixing raw session material into crawl evidence.
 
 ## Active architecture
 
@@ -21,10 +23,10 @@ Instrumented browser
   -> Postman Collection v2.1
 ```
 
-Deterministic browser recording, state extraction, graph exploration, and the
-authenticated production entrypoint are active. LLM synthesis, MCP retrieval,
-and Postman generation will be added in later phases without coupling them to
-evidence persistence.
+Deterministic browser recording, state extraction, graph exploration, the
+authenticated production entrypoint, and portal-knowledge normalization are
+active. LLM synthesis, MCP retrieval, and Postman generation will be added in
+later phases without coupling them to evidence persistence.
 
 ## Project layout
 
@@ -42,6 +44,12 @@ scraper/
   runner.py          # Typed auth/session boundary and production orchestration
   cli.py             # Secret-safe validation and crawl command
   __main__.py        # python -m scraper entrypoint
+knowledge/
+  models.py          # Strict normalized tables, testcases, routes, and coverage
+  builder.py         # Generic semantic extraction from immutable crawl evidence
+  exporter.py        # Atomic audit JSON and compact testcase JSONL export
+  cli.py             # Crawl-to-knowledge command
+  __main__.py        # python -m knowledge entrypoint
 tests/
   test_models.py
   test_artifact_store.py
@@ -53,6 +61,7 @@ tests/
   test_explorer_integration.py
   test_runner.py
   test_runner_integration.py
+  test_knowledge_builder.py
 ```
 
 ## Development
@@ -64,7 +73,7 @@ python -m pytest
 CZ_RUN_BROWSER_TESTS=1 python -m pytest -q \
   tests/test_browser_integration.py tests/test_snapshot_integration.py \
   tests/test_explorer_integration.py tests/test_runner_integration.py
-python -m py_compile scraper/*.py
+python -m py_compile scraper/*.py knowledge/*.py
 ```
 
 ## Running a crawl
@@ -212,6 +221,44 @@ whether the bounded frontier was exhausted and why each unexecuted action was
 skipped. Runtime restoration cannot undo server-side effects or reset storage
 for origins absent from the root frame tree, so only policy-approved safe
 actions are eligible for automatic replay.
+
+## Portal-knowledge normalization
+
+After a completed bounded crawl, normalize its evidence into the stable input
+contract for repository retrieval and the later LLM phase:
+
+```bash
+python -m knowledge --run-id portal-baseline
+```
+
+By default this reads `artifacts/crawls/portal-baseline` and writes an isolated
+package beneath `artifacts/knowledge/portal-baseline`:
+
+- `portal_knowledge.json` contains audit-grade normalized tables, testcase
+  fields, dependencies, controls, modal descriptions, routes, network
+  observations, conflicts, limitations, and immutable evidence citations.
+- `testcases.jsonl` contains one compact, deterministic LLM input record per
+  testcase while retaining source URLs and evidence state IDs.
+- `manifest.json` records file hashes, sizes, counts, and completion gates.
+
+Extraction is portal-agnostic: it uses semantic table headers, structural row
+relationships, dialog ancestry, and recorded action metadata rather than CZ
+text or CSS selectors. `source_bounded_complete` reports whether the entire
+configured crawl frontier completed. `testcase_context_complete` is a separate
+gate that is true only when the portal's declared total equals the normalized
+testcase count and every testcase has non-conflicting description evidence.
+
+A partial crawl can be inspected only through an explicit diagnostic export:
+
+```bash
+python -m knowledge \
+  --run-id portal-partial \
+  --allow-incomplete
+```
+
+Such a package preserves its source limitation and must not be treated as full
+portal coverage. `--skip-integrity-check` is also intended only for diagnostics;
+normal handoffs verify the crawl store before normalization.
 
 The previous agentic implementation is not part of the active import graph. A
 local recoverable copy is stored under `.deprecated/`, which is intentionally

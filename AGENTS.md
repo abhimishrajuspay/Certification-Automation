@@ -20,6 +20,11 @@ runner, authentication boundary, existing-run policy, and CLI in
 Phase 6.1 hardens reproducibility with a secret-free behavior manifest,
 explicit owner-only storage-state export/reuse, canonical nested targets, and
 deterministic popup execution/replay.
+Phase 7 is the LLM-free normalization boundary in `knowledge/`: generic tables,
+testcases, dependencies, row controls, modal descriptions, routes, and network
+observations are deduplicated into citation-rich portal knowledge. The audit
+package and compact testcase JSONL remain derived artifacts outside the crawl
+evidence store.
 
 Active code must not import from `.deprecated/`. The local legacy archive is
 for recovery and comparison only and is intentionally ignored by Git.
@@ -75,6 +80,16 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Existing completed runs may be returned only after strict integrity and
   configuration compatibility checks. Partial browser-frontier resume is not
   supported; new attempts must never overwrite old evidence.
+- Knowledge normalization requires a completed bounded crawl by default.
+  Incomplete diagnostic exports must be explicitly enabled and preserve that
+  limitation. `testcase_context_complete` is separate from whole-UI frontier
+  completion and is true only when declared, normalized, described, and
+  conflict-free testcase counts reconcile.
+- Knowledge extraction uses semantic table headers, structural row context, and
+  dialog ancestry; it must not introduce portal-specific CSS/text selectors.
+- Every normalized table row and testcase must retain citations to immutable
+  state, element, and artifact identifiers. Compact LLM JSONL may reduce those
+  citations to state IDs but must have an audit-grade package alongside it.
 
 ## Validation
 
@@ -82,7 +97,7 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Real browser test:
   `CZ_RUN_BROWSER_TESTS=1 venv/bin/python3 -m pytest -q tests/test_browser_integration.py tests/test_snapshot_integration.py tests/test_explorer_integration.py tests/test_runner_integration.py`
 - Compile check:
-  `venv/bin/python3 -m py_compile scraper/*.py`
+  `venv/bin/python3 -m py_compile scraper/*.py knowledge/*.py`
 - Full checks when development tools are installed: `ruff check .`,
   `ruff format --check .`, and `mypy .`
 
