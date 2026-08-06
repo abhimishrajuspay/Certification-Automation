@@ -1,83 +1,46 @@
-# CZ Certification Automation
+# Generic CZ Portal Automation
 
-Automated certification testing framework for CZ (Central Zone/Portal) environments.
+This repository is being rebuilt as a deterministic, scraping-first automation
+pipeline for generic CZ portals.
 
-## Features
+The active implementation currently contains Phase 1: the immutable evidence
+contract shared by the future browser recorder, snapshotter, state explorer,
+artifact store, and coverage reporter.
 
-- **Web Scraping**: Automated scraping of CZ portal test cases with Playwright
-- **Dependency Management**: DAG-based dependency resolution with automatic skip logic
-- **LLM-Driven Execution**: LiteLLM-powered payload generation and self-correction
-- **Dual Validation**: UI status verification and pod log analysis
-- **Human Review**: Web dashboard and CLI fallback for command approval
-- **Comprehensive Reporting**: HTML dashboard with dependency visualization
+## Active architecture
 
-## Installation
+```text
+Instrumented browser
+  -> deterministic state-graph crawler
+  -> immutable crawl evidence
+  -> normalized portal knowledge
+  -> repository and MCP retrieval
+  -> structured LLM synthesis
+  -> Postman Collection v2.1
+```
+
+Only the immutable crawl evidence layer is implemented. Browser automation,
+LLM synthesis, MCP retrieval, and Postman generation will be added in later
+phases without coupling them to the evidence models.
+
+## Project layout
+
+```text
+scraper/
+  __init__.py
+  models.py          # Immutable Pydantic evidence models
+tests/
+  test_models.py     # Contract validation and serialization tests
+```
+
+## Development
 
 ```bash
-pip install -r requirements.txt
-playwright install chromium
+python -m pip install -e ".[dev]"
+python -m pytest
+python -m py_compile scraper/models.py scraper/__init__.py tests/test_models.py
 ```
 
-## Configuration
-
-Copy `.env.example` to `.env` and configure:
-
-```bash
-cp .env.example .env
-```
-
-Required settings:
-- `CZ_BASE_URL`: CZ portal URL
-- `JSESSIONID`: Session cookie (or leave empty to be prompted)
-- `LITELLM_*`: LLM configuration
-- `K8S_*`: Kubernetes pod details
-
-## Usage
-
-### Basic Execution
-
-```bash
-python main.py
-```
-
-### With Repository Context
-
-```bash
-python main.py --repo-path /path/to/your/app
-```
-
-### Parallel Execution
-
-```bash
-python main.py --parallel --workers 8
-```
-
-### Human Review Mode
-
-```bash
-python main.py --human-review
-```
-
-### Dry Run
-
-```bash
-python main.py --dry-run
-```
-
-## Project Structure
-
-```
-cz_automation/
-├── config/           # Configuration and settings
-├── core/            # Core models, DAG engine, state machine
-├── scraper/         # Playwright-based web scraper
-├── llm_agent/       # LiteLLM client and prompt builder
-├── validator/       # UI and log validation
-├── reporting/       # HTML dashboard generation
-├── utils/           # Helper utilities and dashboard server
-└── main.py          # CLI entrypoint
-```
-
-## License
-
-MIT
+The previous agentic implementation is not part of the active import graph. A
+local recoverable copy is stored under `.deprecated/`, which is intentionally
+ignored by Git. The original tracked versions remain available in Git history.

@@ -4,47 +4,38 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cz-certification-automation"
-version = "0.1.0"
-description = "Automated certification framework for CZ (Central Zone) environment"
-authors = [{name = "Automation Team", email = "automation@company.com"}]
-license = {text = "MIT"}
+version = "0.2.0"
+description = "Deterministic evidence crawler for generic CZ portals"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
-    "playwright>=1.40",
-    "litellm>=1.0",
-    "pydantic>=2.0",
-    "pydantic-settings>=2.0",
-    "jinja2>=3.1",
-    "networkx>=3.0",
-    "click>=8.0",
-    "rich>=13.0",
-    "httpx>=0.25",
-    "tiktoken>=0.5",
+    "pydantic>=2.0,<3.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0",
-    "pytest-asyncio>=0.21",
     "black>=23.0",
     "flake8>=6.0",
     "mypy>=1.0",
+    "pytest>=7.0",
 ]
-
-[project.scripts]
-cz-auto = "main:cli"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["config*", "core*", "scraper*", "llm_agent*", "validator*", "reporting*", "utils*"]
+include = ["scraper*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
 
 [tool.black]
 line-length = 100
-target-version = ['py310']
+target-version = ["py310"]
 
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+strict_equality = true

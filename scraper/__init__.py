@@ -1,5 +1,41 @@
-"""Scraper module for CZ Certification Automation."""
+"""Deterministic evidence models for generic portal scraping."""
 
-from scraper.orchestrator import Scraper
+from scraper.models import (
+    ActionCandidate,
+    ActionKind,
+    ActionRisk,
+    ActionStatus,
+    ArtifactReference,
+    BrowserEvent,
+    BrowserEventKind,
+    CapturePolicy,
+    CoverageReport,
+    CrawlLimits,
+    ElementSnapshot,
+    FrameSnapshot,
+    InteractionTransition,
+    NetworkExchange,
+    ScrapeRun,
+    ScrapeRunStatus,
+    StateSnapshot,
+)
 
-__all__ = ["Scraper"]
+__all__ = [
+    "ActionCandidate",
+    "ActionKind",
+    "ActionRisk",
+    "ActionStatus",
+    "ArtifactReference",
+    "BrowserEvent",
+    "BrowserEventKind",
+    "CapturePolicy",
+    "CoverageReport",
+    "CrawlLimits",
+    "ElementSnapshot",
+    "FrameSnapshot",
+    "InteractionTransition",
+    "NetworkExchange",
+    "ScrapeRun",
+    "ScrapeRunStatus",
+    "StateSnapshot",
+]
