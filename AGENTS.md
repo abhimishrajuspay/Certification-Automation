@@ -14,7 +14,9 @@ is the pre-navigation Playwright lifecycle and browser recorder in
 `scraper/browser.py`, `scraper/recorder.py`, and `scraper/redaction.py`. Phase 4
 is deterministic page-state extraction in `scraper/extractor.py`.
 Phase 5 is safe action planning/execution and bounded graph exploration in
-`scraper/actions.py` and `scraper/explorer.py`.
+`scraper/actions.py` and `scraper/explorer.py`. Phase 6 is the typed production
+runner, authentication boundary, existing-run policy, and CLI in
+`scraper/runner.py`, `scraper/cli.py`, and `scraper/__main__.py`.
 
 Active code must not import from `.deprecated/`. The local legacy archive is
 for recovery and comparison only and is intentionally ignored by Git.
@@ -53,12 +55,19 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Every attempted or skipped candidate produces one causal transition. Crawl
   limits and incomplete restoration boundaries must appear in coverage.
 - Runtime output belongs under `artifacts/` and stays out of Git.
+- Authentication credentials must not be accepted as CLI flags or persisted.
+  Runtime storage-state paths stay outside manifests and command output.
+- Runtime root URLs may contain session query values; persist only the redacted
+  evidence URL while using the original URL in memory for navigation.
+- Existing completed runs may be returned only after strict integrity and
+  configuration compatibility checks. Partial browser-frontier resume is not
+  supported; new attempts must never overwrite old evidence.
 
 ## Validation
 
 - Focused tests: `venv/bin/python3 -m pytest -q tests`
 - Real browser test:
-  `CZ_RUN_BROWSER_TESTS=1 venv/bin/python3 -m pytest -q tests/test_browser_integration.py tests/test_snapshot_integration.py tests/test_explorer_integration.py`
+  `CZ_RUN_BROWSER_TESTS=1 venv/bin/python3 -m pytest -q tests/test_browser_integration.py tests/test_snapshot_integration.py tests/test_explorer_integration.py tests/test_runner_integration.py`
 - Compile check:
   `venv/bin/python3 -m py_compile scraper/*.py`
 - Full checks when development tools are installed: `ruff check .`,

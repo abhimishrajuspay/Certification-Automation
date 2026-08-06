@@ -5,7 +5,8 @@ pipeline for generic CZ portals.
 
 The active implementation contains the immutable evidence contract, durable
 artifact store, pre-navigation Playwright recorder, deterministic page
-snapshotter, action safety policy, and bounded state-graph explorer.
+snapshotter, action safety policy, bounded state-graph explorer, and production
+crawl runner.
 
 ## Active architecture
 
@@ -19,9 +20,10 @@ Instrumented browser
   -> Postman Collection v2.1
 ```
 
-Deterministic browser recording, state extraction, and graph exploration are
-active. LLM synthesis, MCP retrieval, and Postman generation will be added in
-later phases without coupling them to evidence persistence.
+Deterministic browser recording, state extraction, graph exploration, and the
+authenticated production entrypoint are active. LLM synthesis, MCP retrieval,
+and Postman generation will be added in later phases without coupling them to
+evidence persistence.
 
 ## Project layout
 
@@ -36,6 +38,9 @@ scraper/
   extractor.py       # Frame/DOM/element/storage/screenshot state snapshots
   actions.py         # Candidate derivation, safety policy, replay, and effects
   explorer.py        # Parent restoration, bounded frontier, coverage/finalize
+  runner.py          # Typed auth/session boundary and production orchestration
+  cli.py             # Secret-safe validation and crawl command
+  __main__.py        # python -m scraper entrypoint
 tests/
   test_models.py
   test_artifact_store.py
@@ -45,6 +50,8 @@ tests/
   test_snapshot_integration.py
   test_actions.py
   test_explorer_integration.py
+  test_runner.py
+  test_runner_integration.py
 ```
 
 ## Development
@@ -55,9 +62,62 @@ playwright install chromium
 python -m pytest
 CZ_RUN_BROWSER_TESTS=1 python -m pytest -q \
   tests/test_browser_integration.py tests/test_snapshot_integration.py \
-  tests/test_explorer_integration.py
+  tests/test_explorer_integration.py tests/test_runner_integration.py
 python -m py_compile scraper/*.py
 ```
+
+## Running a crawl
+
+Validate configuration without starting a browser or creating a run:
+
+```bash
+python -m scraper --url "https://portal.example.test/start" --validate-only
+```
+
+Run an anonymous or externally authenticated portal session:
+
+```bash
+python -m scraper \
+  --url "https://portal.example.test/start" \
+  --run-id portal-baseline
+```
+
+For interactive SSO, no username or password is accepted on the command line.
+The headed browser pauses until login is completed manually. A caller-provided
+ready selector is optional and is never hardcoded by the crawler:
+
+```bash
+python -m scraper \
+  --url "https://portal.example.test/start" \
+  --auth manual --headed \
+  --ready-selector "[data-portal-ready]"
+```
+
+An existing Playwright storage-state file can instead be injected at runtime:
+
+```bash
+python -m scraper \
+  --url "https://portal.example.test/start" \
+  --auth storage_state \
+  --storage-state ./local/session.json
+```
+
+The storage-state path is not written to the manifest or printed by
+`--validate-only`. Runtime URL values matching the redaction vocabulary are
+redacted before the root URL enters evidence. Storage artifacts contain hashes,
+not cookie or Web Storage plaintext. Screenshots and raw traces can still show
+sensitive rendered data and must be protected.
+
+Run IDs are exclusive by default. `--existing-run return_completed` verifies
+integrity and returns an already completed compatible run without launching a
+browser. `--existing-run new_attempt` creates `RUN_ID-attempt-N` without
+overwriting prior evidence. Resuming a partial live browser frontier is
+intentionally unsupported because credentials and live page state are not
+persisted; start a new attempt instead.
+
+The production path has been verified end to end with a local CZ-like HTTP
+fixture and real Chromium. A smoke run against an actual CZ environment remains
+deferred until a portal URL and authentication session are available.
 
 ## Evidence storage
 
