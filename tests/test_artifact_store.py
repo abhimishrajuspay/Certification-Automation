@@ -297,6 +297,25 @@ def test_blob_tampering_is_reported_and_strict_mode_raises(tmp_path: Path) -> No
         store.verify_integrity(strict=True)
 
 
+def test_missing_artifact_referenced_by_state_is_reported(tmp_path: Path) -> None:
+    store = ArtifactStore.create(tmp_path / "crawls", make_run())
+    reference = store.put_text(
+        ArtifactKind.DOM,
+        "<html></html>",
+        media_type="text/html",
+    )
+    state = make_state(0).model_copy(update={"artifacts": (reference,)})
+    store.append_record(state)
+    (store.run_directory / reference.relative_path).unlink()
+
+    report = store.verify_integrity()
+
+    assert report.valid is False
+    assert any("invalid referenced artifact" in issue for issue in report.issues)
+    with pytest.raises(StoreIntegrityError, match="invalid referenced artifact"):
+        store.verify_integrity(strict=True)
+
+
 def test_artifact_references_cannot_read_store_metadata(tmp_path: Path) -> None:
     store = ArtifactStore.create(tmp_path / "crawls", make_run())
     reference = store.put_text(ArtifactKind.DOM, "safe", media_type="text/plain")

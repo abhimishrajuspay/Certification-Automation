@@ -53,6 +53,7 @@ class ArtifactKind(str, Enum):
 
     MANIFEST = "manifest"
     DOM = "dom"
+    ELEMENTS = "elements"
     SCREENSHOT = "screenshot"
     ACCESSIBILITY_TREE = "accessibility_tree"
     STORAGE_STATE = "storage_state"
@@ -300,6 +301,8 @@ class ElementSnapshot(EvidenceModel):
     attributes: tuple[ValueCapture, ...] = ()
     value_hash: Optional[str] = Field(default=None, pattern=SHA256_PATTERN)
     value_redacted: bool = False
+    interactive: bool = False
+    interaction_signals: tuple[str, ...] = ()
     visible: bool = False
     enabled: bool = False
     editable: bool = False
@@ -321,6 +324,24 @@ class ElementSnapshot(EvidenceModel):
         primary_count = sum(locator.is_primary for locator in self.locators)
         if primary_count > 1:
             raise ValueError("an element can have at most one primary locator")
+        if len(self.interaction_signals) != len(set(self.interaction_signals)):
+            raise ValueError("interaction_signals must be unique")
+        return self
+
+
+class FrameElementCollection(EvidenceModel):
+    """Content-addressed structured element evidence for one frame."""
+
+    frame_id: str = Field(min_length=1)
+    elements: tuple[ElementSnapshot, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_elements(self) -> "FrameElementCollection":
+        element_ids = [element.element_id for element in self.elements]
+        if len(element_ids) != len(set(element_ids)):
+            raise ValueError("element identifiers must be unique within a frame")
+        if any(element.frame_id != self.frame_id for element in self.elements):
+            raise ValueError("all elements must reference the collection frame_id")
         return self
 
 
@@ -336,8 +357,25 @@ class FrameSnapshot(EvidenceModel):
     element_ids: tuple[str, ...] = ()
     child_frame_ids: tuple[str, ...] = ()
     dom_artifact: Optional[ArtifactReference] = None
+    elements_artifact: Optional[ArtifactReference] = None
     accessibility_artifact: Optional[ArtifactReference] = None
     limitations: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_artifact_kinds(self) -> "FrameSnapshot":
+        expected = (
+            (self.dom_artifact, ArtifactKind.DOM, "dom_artifact"),
+            (self.elements_artifact, ArtifactKind.ELEMENTS, "elements_artifact"),
+            (
+                self.accessibility_artifact,
+                ArtifactKind.ACCESSIBILITY_TREE,
+                "accessibility_artifact",
+            ),
+        )
+        for reference, kind, field_name in expected:
+            if reference is not None and reference.kind != kind:
+                raise ValueError(f"{field_name} must reference a {kind.value} artifact")
+        return self
 
 
 class StateSnapshot(EvidenceModel):
@@ -537,6 +575,7 @@ class CapturePolicy(EvidenceModel):
     capture_dom: bool = True
     capture_screenshots: bool = True
     capture_accessibility_tree: bool = True
+    capture_storage_state: bool = True
     capture_request_bodies: bool = True
     capture_response_bodies: bool = True
     capture_trace: bool = True
@@ -732,6 +771,7 @@ __all__ = [
     "EffectKind",
     "ElementContext",
     "ElementSnapshot",
+    "FrameElementCollection",
     "FrameSnapshot",
     "InteractionTransition",
     "LocatorCandidate",

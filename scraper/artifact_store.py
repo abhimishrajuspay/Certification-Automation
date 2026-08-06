@@ -669,6 +669,29 @@ class ArtifactStore:
                 except OSError as exc:
                     issues.append(f"failed to inspect blob {path.name}: {exc}")
 
+        references: dict[tuple[str, str, int], ArtifactReference] = {}
+        for model_type in _MODEL_STREAMS:
+            try:
+                for record in self.iter_records(model_type):
+                    for reference in self._walk_artifact_references(record):
+                        references[
+                            (
+                                reference.relative_path,
+                                reference.sha256,
+                                reference.byte_size,
+                            )
+                        ] = reference
+            except ArtifactStoreError:
+                # The stream scan above already reports the structural issue.
+                continue
+        for reference in references.values():
+            try:
+                self.read_bytes(reference)
+            except ArtifactStoreError as exc:
+                issues.append(
+                    f"invalid referenced artifact {reference.artifact_id}: {exc}"
+                )
+
         report = StoreIntegrityReport(
             run_id=self._run.run_id,
             streams=tuple(positions),
@@ -680,6 +703,26 @@ class ArtifactStore:
         if strict and issues:
             raise StoreIntegrityError("; ".join(issues))
         return report
+
+    @classmethod
+    def _walk_artifact_references(
+        cls,
+        value: object,
+    ) -> Iterator[ArtifactReference]:
+        if isinstance(value, ArtifactReference):
+            yield value
+            return
+        if isinstance(value, BaseModel):
+            for field_name in type(value).model_fields:
+                yield from cls._walk_artifact_references(getattr(value, field_name))
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from cls._walk_artifact_references(item)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                yield from cls._walk_artifact_references(item)
 
     def _scan_stream(
         self,

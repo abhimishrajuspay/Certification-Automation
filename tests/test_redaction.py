@@ -63,6 +63,10 @@ def test_text_redacts_bearer_assignments_and_xml_elements() -> None:
     assert "xml-secret" not in result
     assert "visible=ok" in result
 
+    html = '<iframe src="/frame?token=url-secret"></iframe>'
+    redacted_html = redact_text(html, REDACTED_NAMES)
+    assert redacted_html == '<iframe src="/frame?token=[REDACTED]"></iframe>'
+
 
 def test_structured_body_redaction_is_canonical() -> None:
     body, changed = redact_body(

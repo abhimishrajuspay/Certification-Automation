@@ -102,7 +102,7 @@ def redact_text(text: str, redacted_names: Sequence[str]) -> str:
             redacted,
         )
         redacted = re.sub(
-            rf"(?i)(\b{escaped}\b\s*[:=]\s*)([^\s,;&]+)",
+            rf"(?i)(\b{escaped}\b\s*[:=]\s*)([^\s,;&\"'<>\)]+)",
             rf"\1{REDACTED}",
             redacted,
         )

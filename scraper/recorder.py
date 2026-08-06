@@ -40,10 +40,31 @@ from scraper.redaction import capture_mapping, redact_body, redact_text, redact_
 
 MUTATION_INIT_SCRIPT = r"""
 (() => {
+    const listenerRegistry = new WeakMap();
+    const originalAddEventListener = EventTarget.prototype.addEventListener;
+    EventTarget.prototype.addEventListener = function(type, listener, options) {
+        if (this instanceof Element) {
+            let eventTypes = listenerRegistry.get(this);
+            if (!eventTypes) {
+                eventTypes = new Set();
+                listenerRegistry.set(this, eventTypes);
+            }
+            eventTypes.add(String(type).toLowerCase());
+        }
+        return originalAddEventListener.call(this, type, listener, options);
+    };
+    Object.defineProperty(window, '__czEvidenceEventTypesFor', {
+        value: (element) => Array.from(listenerRegistry.get(element) || []).sort(),
+        configurable: false,
+        enumerable: false,
+        writable: false,
+    });
+
     const BUFFER_KEY = '__czEvidenceMutationBuffer';
     const LIMIT = 50000;
     const buffer = [];
     let overflow = 0;
+    let version = 0;
 
     const safeText = (value) => {
         if (value === null || value === undefined) return null;
@@ -60,6 +81,7 @@ MUTATION_INIT_SCRIPT = r"""
     };
 
     const push = (entry) => {
+        version += 1;
         const item = { timestamp: Date.now(), ...entry };
         if (buffer.length < LIMIT) buffer.push(item);
         else overflow += 1;
@@ -85,6 +107,13 @@ MUTATION_INIT_SCRIPT = r"""
             }
             return items;
         },
+        configurable: false,
+        enumerable: false,
+        writable: false,
+    });
+
+    Object.defineProperty(window, '__czEvidenceMutationVersion', {
+        value: () => version,
         configurable: false,
         enumerable: false,
         writable: false,

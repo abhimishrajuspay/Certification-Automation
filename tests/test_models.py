@@ -10,6 +10,8 @@ from scraper.models import (
     ArtifactKind,
     ArtifactReference,
     CoverageReport,
+    ElementSnapshot,
+    FrameElementCollection,
     FrameSnapshot,
     InteractionTransition,
     ScrapeRun,
@@ -137,6 +139,29 @@ def test_state_snapshot_rejects_dangling_active_element() -> None:
             viewport=Viewport(width=1280, height=720),
             element_ids=("button-1",),
             active_element_id="missing",
+        )
+
+
+def test_frame_element_collection_guards_frame_and_element_identity() -> None:
+    element = ElementSnapshot(
+        element_id="button-1",
+        frame_id="frame-main",
+        tag="button",
+    )
+    collection = FrameElementCollection(
+        frame_id="frame-main",
+        elements=(element,),
+    )
+
+    assert collection.elements == (element,)
+
+    with pytest.raises(ValidationError, match="collection frame_id"):
+        FrameElementCollection(frame_id="other-frame", elements=(element,))
+
+    with pytest.raises(ValidationError, match="must be unique"):
+        FrameElementCollection(
+            frame_id="frame-main",
+            elements=(element, element),
         )
 
 
