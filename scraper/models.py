@@ -140,6 +140,12 @@ class BrowserEventKind(str, Enum):
     NAVIGATION = "navigation"
     DOM_CONTENT_LOADED = "dom_content_loaded"
     LOAD = "load"
+    PAGE_OPENED = "page_opened"
+    PAGE_CLOSED = "page_closed"
+    PAGE_CRASH = "page_crash"
+    FILE_CHOOSER = "file_chooser"
+    TRACE_SAVED = "trace_saved"
+    HAR_SAVED = "har_saved"
 
 
 class EffectKind(str, Enum):
@@ -440,6 +446,7 @@ class NetworkExchange(EvidenceModel):
     completed_at: Optional[datetime] = None
     duration_ms: Optional[int] = Field(default=None, ge=0)
     from_cache: bool = False
+    from_service_worker: bool = False
     failure_text: Optional[str] = None
     redirected_from_request_id: Optional[str] = None
 
@@ -530,6 +537,7 @@ class CapturePolicy(EvidenceModel):
     capture_dom: bool = True
     capture_screenshots: bool = True
     capture_accessibility_tree: bool = True
+    capture_request_bodies: bool = True
     capture_response_bodies: bool = True
     capture_trace: bool = True
     capture_har: bool = False

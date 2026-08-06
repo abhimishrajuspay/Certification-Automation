@@ -12,6 +12,13 @@ from scraper.artifact_store import (
     StoreNotFoundError,
     StreamPosition,
 )
+from scraper.browser import (
+    BrowserLaunchConfig,
+    BrowserLifecycleError,
+    BrowserManager,
+    BrowserName,
+    WaitUntil,
+)
 from scraper.models import (
     ActionCandidate,
     ActionKind,
@@ -31,6 +38,12 @@ from scraper.models import (
     ScrapeRunStatus,
     StateSnapshot,
 )
+from scraper.recorder import (
+    MUTATION_INIT_SCRIPT,
+    BrowserRecorder,
+    RecorderError,
+    RecorderStateError,
+)
 
 __all__ = [
     "ActionCandidate",
@@ -43,6 +56,11 @@ __all__ = [
     "ArtifactStoreError",
     "BrowserEvent",
     "BrowserEventKind",
+    "BrowserLaunchConfig",
+    "BrowserLifecycleError",
+    "BrowserManager",
+    "BrowserName",
+    "BrowserRecorder",
     "CapturePolicy",
     "CoverageReport",
     "CrawlLimits",
@@ -50,6 +68,7 @@ __all__ = [
     "FrameSnapshot",
     "InteractionTransition",
     "NetworkExchange",
+    "MUTATION_INIT_SCRIPT",
     "RecordStream",
     "ScrapeRun",
     "ScrapeRunStatus",
@@ -60,4 +79,7 @@ __all__ = [
     "StoreIntegrityReport",
     "StoreNotFoundError",
     "StreamPosition",
+    "RecorderError",
+    "RecorderStateError",
+    "WaitUntil",
 ]

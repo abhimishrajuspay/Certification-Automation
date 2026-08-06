@@ -9,7 +9,9 @@ repository retrieval, MCP, testcase synthesis, or Postman generation occurs.
 ## Active foundation
 
 Phase 1 is the immutable evidence contract in `scraper/models.py`. Phase 2 is
-the append-only, content-addressed store in `scraper/artifact_store.py`.
+the append-only, content-addressed store in `scraper/artifact_store.py`. Phase 3
+is the pre-navigation Playwright lifecycle and browser recorder in
+`scraper/browser.py`, `scraper/recorder.py`, and `scraper/redaction.py`.
 
 Active code must not import from `.deprecated/`. The local legacy archive is
 for recovery and comparison only and is intentionally ignored by Git.
@@ -27,15 +29,22 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Plaintext secrets must never be retained in values marked as redacted.
 - The crawl graph and future testcase dependency graph are separate concepts.
 - Browser collection remains deterministic and LLM-free.
+- Browser listeners and page init scripts must be installed before navigation.
+- Browser actions must run inside an action scope until their observable effects
+  settle so network and event evidence keeps its causal `action_id`.
+- Embedded HAR text must be redacted before persistence; raw Playwright traces
+  are explicitly unredacted sensitive artifacts.
 - Runtime output belongs under `artifacts/` and stays out of Git.
 
 ## Validation
 
 - Focused tests: `venv/bin/python3 -m pytest -q tests`
+- Real browser test:
+  `CZ_RUN_BROWSER_TESTS=1 venv/bin/python3 -m pytest -q tests/test_browser_integration.py`
 - Compile check:
-  `venv/bin/python3 -m py_compile scraper/models.py scraper/artifact_store.py scraper/__init__.py`
-- Full checks when development tools are installed: `black --check .`,
-  `flake8 .`, and `mypy .`
+  `venv/bin/python3 -m py_compile scraper/*.py`
+- Full checks when development tools are installed: `ruff check .`,
+  `ruff format --check .`, and `mypy .`
 
 ## Safety
 
