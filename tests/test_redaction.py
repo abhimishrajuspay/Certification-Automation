@@ -18,6 +18,8 @@ REDACTED_NAMES = (
     "cookie",
     "password",
     "token",
+    "csrf",
+    "otp",
     "secret",
 )
 
@@ -50,6 +52,12 @@ def test_url_redacts_sensitive_query_and_fragment_values() -> None:
     assert "%5BREDACTED%5D" in result
 
 
+def test_url_without_sensitive_fields_preserves_original_encoding() -> None:
+    url = "https://portal.test/ResetPassword?message=hello%20world&next=%2FHome"
+
+    assert redact_url(url, REDACTED_NAMES) == url
+
+
 def test_text_redacts_bearer_assignments_and_xml_elements() -> None:
     text = (
         'Authorization: Bearer abc.def password="hunter2" '
@@ -66,6 +74,10 @@ def test_text_redacts_bearer_assignments_and_xml_elements() -> None:
     html = '<iframe src="/frame?token=url-secret"></iframe>'
     redacted_html = redact_text(html, REDACTED_NAMES)
     assert redacted_html == '<iframe src="/frame?token=[REDACTED]"></iframe>'
+
+    console = redact_text("otp value: 123456", REDACTED_NAMES)
+    assert "123456" not in console
+    assert console == "otp value: [REDACTED]"
 
 
 def test_structured_body_redaction_is_canonical() -> None:

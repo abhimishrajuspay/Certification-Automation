@@ -157,3 +157,21 @@ def test_sensitive_select_options_are_hashed(tmp_path: Path) -> None:
     assert element.options[0].value is None
     assert element.options[0].value_hash is not None
     assert "secret-option" not in element.model_dump_json()
+
+
+def test_safe_href_encoding_does_not_create_invalid_redacted_capture(
+    tmp_path: Path,
+) -> None:
+    extractor = make_extractor(tmp_path)
+
+    attributes = extractor._attributes(  # noqa: SLF001 - pure boundary test
+        {
+            "href": "/ResetPassword?message=hello%20world&next=%2FHome",
+        },
+        current_value=None,
+    )
+
+    href = next(attribute for attribute in attributes if attribute.name == "href")
+    assert href.redacted is False
+    assert href.value == "/ResetPassword?message=hello%20world&next=%2FHome"
+    assert href.safe_value is None

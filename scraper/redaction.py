@@ -60,24 +60,27 @@ def redact_url(url: str, redacted_names: Sequence[str]) -> str:
     """Redact sensitive query and fragment values while preserving URL shape."""
 
     parts = urlsplit(url)
-    query = _redact_pairs(
-        parse_qsl(parts.query, keep_blank_values=True), redacted_names
-    )
+    query = parts.query
+    query_pairs = parse_qsl(parts.query, keep_blank_values=True)
+    if _contains_sensitive_pair(query_pairs, redacted_names):
+        query = urlencode(_redact_pairs(query_pairs, redacted_names), doseq=True)
     fragment = parts.fragment
     if fragment:
         fragment_pairs = parse_qsl(fragment, keep_blank_values=True)
-        if fragment_pairs:
+        if _contains_sensitive_pair(fragment_pairs, redacted_names):
             fragment = urlencode(
                 _redact_pairs(fragment_pairs, redacted_names), doseq=True
             )
         else:
             fragment = redact_text(fragment, redacted_names)
+    if query == parts.query and fragment == parts.fragment:
+        return url
     return urlunsplit(
         (
             parts.scheme,
             parts.netloc,
             parts.path,
-            urlencode(query, doseq=True),
+            query,
             fragment,
         )
     )
@@ -103,6 +106,12 @@ def redact_text(text: str, redacted_names: Sequence[str]) -> str:
         )
         redacted = re.sub(
             rf"(?i)(\b{escaped}\b\s*[:=]\s*)([^\s,;&\"'<>\)]+)",
+            rf"\1{REDACTED}",
+            redacted,
+        )
+        redacted = re.sub(
+            rf"(?i)(\b{escaped}\b\s+(?:value|code)\s*[:=]\s*)"
+            rf"([^\s,;&\"'<>\)]+)",
             rf"\1{REDACTED}",
             redacted,
         )
@@ -185,6 +194,13 @@ def _redact_pairs(
         (name, REDACTED if is_sensitive_name(name, redacted_names) else value)
         for name, value in pairs
     ]
+
+
+def _contains_sensitive_pair(
+    pairs: Sequence[tuple[str, str]],
+    redacted_names: Sequence[str],
+) -> bool:
+    return any(is_sensitive_name(name, redacted_names) for name, _ in pairs)
 
 
 def _redact_text_bytes(

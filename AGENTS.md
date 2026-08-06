@@ -32,6 +32,9 @@ for recovery and comparison only and is intentionally ignored by Git.
   streams; blobs are immutable and addressed by SHA-256.
 - Only manifests and checkpoints may use atomic replacement.
 - Plaintext secrets must never be retained in values marked as redacted.
+- URL redaction must preserve non-sensitive query encoding; a changed value is
+  not evidence of redaction unless an explicit marker is retained or the value
+  is reduced to a hash. OTP/CSRF console and metadata values are sensitive.
 - The crawl graph and future testcase dependency graph are separate concepts.
 - Browser collection remains deterministic and LLM-free.
 - Browser listeners and page init scripts must be installed before navigation.

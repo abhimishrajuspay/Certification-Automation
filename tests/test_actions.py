@@ -38,6 +38,7 @@ def _element(
     attributes: tuple[ValueCapture, ...] = (),
     checked: bool | None = None,
     options: tuple[SelectOptionSnapshot, ...] = (),
+    input_type: str | None = None,
 ) -> ElementSnapshot:
     return ElementSnapshot(
         element_id=element_id,
@@ -45,6 +46,7 @@ def _element(
         tag=tag,
         role=role,
         accessible_name=name,
+        input_type=input_type,
         attributes=attributes,
         interactive=True,
         interaction_signals=(f"role:{role}",),
@@ -206,3 +208,29 @@ async def test_review_actions_can_be_explicitly_enabled(tmp_path: Path) -> None:
 
     assert candidate.risk == ActionRisk.REVIEW_REQUIRED
     assert candidate.status == ActionStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_authentication_and_structural_submit_actions_require_review(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore.create(
+        tmp_path / "crawls",
+        ScrapeRun(
+            run_id="authentication-actions",
+            root_url="https://portal.test/login",
+            allowed_origins=("https://portal.test",),
+        ),
+    )
+    elements = (
+        _element("login", name="Login"),
+        _element("unnamed-submit", name="Continue", input_type="submit"),
+    )
+
+    planned = await ActionPlanner(store).plan(_capture(store, elements))
+    candidates = {item.element.element_id: item.candidate for item in planned}
+
+    assert candidates["login"].risk == ActionRisk.REVIEW_REQUIRED
+    assert candidates["login"].status == ActionStatus.SKIPPED
+    assert candidates["unnamed-submit"].risk == ActionRisk.REVIEW_REQUIRED
+    assert candidates["unnamed-submit"].policy_rule == "form.submit_requires_review"

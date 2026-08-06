@@ -290,7 +290,14 @@ FRAME_EXTRACTION_SCRIPT = r"""
             text: rawText.slice(0, config.maximumTextChars),
             textTruncated,
             title: normalized(element.getAttribute('title')),
-            inputType: element.tagName.toLowerCase() === 'input' ? String(element.type || '').toLowerCase() : '',
+            inputType: element.tagName.toLowerCase() === 'input'
+                ? String(element.type || '').toLowerCase()
+                : (element.tagName.toLowerCase() === 'button'
+                    ? String(
+                        element.getAttribute('type')
+                        || (element.closest('form') ? 'submit' : 'button')
+                    ).toLowerCase()
+                    : ''),
             attributes,
             value: currentValue(element),
             visible: visible(element),
@@ -365,6 +372,16 @@ FRAME_EXTRACTION_SCRIPT = r"""
         for (const script of Array.from(clone.querySelectorAll('script'))) {
             if (script.textContent) {
                 script.textContent = '[SCRIPT CONTENT OMITTED FROM SANITIZED DOM]';
+                changed = true;
+            }
+        }
+        for (const meta of Array.from(clone.querySelectorAll('meta[content]'))) {
+            const semanticName = meta.getAttribute('name')
+                || meta.getAttribute('http-equiv')
+                || meta.getAttribute('property')
+                || '';
+            if (sensitiveName(semanticName)) {
+                meta.setAttribute('content', REDACTED);
                 changed = true;
             }
         }
@@ -886,10 +903,15 @@ class PageStateExtractor:
                     else redact_text(raw, self.policy.redacted_names)
                 )
                 if safe != raw:
+                    normalized_safe = safe.lower()
+                    retains_marker = (
+                        "[redacted]" in normalized_safe
+                        or "%5bredacted%5d" in normalized_safe
+                    )
                     captured.append(
                         ValueCapture(
                             name=name,
-                            safe_value=safe,
+                            safe_value=safe if retains_marker else None,
                             value_hash=hash_text(raw),
                             redacted=True,
                         )

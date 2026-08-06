@@ -72,6 +72,7 @@ _SNAPSHOT_HTML = """<!doctype html>
 <html>
 <head>
   <title>Snapshot Fixture</title>
+  <meta name="_csrf" content="csrf-meta-secret">
   <style>
     body { min-height: 1800px; font-family: sans-serif; }
     .hidden { display: none; }
@@ -286,6 +287,7 @@ async def test_real_page_snapshot_is_complete_stable_and_secret_safe(
         "local-storage-secret",
         "session-storage-secret",
         "frame-url-secret",
+        "csrf-meta-secret",
     ):
         assert secret not in serialized_elements
         assert secret not in storage_data

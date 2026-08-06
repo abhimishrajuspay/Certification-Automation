@@ -72,6 +72,9 @@ class ActionPolicyConfig:
         "create",
         "download",
         "execute",
+        "authenticate",
+        "log in",
+        "login",
         "pay",
         "play",
         "production",
@@ -81,6 +84,7 @@ class ActionPolicyConfig:
         "run",
         "save",
         "send",
+        "sign in",
         "start",
         "submit",
         "transfer",
@@ -320,6 +324,15 @@ class ActionPlanner:
                 ActionRisk.BLOCKED,
                 f"semantic.blocked.{_rule_token(blocked)}",
                 f"semantic evidence contains blocked operation '{blocked}'",
+            )
+        if kind == ActionKind.CLICK and (element.input_type or "").lower() in {
+            "image",
+            "submit",
+        }:
+            return (
+                ActionRisk.REVIEW_REQUIRED,
+                "form.submit_requires_review",
+                "form submission can cause authentication or server-side effects",
             )
         review = _matching_keyword(description, self.config.review_keywords)
         if review:

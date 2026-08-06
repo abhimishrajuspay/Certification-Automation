@@ -604,6 +604,8 @@ class CapturePolicy(EvidenceModel):
         "x-api-key",
         "password",
         "token",
+        "csrf",
+        "otp",
         "secret",
     )
 

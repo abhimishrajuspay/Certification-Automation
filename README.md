@@ -135,8 +135,9 @@ frames, dialogs, popups, downloads, file choosers, workers, WebSockets,
 navigations, lifecycle events, DOM mutations, HAR, and trace references. Action
 scopes correlate asynchronous effects with the interaction that caused them.
 Sensitive header, URL, body, console, and HAR fields are redacted before they
-enter the evidence store. Trace archives are retained as explicitly unredacted
-raw evidence and must be handled as sensitive artifacts.
+enter the evidence store. This includes OTP/CSRF name-value patterns and
+security-related HTML metadata. Trace archives are retained as explicitly
+unredacted raw evidence and must be handled as sensitive artifacts.
 
 The state extractor waits for a bounded DOM-quiet window without clicking,
 then traverses the main document, child frames, and open shadow roots. It
