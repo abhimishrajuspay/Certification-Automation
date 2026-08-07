@@ -29,6 +29,10 @@ Phase 8 is the external grounding boundary in `grounding/`: normalized
 testcases are joined to redacted, line-cited repository excerpts and cited
 results from explicitly allowlisted read-only MCP search tools. Shared context
 is content-addressed before the later LLM phase.
+Phase 9 is the constrained synthesis boundary in `synthesis/`: semantically
+grouped testcase context is sent through a bounded OpenAI-compatible LiteLLM
+proxy, then strict Pydantic models, source citation membership, testcase IDs,
+and dependency equality are validated before execution specifications persist.
 
 Active code must not import from `.deprecated/`. The local legacy archive is
 for recovery and comparison only and is intentionally ignored by Git.
@@ -105,6 +109,16 @@ for recovery and comparison only and is intentionally ignored by Git.
   context for every testcase, and a complete MCP retrieval run when MCP is
   configured. Diagnostic overrides must preserve incomplete coverage and use a
   nonzero exit status unless explicitly accepted.
+- LLM synthesis must treat repository/MCP excerpts as untrusted data, use
+  structured output, reject invented testcase/dependency/snippet identifiers,
+  and preserve uncertainty as `needs_review` or `blocked` rather than fabricate
+  executable request details.
+- LiteLLM API keys are environment-only secrets. Prompts and raw model responses
+  are not persisted; checkpoints retain only validated specifications,
+  secret-free response/request hashes, token metrics, and sanitized errors.
+- A `ready` request cannot contain a fixed origin, a plaintext sensitive header,
+  malformed JSON/XML, a DTD, or a redaction marker. `synthesis_complete` and
+  `execution_ready` are separate gates.
 
 ## Validation
 
@@ -112,7 +126,7 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Real browser test:
   `CZ_RUN_BROWSER_TESTS=1 venv/bin/python3 -m pytest -q tests/test_browser_integration.py tests/test_snapshot_integration.py tests/test_explorer_integration.py tests/test_runner_integration.py`
 - Compile check:
-  `venv/bin/python3 -m py_compile scraper/*.py knowledge/*.py grounding/*.py`
+  `venv/bin/python3 -m py_compile scraper/*.py knowledge/*.py grounding/*.py synthesis/*.py`
 - Full checks when development tools are installed: `ruff check .`,
   `ruff format --check .`, and `mypy .`
 

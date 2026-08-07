@@ -10,7 +10,8 @@ crawl runner. It now also includes the deterministic normalization boundary
 that turns immutable crawl evidence into cited portal knowledge, plus bounded
 repository and MCP grounding for every normalized testcase. The runner can
 explicitly export a private authenticated session for reuse without mixing raw
-session material into crawl evidence.
+session material into crawl evidence. Phase 9 compiles that cited context into
+strict, review-aware HTTP execution specifications through a LiteLLM proxy.
 
 ## Active architecture
 
@@ -25,10 +26,9 @@ Instrumented browser
 ```
 
 Deterministic browser recording, state extraction, graph exploration, the
-authenticated production entrypoint, portal-knowledge normalization, and cited
-repository/MCP retrieval are active. Structured LLM synthesis and Postman
-generation will be added in later phases without coupling them to evidence
-persistence.
+authenticated production entrypoint, portal-knowledge normalization, cited
+repository/MCP retrieval, and constrained LLM synthesis are active. Postman
+generation remains a later deterministic phase.
 
 ## Project layout
 
@@ -60,6 +60,13 @@ grounding/
   exporter.py        # Atomic audit JSON and LLM-ready JSONL export
   cli.py             # Knowledge-to-grounding command
   __main__.py        # python -m grounding entrypoint
+synthesis/
+  models.py          # Strict HTTP request, assertion, review, and audit models
+  client.py          # Bounded OpenAI-compatible LiteLLM proxy client
+  builder.py         # Semantic batching, prompting, retries, and citation checks
+  exporter.py        # Atomic audit/JSONL export and resumable checkpoints
+  cli.py             # Grounding-to-execution-spec command
+  __main__.py        # python -m synthesis entrypoint
 tests/
   test_models.py
   test_artifact_store.py
@@ -73,6 +80,7 @@ tests/
   test_runner_integration.py
   test_knowledge_builder.py
   test_grounding.py
+  test_synthesis.py
 ```
 
 ## Development
@@ -84,7 +92,7 @@ python -m pytest
 CZ_RUN_BROWSER_TESTS=1 python -m pytest -q \
   tests/test_browser_integration.py tests/test_snapshot_integration.py \
   tests/test_explorer_integration.py tests/test_runner_integration.py
-python -m py_compile scraper/*.py knowledge/*.py grounding/*.py
+python -m py_compile scraper/*.py knowledge/*.py grounding/*.py synthesis/*.py
 ```
 
 ## Running a crawl
@@ -311,6 +319,59 @@ Grounding is complete only when Phase 7 testcase context is complete, every
 testcase has repository or MCP context, and configured MCP retrieval completed.
 Repository-only diagnostics can use `--no-mcp`. Incomplete output returns exit
 code 2 unless `--allow-incomplete-grounding` is explicitly supplied.
+
+## Constrained execution-spec synthesis
+
+First validate the Phase 8 package and inspect the number and size of planned
+model calls. This performs no network request and requires no model credential:
+
+```bash
+python -m synthesis --run-id portal-baseline --plan-only
+```
+
+Configure an OpenAI-compatible LiteLLM proxy. Supply the API key through the
+environment or a secret manager; it is never accepted as a CLI value or written
+to an artifact:
+
+```bash
+export CZ_LITELLM_URL="https://litellm.example.test"
+export CZ_LITELLM_MODEL="your-proxy-model-name"
+# Inject CZ_LITELLM_API_KEY with your shell or secret manager.
+
+python -m synthesis \
+  --run-id portal-baseline \
+  --maximum-cases-per-batch 8 \
+  --concurrency 2
+```
+
+Use `--no-api-key` only for a trusted proxy that authenticates outside the
+request. If the selected model cannot accept JSON Schema response formatting,
+use `--response-format json_object`; the same Pydantic validation still applies
+after the response. A stopped or partially failed run can continue without
+repeating completed batches:
+
+```bash
+python -m synthesis --run-id portal-baseline --resume
+```
+
+The default output under `artifacts/synthesis/<run-id>/` contains:
+
+- `synthesis.json`, the audit package with secret-free model-call hashes,
+  validation history, token totals, coverage, and every execution spec;
+- `execution_specs.jsonl`, one strict request/assertion specification per
+  successfully synthesized testcase;
+- `checkpoint.json`, atomically updated after each completed batch; and
+- `manifest.json`, with final output hashes and separate `synthesis_complete`
+  and `execution_ready` gates.
+
+Each testcase is classified as `ready`, `needs_review`, or `blocked`. A complete
+synthesis may still be not execution-ready when the cited sources do not contain
+enough facts. Ready requests cannot contain fixed origins, plaintext sensitive
+headers, invalid JSON/XML, redaction markers, invented snippet IDs, or changed
+dependencies. Every request/assertion placeholder has a typed environment,
+portal-field, cited-literal, generated, or dependency binding; copied portal
+values are checked against the Phase 8 input. Raw model responses and prompts
+are deliberately not persisted.
 
 The previous agentic implementation is not part of the active import graph. A
 local recoverable copy is stored under `.deprecated/`, which is intentionally
