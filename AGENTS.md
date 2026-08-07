@@ -33,6 +33,10 @@ Phase 9 is the constrained synthesis boundary in `synthesis/`: semantically
 grouped testcase context is sent through a bounded OpenAI-compatible LiteLLM
 proxy, then strict Pydantic models, source citation membership, testcase IDs,
 and dependency equality are validated before execution specifications persist.
+Phase 10 is the deterministic Postman boundary in `postman/`: only validated
+ready specifications are topologically ordered and rendered into Collection
+v2.1 requests, variable setup, dependency guards/extraction, response tests, and
+a secret-empty environment template.
 
 Active code must not import from `.deprecated/`. The local legacy archive is
 for recovery and comparison only and is intentionally ignored by Git.
@@ -119,6 +123,12 @@ for recovery and comparison only and is intentionally ignored by Git.
 - A `ready` request cannot contain a fixed origin, a plaintext sensitive header,
   malformed JSON/XML, a DTD, or a redaction marker. `synthesis_complete` and
   `execution_ready` are separate gates.
+- Postman generation is LLM-free and requires `execution_ready` by default.
+  Partial rendering must be explicit, include only the dependency-closed ready
+  subset, retain every skip reason, and never claim `generation_complete`.
+- Generated collections must gate children on parent pass status, reject
+  dependency cycles, keep credential environment values empty, and derive all
+  requests/assertions/extractions from validated Phase 9 fields.
 
 ## Validation
 
@@ -126,7 +136,7 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Real browser test:
   `CZ_RUN_BROWSER_TESTS=1 venv/bin/python3 -m pytest -q tests/test_browser_integration.py tests/test_snapshot_integration.py tests/test_explorer_integration.py tests/test_runner_integration.py`
 - Compile check:
-  `venv/bin/python3 -m py_compile scraper/*.py knowledge/*.py grounding/*.py synthesis/*.py`
+  `venv/bin/python3 -m py_compile scraper/*.py knowledge/*.py grounding/*.py synthesis/*.py postman/*.py`
 - Full checks when development tools are installed: `ruff check .`,
   `ruff format --check .`, and `mypy .`
 

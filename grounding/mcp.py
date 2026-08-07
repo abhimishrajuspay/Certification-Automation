@@ -213,7 +213,7 @@ class MCPClient:
                 "capabilities": {},
                 "clientInfo": {
                     "name": "cz-certification-automation",
-                    "version": "0.7.0",
+                    "version": "0.8.0",
                 },
             },
         )

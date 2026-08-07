@@ -61,7 +61,9 @@ Rules:
 8. Every {{PLACEHOLDER}} must have exactly one typed variable binding. Values
    copied from portal fields must name the exact source key and preserve its
    value. Credentials use sensitive environment bindings; generated values use
-   only the supported generator enum.
+   only the supported generator enum. Dependency bindings must identify the
+   parent testcase plus the response header, JSON path, XML path, or complete
+   response body from which Postman will extract the value.
 """
 
 _GROUP_FIELD_KEYS = {

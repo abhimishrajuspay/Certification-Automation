@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from knowledge.models import SHA256_PATTERN
 
 
-SYNTHESIS_SCHEMA_VERSION = "1.0"
+SYNTHESIS_SCHEMA_VERSION = "1.1"
 PROMPT_VERSION = "1.0"
 _ENVIRONMENT_VALUE = re.compile(r"^\{\{[A-Za-z_][A-Za-z0-9_]*\}\}$")
 _TEMPLATE_VALUE = re.compile(r"\{\{[A-Za-z_][A-Za-z0-9_]*\}\}")
@@ -231,6 +231,7 @@ class TemplateVariableBinding(SynthesisModel):
     value: Optional[str] = None
     source_key: Optional[str] = None
     dependency_case_id: Optional[str] = None
+    extraction_source: Optional[AssertionSource] = None
     generator: Optional[GeneratedValueKind] = None
     sensitive: bool = False
     description: str = Field(min_length=1)
@@ -244,6 +245,7 @@ class TemplateVariableBinding(SynthesisModel):
                     self.value,
                     self.source_key,
                     self.dependency_case_id,
+                    self.extraction_source,
                     self.generator,
                 )
             ):
@@ -253,6 +255,7 @@ class TemplateVariableBinding(SynthesisModel):
                 raise ValueError("portal-field bindings require source_key and value")
             if (
                 self.dependency_case_id is not None
+                or self.extraction_source is not None
                 or self.generator is not None
                 or self.sensitive
             ):
@@ -263,6 +266,7 @@ class TemplateVariableBinding(SynthesisModel):
             if (
                 self.source_key is not None
                 or self.dependency_case_id is not None
+                or self.extraction_source is not None
                 or self.generator is not None
                 or self.sensitive
             ):
@@ -280,13 +284,25 @@ class TemplateVariableBinding(SynthesisModel):
                 self.value is not None
                 or self.source_key is not None
                 or self.dependency_case_id is not None
+                or self.extraction_source is not None
                 or self.sensitive
             ):
                 raise ValueError("generated binding contains incompatible metadata")
         elif self.source == TemplateVariableSource.DEPENDENCY:
-            if not self.source_key or not self.dependency_case_id:
+            supported_sources = {
+                AssertionSource.JSON_PATH,
+                AssertionSource.XPATH,
+                AssertionSource.RESPONSE_HEADER,
+                AssertionSource.RESPONSE_BODY,
+            }
+            if (
+                not self.source_key
+                or not self.dependency_case_id
+                or self.extraction_source not in supported_sources
+            ):
                 raise ValueError(
-                    "dependency bindings require dependency_case_id and source_key"
+                    "dependency bindings require dependency_case_id, source_key, "
+                    "and a supported extraction_source"
                 )
             if self.value is not None or self.generator is not None or self.sensitive:
                 raise ValueError("dependency binding contains incompatible metadata")

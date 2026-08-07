@@ -289,6 +289,14 @@ def test_request_models_reject_unsafe_or_invalid_ready_specs() -> None:
         RequestBodySpec(mode=RequestBodyMode.JSON, template="{invalid")
     with pytest.raises(ValidationError, match="fixed origin"):
         HTTPRequestSpec(method=HTTPMethod.GET, path="https://api.example.test/path")
+    with pytest.raises(ValidationError, match="supported extraction_source"):
+        TemplateVariableBinding(
+            name="PARENT_VALUE",
+            source=TemplateVariableSource.DEPENDENCY,
+            source_key="$.id",
+            dependency_case_id="TC_PARENT",
+            description="Missing extraction source is rejected",
+        )
 
 
 @pytest.mark.asyncio

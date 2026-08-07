@@ -12,6 +12,8 @@ repository and MCP grounding for every normalized testcase. The runner can
 explicitly export a private authenticated session for reuse without mixing raw
 session material into crawl evidence. Phase 9 compiles that cited context into
 strict, review-aware HTTP execution specifications through a LiteLLM proxy.
+Phase 10 deterministically renders execution-ready specifications as a Postman
+Collection v2.1 plus a secret-empty environment template.
 
 ## Active architecture
 
@@ -28,7 +30,7 @@ Instrumented browser
 Deterministic browser recording, state extraction, graph exploration, the
 authenticated production entrypoint, portal-knowledge normalization, cited
 repository/MCP retrieval, and constrained LLM synthesis are active. Postman
-generation remains a later deterministic phase.
+Collection v2.1 generation is also active and remains LLM-free by design.
 
 ## Project layout
 
@@ -67,6 +69,12 @@ synthesis/
   exporter.py        # Atomic audit/JSONL export and resumable checkpoints
   cli.py             # Grounding-to-execution-spec command
   __main__.py        # python -m synthesis entrypoint
+postman/
+  models.py          # Strict Collection v2.1, environment, and audit contracts
+  builder.py         # Dependency ordering, variables, scripts, and assertions
+  exporter.py        # Atomic collection/environment/report export
+  cli.py             # Execution-spec-to-Postman command
+  __main__.py        # python -m postman entrypoint
 tests/
   test_models.py
   test_artifact_store.py
@@ -81,6 +89,7 @@ tests/
   test_knowledge_builder.py
   test_grounding.py
   test_synthesis.py
+  test_postman.py
 ```
 
 ## Development
@@ -92,7 +101,8 @@ python -m pytest
 CZ_RUN_BROWSER_TESTS=1 python -m pytest -q \
   tests/test_browser_integration.py tests/test_snapshot_integration.py \
   tests/test_explorer_integration.py tests/test_runner_integration.py
-python -m py_compile scraper/*.py knowledge/*.py grounding/*.py synthesis/*.py
+python -m py_compile \
+  scraper/*.py knowledge/*.py grounding/*.py synthesis/*.py postman/*.py
 ```
 
 ## Running a crawl
@@ -372,6 +382,44 @@ dependencies. Every request/assertion placeholder has a typed environment,
 portal-field, cited-literal, generated, or dependency binding; copied portal
 values are checked against the Phase 8 input. Raw model responses and prompts
 are deliberately not persisted.
+
+The LLM—not MCP—makes these decisions. Phase 8 MCP tools only retrieve cited
+documentation. Phase 9 sends portal facts plus those excerpts to the configured
+LiteLLM model, which proposes the HTTP method/path, payload, typed variables,
+assertions, confidence, and ready/review/blocked disposition. Local validators
+reject unsupported or invented output before anything reaches Postman.
+
+## Postman Collection v2.1 generation
+
+After Phase 9 has produced `execution_specs.jsonl`, inspect deterministic render
+coverage without writing files:
+
+```bash
+python -m postman --run-id portal-baseline --plan-only
+```
+
+Generate the final package only when Phase 9 reports `execution_ready: true`:
+
+```bash
+python -m postman --run-id portal-baseline
+```
+
+The default output under `artifacts/postman/<run-id>/` contains:
+
+- `postman_collection.json`, with requests in dependency order, typed variable
+  setup, dependency guards, response assertions, and parent-response extraction;
+- `postman_environment.json`, containing an empty `base_url` plus empty runtime
+  credential variables marked as secrets;
+- `postman_report.json`, with rendered/skipped testcase coverage and reasons;
+  and
+- `manifest.json`, containing content hashes and `generation_complete`.
+
+The renderer never asks MCP or an LLM to make another decision. It translates
+only validated Phase 9 fields. A child request is skipped unless all parents
+passed, dependency cycles are rejected, and environment secrets are never copied
+into generated files. For diagnostics, `--allow-partial` renders only the ready,
+dependency-closed subset and records every omission; it never claims complete
+generation.
 
 The previous agentic implementation is not part of the active import graph. A
 local recoverable copy is stored under `.deprecated/`, which is intentionally
