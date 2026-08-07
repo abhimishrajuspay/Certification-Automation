@@ -7,9 +7,10 @@ The active implementation contains the immutable evidence contract, durable
 artifact store, pre-navigation Playwright recorder, deterministic page
 snapshotter, action safety policy, bounded state-graph explorer, and production
 crawl runner. It now also includes the deterministic normalization boundary
-that turns immutable crawl evidence into cited, LLM-ready portal knowledge. The
-runner can explicitly export a private authenticated session for reuse without
-mixing raw session material into crawl evidence.
+that turns immutable crawl evidence into cited portal knowledge, plus bounded
+repository and MCP grounding for every normalized testcase. The runner can
+explicitly export a private authenticated session for reuse without mixing raw
+session material into crawl evidence.
 
 ## Active architecture
 
@@ -24,9 +25,10 @@ Instrumented browser
 ```
 
 Deterministic browser recording, state extraction, graph exploration, the
-authenticated production entrypoint, and portal-knowledge normalization are
-active. LLM synthesis, MCP retrieval, and Postman generation will be added in
-later phases without coupling them to evidence persistence.
+authenticated production entrypoint, portal-knowledge normalization, and cited
+repository/MCP retrieval are active. Structured LLM synthesis and Postman
+generation will be added in later phases without coupling them to evidence
+persistence.
 
 ## Project layout
 
@@ -50,6 +52,14 @@ knowledge/
   exporter.py        # Atomic audit JSON and compact testcase JSONL export
   cli.py             # Crawl-to-knowledge command
   __main__.py        # python -m knowledge entrypoint
+grounding/
+  models.py          # Strict repository/MCP citations and coverage gates
+  repository.py      # Bounded, redacted, line-cited local retrieval
+  mcp.py             # Async JSON-RPC client with read-only tool allowlist
+  builder.py         # Grouped testcase retrieval and shared snippet assembly
+  exporter.py        # Atomic audit JSON and LLM-ready JSONL export
+  cli.py             # Knowledge-to-grounding command
+  __main__.py        # python -m grounding entrypoint
 tests/
   test_models.py
   test_artifact_store.py
@@ -62,6 +72,7 @@ tests/
   test_runner.py
   test_runner_integration.py
   test_knowledge_builder.py
+  test_grounding.py
 ```
 
 ## Development
@@ -73,7 +84,7 @@ python -m pytest
 CZ_RUN_BROWSER_TESTS=1 python -m pytest -q \
   tests/test_browser_integration.py tests/test_snapshot_integration.py \
   tests/test_explorer_integration.py tests/test_runner_integration.py
-python -m py_compile scraper/*.py knowledge/*.py
+python -m py_compile scraper/*.py knowledge/*.py grounding/*.py
 ```
 
 ## Running a crawl
@@ -259,6 +270,47 @@ python -m knowledge \
 Such a package preserves its source limitation and must not be treated as full
 portal coverage. `--skip-integrity-check` is also intended only for diagnostics;
 normal handoffs verify the crawl store before normalization.
+
+## Repository and MCP grounding
+
+Ground a normalized package against the integration repository and the MCP
+documentation server before sending anything to an LLM:
+
+```bash
+export CZ_MCP_URL="http://10.200.3.108:8000/mcp"
+python -m grounding \
+  --run-id portal-baseline \
+  --repo-path /path/to/integration-repository
+```
+
+The repository scanner reads only an explicit extension allowlist for schemas,
+templates, examples, and documentation. It does not follow symlinks, skips
+hidden/build/runtime directories, enforces per-file and total byte limits, and
+redacts sensitive name/value patterns before excerpts are retained. Citations
+contain a relative path, raw file SHA-256, line range, and excerpt digest; the
+absolute repository path is not exported.
+
+The MCP client performs a standard JSON-RPC initialize and tool-discovery
+handshake. Automatic grounding can invoke only the advertised `search_docs` and
+`search_documents` tools. Testcases are grouped by semantic API identity so a
+portal with many scenarios for one API does not issue one remote query per row.
+Every retained MCP excerpt records the server/protocol identity, tool,
+argument/response digests, retrieval time, and document/chunk references.
+Payload-generation, sandbox execution, validation, and other side-effecting or
+generative MCP tools are never called by this phase.
+
+The default output under `artifacts/grounding/<run-id>/` contains:
+
+- `grounding.json`, the audit-grade package with shared content-addressed
+  snippets and per-testcase references;
+- `grounded_testcases.jsonl`, one self-contained context record per testcase for
+  the next structured LLM phase; and
+- `manifest.json`, containing output hashes and the `grounding_complete` gate.
+
+Grounding is complete only when Phase 7 testcase context is complete, every
+testcase has repository or MCP context, and configured MCP retrieval completed.
+Repository-only diagnostics can use `--no-mcp`. Incomplete output returns exit
+code 2 unless `--allow-incomplete-grounding` is explicitly supplied.
 
 The previous agentic implementation is not part of the active import graph. A
 local recoverable copy is stored under `.deprecated/`, which is intentionally

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cz-certification-automation"
-version = "0.5.0"
-description = "Deterministic evidence and knowledge pipeline for generic CZ portals"
+version = "0.6.0"
+description = "Cited evidence, normalization, and grounding pipeline for generic CZ portals"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,6 +16,7 @@ dependencies = [
 [project.scripts]
 cz-crawl = "scraper.cli:entrypoint"
 cz-normalize = "knowledge.cli:entrypoint"
+cz-ground = "grounding.cli:entrypoint"
 
 [project.optional-dependencies]
 dev = [
@@ -29,7 +30,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["scraper*", "knowledge*"]
+include = ["scraper*", "knowledge*", "grounding*"]
 exclude = ["tests*"]
 
 [tool.pytest.ini_options]

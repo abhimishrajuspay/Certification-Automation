@@ -25,6 +25,10 @@ testcases, dependencies, row controls, modal descriptions, routes, and network
 observations are deduplicated into citation-rich portal knowledge. The audit
 package and compact testcase JSONL remain derived artifacts outside the crawl
 evidence store.
+Phase 8 is the external grounding boundary in `grounding/`: normalized
+testcases are joined to redacted, line-cited repository excerpts and cited
+results from explicitly allowlisted read-only MCP search tools. Shared context
+is content-addressed before the later LLM phase.
 
 Active code must not import from `.deprecated/`. The local legacy archive is
 for recovery and comparison only and is intentionally ignored by Git.
@@ -90,6 +94,17 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Every normalized table row and testcase must retain citations to immutable
   state, element, and artifact identifiers. Compact LLM JSONL may reduce those
   citations to state IDs but must have an audit-grade package alongside it.
+- Repository grounding must be suffix-allowlisted, size-bounded, symlink-safe,
+  secret-redacted, and cited by relative path, raw file digest, and line range.
+  A repository path must never be sent to MCP or persisted as an absolute path.
+- Automatic MCP grounding may invoke only advertised tools on the explicit
+  read-only allowlist. Calls are grouped by semantic API identity, bounded,
+  retried only for transport failures, and retain argument/response hashes plus
+  document/chunk references when the server supplies them.
+- `grounding_complete` requires complete Phase 7 testcase context, external
+  context for every testcase, and a complete MCP retrieval run when MCP is
+  configured. Diagnostic overrides must preserve incomplete coverage and use a
+  nonzero exit status unless explicitly accepted.
 
 ## Validation
 
@@ -97,7 +112,7 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Real browser test:
   `CZ_RUN_BROWSER_TESTS=1 venv/bin/python3 -m pytest -q tests/test_browser_integration.py tests/test_snapshot_integration.py tests/test_explorer_integration.py tests/test_runner_integration.py`
 - Compile check:
-  `venv/bin/python3 -m py_compile scraper/*.py knowledge/*.py`
+  `venv/bin/python3 -m py_compile scraper/*.py knowledge/*.py grounding/*.py`
 - Full checks when development tools are installed: `ruff check .`,
   `ruff format --check .`, and `mypy .`
 
