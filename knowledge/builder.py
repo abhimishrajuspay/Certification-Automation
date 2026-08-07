@@ -15,6 +15,7 @@ from scraper.models import (
     ActionCandidate,
     ActionStatus,
     CoverageReport,
+    CrawlCompletionGoal,
     ElementSnapshot,
     FrameElementCollection,
     FrameSnapshot,
@@ -170,18 +171,28 @@ class PortalKnowledgeBuilder:
         run = self.store.reload_manifest()
         coverage_records = tuple(self.store.iter_records(CoverageReport))
         source_coverage = coverage_records[-1] if coverage_records else None
-        source_complete = bool(
+        source_bounded_complete = bool(
             run.status == ScrapeRunStatus.COMPLETED
             and source_coverage is not None
             and source_coverage.bounded_complete
         )
-        if not source_complete and not self.config.allow_incomplete:
+        source_goal_complete = bool(
+            run.status == ScrapeRunStatus.COMPLETED
+            and source_coverage is not None
+            and source_coverage.configured_goal_complete
+        )
+        source_acceptable = source_bounded_complete or bool(
+            source_goal_complete
+            and source_coverage is not None
+            and source_coverage.completion_goal == CrawlCompletionGoal.TESTCASE_CONTEXT
+        )
+        if not source_acceptable and not self.config.allow_incomplete:
             raise KnowledgeBuildError(
-                "normalization requires a completed, bounded crawl; use "
-                "allow_incomplete only for diagnostic output"
+                "normalization requires a completed crawl goal; use allow_incomplete "
+                "only for diagnostic output"
             )
         if self.config.verify_integrity:
-            integrity = self.store.verify_integrity(strict=source_complete)
+            integrity = self.store.verify_integrity(strict=source_acceptable)
             if not integrity.valid:
                 raise KnowledgeBuildError(
                     "crawl evidence failed integrity validation: "
@@ -228,12 +239,29 @@ class PortalKnowledgeBuilder:
 
         limitations = list(source_coverage.limitations if source_coverage else ())
         limitations.extend(declared_limitations)
-        if not source_complete:
+        if not source_acceptable:
             limitations.append("knowledge was generated from incomplete crawl evidence")
         missing = tuple(
             case.test_case_id for case in test_cases if case.description is None
         )
         conflicts = tuple(case.test_case_id for case in test_cases if case.conflicts)
+        testcase_context_complete = bool(
+            declared_total is not None
+            and declared_total == len(test_cases)
+            and not missing
+            and not conflicts
+        )
+        if (
+            source_coverage is not None
+            and source_coverage.completion_goal == CrawlCompletionGoal.TESTCASE_CONTEXT
+            and source_goal_complete
+            and not testcase_context_complete
+            and not self.config.allow_incomplete
+        ):
+            raise KnowledgeBuildError(
+                "crawl reported a complete testcase-context goal, but normalized "
+                "evidence does not satisfy that gate"
+            )
         if missing:
             limitations.append(
                 f"{len(missing)} normalized testcases lack captured detail descriptions"
@@ -252,13 +280,8 @@ class PortalKnowledgeBuilder:
         started_at = run.started_at or min(state.captured_at for state in states)
         knowledge_coverage = KnowledgeCoverage(
             source_status=run.status,
-            source_bounded_complete=source_complete,
-            testcase_context_complete=bool(
-                declared_total is not None
-                and declared_total == len(test_cases)
-                and not missing
-                and not conflicts
-            ),
+            source_bounded_complete=source_bounded_complete,
+            testcase_context_complete=testcase_context_complete,
             states_examined=len(states),
             routes_normalized=len(routes),
             tables_normalized=len(normalized_tables),

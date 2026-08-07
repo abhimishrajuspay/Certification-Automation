@@ -10,6 +10,7 @@ from scraper.models import (
     ArtifactKind,
     ArtifactReference,
     CoverageReport,
+    CrawlCompletionGoal,
     ElementSnapshot,
     FrameElementCollection,
     FrameSnapshot,
@@ -18,6 +19,7 @@ from scraper.models import (
     ScrapeRunStatus,
     ScrollPosition,
     StateSnapshot,
+    TestcaseContextCoverage as ContextCoverage,
     ValueCapture,
     Viewport,
 )
@@ -301,3 +303,26 @@ def test_coverage_counts_must_reconcile() -> None:
     )
 
     assert coverage.bounded_complete is True
+    assert coverage.configured_goal_complete is True
+
+    testcase_goal = CoverageReport(
+        run_id="run-1",
+        action_candidates=2,
+        actions_succeeded=1,
+        actions_pending=1,
+        unexplored_action_ids=("action-2",),
+        bounded_complete=False,
+        completion_goal=CrawlCompletionGoal.TESTCASE_CONTEXT,
+        goal_complete=True,
+        testcase_context=ContextCoverage(
+            declared_test_cases=1,
+            test_cases_discovered=1,
+            descriptions_captured=1,
+            stable_observations=2,
+            context_complete=True,
+        ),
+        completion_reason="testcase context complete",
+    )
+
+    assert testcase_goal.configured_goal_complete is True
+    assert testcase_goal.bounded_complete is False

@@ -13,7 +13,8 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import ValidationError
 
 from scraper.browser import BrowserName
-from scraper.models import CapturePolicy, CrawlLimits
+from scraper.explorer import ExplorerConfig
+from scraper.models import CapturePolicy, CrawlCompletionGoal, CrawlLimits
 from scraper.runner import (
     AuthenticationMode,
     CrawlRequest,
@@ -112,6 +113,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=10_737_418_240,
     )
     parser.add_argument(
+        "--completion-goal",
+        choices=[item.value for item in CrawlCompletionGoal],
+        default=CrawlCompletionGoal.BOUNDED_FRONTIER.value,
+        help=(
+            "successful completion condition; testcase_context stops after the "
+            "declared testcase total, unique IDs, and descriptions reconcile"
+        ),
+    )
+    parser.add_argument(
+        "--testcase-context-stability-observations",
+        type=_positive_int,
+        default=2,
+        help="complete captures required before testcase-context early stop",
+    )
+    parser.add_argument(
         "--screenshots",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -208,6 +224,12 @@ def request_from_args(args: argparse.Namespace) -> CrawlRequest:
         ready_selector=args.ready_selector,
         limits=limits,
         capture_policy=capture_policy,
+        explorer_config=ExplorerConfig(
+            completion_goal=CrawlCompletionGoal(args.completion_goal),
+            testcase_context_stability_observations=(
+                args.testcase_context_stability_observations
+            ),
+        ),
     )
 
 
@@ -236,7 +258,7 @@ async def async_main(argv: Optional[Sequence[str]] = None) -> int:
                 sort_keys=True,
             )
         )
-        return 0 if result.exploration.coverage.bounded_complete else 2
+        return 0 if result.exploration.coverage.configured_goal_complete else 2
     except (CrawlRunnerError, ValidationError, ValueError) as exc:
         print(f"cz-crawl: {exc}", file=sys.stderr)
         return 1
@@ -278,6 +300,10 @@ def _validation_summary(request: CrawlRequest) -> dict[str, object]:
         "ready_selector_configured": request.ready_selector is not None,
         "existing_run_policy": request.existing_run_policy.value,
         "limits": request.limits.model_dump(mode="json"),
+        "completion_goal": request.explorer_config.completion_goal.value,
+        "testcase_context_stability_observations": (
+            request.explorer_config.testcase_context_stability_observations
+        ),
         "capture_policy": request.capture_policy.model_dump(mode="json"),
     }
 

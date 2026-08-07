@@ -28,13 +28,16 @@ from scraper.models import (
     BrowserEvent,
     BrowserEventKind,
     CoverageReport,
+    CrawlCompletionGoal,
     EffectKind,
     InteractionTransition,
     ScrapeRunStatus,
+    TestcaseContextCoverage,
     utc_now,
 )
 from scraper.recorder import BrowserRecorder, RecorderError
 from scraper.redaction import redact_text
+from scraper.testcase_context import TestcaseContextTracker
 
 
 RESTORE_STORAGE_SCRIPT = r"""
@@ -57,10 +60,14 @@ class ExplorerConfig:
 
     restore_timeout_ms: int = 15_000
     capture_initial_state: bool = True
+    completion_goal: CrawlCompletionGoal = CrawlCompletionGoal.BOUNDED_FRONTIER
+    testcase_context_stability_observations: int = 2
 
     def __post_init__(self) -> None:
         if self.restore_timeout_ms <= 0:
             raise ValueError("restore_timeout_ms must be positive")
+        if self.testcase_context_stability_observations <= 0:
+            raise ValueError("testcase_context_stability_observations must be positive")
 
 
 @dataclass(frozen=True)
@@ -150,6 +157,14 @@ class StateGraphExplorer:
             raise
         ledger.sequence += 1
         ledger.states[root_capture.state.fingerprint] = root_capture
+        context_tracker = (
+            TestcaseContextTracker(self.config.testcase_context_stability_observations)
+            if self.config.completion_goal == CrawlCompletionGoal.TESTCASE_CONTEXT
+            else None
+        )
+        testcase_context = (
+            context_tracker.observe(root_capture) if context_tracker else None
+        )
         frontier: deque[_GraphNode] = deque(
             [_GraphNode(capture=root_capture, path=(), depth=0)]
         )
@@ -157,6 +172,7 @@ class StateGraphExplorer:
         observation_frontier: deque[_GraphNode] = deque()
         completion_reason = "frontier exhausted"
         runtime_limited = False
+        testcase_goal_stopped = False
         attempted_actions = 0
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.limits.maximum_runtime_seconds
@@ -220,11 +236,24 @@ class StateGraphExplorer:
                     capture = outcome.capture
                     if capture is None:
                         continue
+                    if context_tracker is not None:
+                        testcase_context = context_tracker.observe(capture)
+                        if testcase_context.stable_for_early_stop:
+                            completion_reason = "testcase context complete"
+                            ledger.limitations.add(
+                                "configured testcase-context goal reached before "
+                                "bounded frontier exhaustion"
+                            )
+                            testcase_goal_stopped = True
                     existing = ledger.states.get(capture.state.fingerprint)
                     if existing is not None:
                         ledger.duplicate_states += 1
+                        if testcase_goal_stopped:
+                            break
                         continue
                     ledger.states[capture.state.fingerprint] = capture
+                    if testcase_goal_stopped:
+                        break
                     if planned.candidate.risk == ActionRisk.REVIEW_REQUIRED:
                         ledger.limitations.add(
                             "review-required action results are terminal branches "
@@ -248,13 +277,17 @@ class StateGraphExplorer:
                         frontier.append(child)
                 if runtime_limited:
                     break
+                if testcase_goal_stopped:
+                    break
         except Exception as exc:
             await self._finalize_failed_run(started_at, ledger, str(exc))
             raise
 
         coverage = await self._coverage(
             ledger,
-            bounded_complete=not runtime_limited,
+            bounded_complete=not runtime_limited and not testcase_goal_stopped,
+            completion_goal=self.config.completion_goal,
+            testcase_context=testcase_context,
             completion_reason=completion_reason,
         )
         await asyncio.to_thread(self.store.append_record, coverage)
@@ -267,7 +300,7 @@ class StateGraphExplorer:
         )
         final_status = (
             ScrapeRunStatus.COMPLETED
-            if coverage.bounded_complete
+            if coverage.configured_goal_complete
             else ScrapeRunStatus.PARTIAL
         )
         final_run = self.store.run.model_copy(
@@ -444,6 +477,8 @@ class StateGraphExplorer:
         ledger: _ExplorationLedger,
         *,
         bounded_complete: bool,
+        completion_goal: CrawlCompletionGoal,
+        testcase_context: Optional[TestcaseContextCoverage],
         completion_reason: str,
     ) -> CoverageReport:
         transitioned = {transition.action_id for transition in ledger.transitions}
@@ -490,6 +525,12 @@ class StateGraphExplorer:
             limitations.add(
                 "cross-origin frames are restored only when present in the root frame tree"
             )
+        effective_bounded_complete = bounded_complete and not pending_ids
+        goal_complete = (
+            effective_bounded_complete
+            if completion_goal == CrawlCompletionGoal.BOUNDED_FRONTIER
+            else bool(testcase_context and testcase_context.context_complete)
+        )
         return CoverageReport(
             run_id=self.store.run.run_id,
             states_discovered=len(captures),
@@ -517,7 +558,10 @@ class StateGraphExplorer:
             ),
             unexplored_action_ids=pending_ids,
             limitations=tuple(sorted(limitations)),
-            bounded_complete=bounded_complete and not pending_ids,
+            bounded_complete=effective_bounded_complete,
+            completion_goal=completion_goal,
+            goal_complete=goal_complete,
+            testcase_context=testcase_context,
             completion_reason=completion_reason,
         )
 

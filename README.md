@@ -121,6 +121,26 @@ python -m scraper \
   --run-id portal-baseline
 ```
 
+For certification extraction, select the testcase-context completion goal. The
+crawler stops cleanly once the portal's declared testcase total equals the
+unique testcase IDs, every ID has a non-conflicting detail-dialog description,
+and that complete evidence remains stable across two captures:
+
+```bash
+python -m scraper \
+  --url "https://portal.example.test/start" \
+  --run-id portal-testcases \
+  --completion-goal testcase_context
+```
+
+This is a successful run (`status: completed`, exit code `0`) even when
+unrelated UI actions remain. Its coverage deliberately reports
+`goal_complete: true` and `bounded_complete: false`, so testcase completeness
+is never confused with full UI-frontier exhaustion. The stability threshold is
+configurable with `--testcase-context-stability-observations`, but two is the
+recommended default. Portals without a declared testcase total cannot satisfy
+this goal and continue until another configured limit or frontier exhaustion.
+
 For interactive SSO, no username or password is accepted on the command line.
 The headed browser pauses until login is completed manually. A caller-provided
 ready selector is optional and is never hardcoded by the crawler:
@@ -253,7 +273,7 @@ actions are eligible for automatic replay.
 
 ## Portal-knowledge normalization
 
-After a completed bounded crawl, normalize its evidence into the stable input
+After a completed crawl goal, normalize its evidence into the stable input
 contract for repository retrieval and the later LLM phase:
 
 ```bash
@@ -276,6 +296,9 @@ text or CSS selectors. `source_bounded_complete` reports whether the entire
 configured crawl frontier completed. `testcase_context_complete` is a separate
 gate that is true only when the portal's declared total equals the normalized
 testcase count and every testcase has non-conflicting description evidence.
+A successful `testcase_context` crawl is accepted directly by this phase even
+when `source_bounded_complete` is false; the normalizer independently recomputes
+the testcase gate from immutable evidence before accepting the handoff.
 
 A partial crawl can be inspected only through an explicit diagnostic export:
 

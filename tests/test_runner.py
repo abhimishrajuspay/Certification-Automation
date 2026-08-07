@@ -20,6 +20,7 @@ from scraper.explorer import ExplorerConfig
 from scraper.extractor import SnapshotConfig
 from scraper.models import (
     CoverageReport,
+    CrawlCompletionGoal,
     ScrapeRun,
     ScrapeRunStatus,
     StateSnapshot,
@@ -236,6 +237,38 @@ def test_manifest_persists_complete_behavior_policy(tmp_path: Path) -> None:
     assert behavior.action.execution_timeout_ms == 8_000
     assert behavior.action.popup_detection_timeout_ms == 250
     assert behavior.explorer.restore_timeout_ms == 9_000
+
+
+@pytest.mark.asyncio
+async def test_cli_exposes_testcase_context_completion_goal(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    status = await async_main(
+        [
+            "--url",
+            PORTAL_URL,
+            "--completion-goal",
+            "testcase_context",
+            "--testcase-context-stability-observations",
+            "3",
+            "--validate-only",
+        ]
+    )
+
+    summary = json.loads(capsys.readouterr().out)
+    assert status == 0
+    assert summary["completion_goal"] == "testcase_context"
+    assert summary["testcase_context_stability_observations"] == 3
+    request = CrawlRequest(
+        root_url=PORTAL_URL,
+        explorer_config=ExplorerConfig(
+            completion_goal=CrawlCompletionGoal.TESTCASE_CONTEXT,
+            testcase_context_stability_observations=3,
+        ),
+    )
+    assert request.explorer_config.completion_goal == (
+        CrawlCompletionGoal.TESTCASE_CONTEXT
+    )
 
 
 @pytest.mark.asyncio

@@ -14,12 +14,13 @@ import pytest
 from scraper.actions import ActionExecutor, ActionPlanner
 from scraper.artifact_store import ArtifactStore
 from scraper.browser import BrowserLaunchConfig, BrowserManager
-from scraper.explorer import StateGraphExplorer
+from scraper.explorer import ExplorerConfig, StateGraphExplorer
 from scraper.extractor import PageStateExtractor, SnapshotConfig
 from scraper.models import (
     ActionCandidate,
     ActionStatus,
     CapturePolicy,
+    CrawlCompletionGoal,
     CrawlLimits,
     EffectKind,
     InteractionTransition,
@@ -39,6 +40,8 @@ class _ExplorerFixtureHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/":
             self._send_html(_EXPLORER_HTML)
+        elif path == "/testcase-context":
+            self._send_html(_TESTCASE_CONTEXT_HTML)
         elif path == "/frame":
             self._send_html(_FRAME_HTML)
         elif path == "/popup":
@@ -143,6 +146,39 @@ _EXPLORER_HTML = """<!doctype html>
         finish('<section><h2>Frame result visible</h2></section>');
       }
     });
+  </script>
+</body>
+</html>
+"""
+
+
+_TESTCASE_CONTEXT_HTML = """<!doctype html>
+<html>
+<head><title>Testcase context fixture</title></head>
+<body>
+  <table>
+    <thead><tr><th>API Name</th><th>Total TCs</th></tr></thead>
+    <tbody><tr><td>Payments</td><td>2</td></tr></tbody>
+  </table>
+  <table>
+    <thead><tr><th>TC ID</th><th>API Name</th><th>Status</th><th>Info</th></tr></thead>
+    <tbody>
+      <tr><td>TC_01</td><td>Payments</td><td>pending</td><td><button data-case="TC_01" aria-label="Information for TC_01">i</button></td></tr>
+      <tr><td>TC_02</td><td>Payments</td><td>pending</td><td><button data-case="TC_02" aria-label="Information for TC_02">i</button></td></tr>
+    </tbody>
+  </table>
+  <div id="modal-root"></div>
+  <script>
+    const modalRoot = document.querySelector('#modal-root');
+    for (const button of document.querySelectorAll('button[data-case]')) {
+      button.addEventListener('click', () => {
+        const caseId = button.dataset.case;
+        modalRoot.innerHTML = `<div role="dialog" aria-label="Test Case Details"><div role="document" class="modal-body">${caseId}: validates the payment flow</div><button aria-label="Close details">Close</button></div>`;
+        modalRoot.querySelector('button').addEventListener('click', () => {
+          modalRoot.replaceChildren();
+        });
+      });
+    }
   </script>
 </body>
 </html>
@@ -283,3 +319,75 @@ async def test_real_graph_exploration_restores_parents_and_records_effects(
     assert checkpoint.last_state_id in result.state_ids
     assert checkpoint.last_transition_id in result.transition_ids
     assert store.verify_integrity(strict=True).valid is True
+
+
+@pytest.mark.skipif(
+    not RUN_BROWSER_TESTS,
+    reason="set CZ_RUN_BROWSER_TESTS=1 to run real Chromium verification",
+)
+@pytest.mark.asyncio
+async def test_testcase_context_goal_stops_with_success_before_frontier_exhaustion(
+    tmp_path: Path,
+    explorer_portal: str,
+) -> None:
+    url = f"{explorer_portal}/testcase-context"
+    run = ScrapeRun(
+        run_id="testcase-context-run",
+        root_url=url,
+        allowed_origins=(explorer_portal,),
+        limits=CrawlLimits(
+            maximum_depth=5,
+            maximum_states=20,
+            maximum_actions=20,
+            maximum_runtime_seconds=60,
+        ),
+        capture_policy=CapturePolicy(
+            capture_dom=False,
+            capture_screenshots=False,
+            capture_accessibility_tree=False,
+            capture_trace=False,
+            capture_har=False,
+        ),
+    )
+    store = ArtifactStore.create(tmp_path / "crawls", run)
+    manager = BrowserManager(
+        store,
+        BrowserLaunchConfig(headless=True, viewport_width=1280, viewport_height=720),
+    )
+
+    try:
+        page = await manager.start()
+        await manager.navigate(url)
+        extractor = PageStateExtractor(
+            store,
+            manager.recorder,
+            SnapshotConfig(
+                quiet_window_ms=100,
+                quiet_timeout_ms=2_000,
+                full_page_screenshot=False,
+            ),
+        )
+        result = await StateGraphExplorer(
+            store,
+            manager.recorder,
+            extractor,
+            ActionPlanner(store),
+            ActionExecutor(store, manager.recorder, extractor),
+            ExplorerConfig(
+                completion_goal=CrawlCompletionGoal.TESTCASE_CONTEXT,
+                testcase_context_stability_observations=2,
+            ),
+        ).explore(page)
+    finally:
+        await manager.stop()
+
+    context = result.coverage.testcase_context
+    assert context is not None
+    assert result.completion_reason == "testcase context complete"
+    assert result.coverage.configured_goal_complete is True
+    assert result.coverage.bounded_complete is False
+    assert context.declared_test_cases == 2
+    assert context.test_cases_discovered == 2
+    assert context.descriptions_captured == 2
+    assert context.stable_for_early_stop is True
+    assert store.run.status == ScrapeRunStatus.COMPLETED

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -15,7 +16,8 @@ from knowledge.builder import (
     _contains_identifier,
 )
 from knowledge.exporter import KnowledgeExportError, export_knowledge
-from scraper.artifact_store import ArtifactStore
+from scraper.artifact_store import AppendReceipt, ArtifactStore
+from scraper.extractor import CapturedState
 from scraper.models import (
     ActionCandidate,
     ActionKind,
@@ -23,6 +25,7 @@ from scraper.models import (
     ActionStatus,
     ArtifactKind,
     CoverageReport,
+    CrawlCompletionGoal,
     ElementContext,
     ElementSnapshot,
     FrameElementCollection,
@@ -32,9 +35,11 @@ from scraper.models import (
     ScrapeRun,
     ScrapeRunStatus,
     StateSnapshot,
+    TestcaseContextCoverage as ContextCoverage,
     ValueCapture,
     Viewport,
 )
+from scraper.testcase_context import TestcaseContextTracker as ContextTracker
 
 
 NOW = datetime(2026, 8, 6, 10, 0, tzinfo=timezone.utc)
@@ -455,7 +460,7 @@ def test_incomplete_crawl_is_rejected_unless_explicitly_allowed(
 ) -> None:
     store = _build_store(tmp_path, completed=False)
 
-    with pytest.raises(KnowledgeBuildError, match="completed, bounded"):
+    with pytest.raises(KnowledgeBuildError, match="completed crawl goal"):
         PortalKnowledgeBuilder(store).build()
 
     diagnostic = PortalKnowledgeBuilder(
@@ -468,6 +473,84 @@ def test_incomplete_crawl_is_rejected_unless_explicitly_allowed(
     assert "knowledge was generated from incomplete crawl evidence" in (
         diagnostic.coverage.limitations
     )
+
+
+def test_incremental_completion_tracker_matches_normalized_context_gate(
+    tmp_path: Path,
+) -> None:
+    store = _build_store(tmp_path, completed=True)
+    tracker = ContextTracker(required_stable_observations=2)
+    observations = []
+    for state in store.iter_records(StateSnapshot):
+        frame = state.frames[0]
+        assert frame.elements_artifact is not None
+        elements = FrameElementCollection.model_validate_json(
+            store.read_bytes(frame.elements_artifact)
+        ).elements
+        observations.append(
+            tracker.observe(
+                CapturedState(
+                    state=state,
+                    elements=elements,
+                    receipt=cast(AppendReceipt, object()),
+                )
+            )
+        )
+
+    assert observations[0].declared_test_cases == 2
+    assert observations[0].test_cases_discovered == 2
+    assert observations[0].descriptions_captured == 0
+    assert observations[1].descriptions_captured == 1
+    assert observations[2].context_complete is True
+    assert observations[2].stable_observations == 1
+    assert observations[2].stable_for_early_stop is False
+
+    stable = tracker.observe(
+        CapturedState(
+            state=tuple(store.iter_records(StateSnapshot))[-1],
+            elements=elements,
+            receipt=cast(AppendReceipt, object()),
+        )
+    )
+    knowledge = PortalKnowledgeBuilder(store).build()
+
+    assert stable.stable_for_early_stop is True
+    assert stable.declared_test_cases == knowledge.coverage.declared_test_cases
+    assert stable.test_cases_discovered == knowledge.coverage.test_cases_normalized
+    assert stable.descriptions_captured == knowledge.coverage.descriptions_captured
+
+
+def test_completed_testcase_goal_is_a_normalizable_non_frontier_handoff(
+    tmp_path: Path,
+) -> None:
+    store = _build_store(tmp_path, completed=True)
+    store.append_record(
+        CoverageReport(
+            run_id=store.run.run_id,
+            generated_at=NOW + timedelta(seconds=4),
+            bounded_complete=False,
+            completion_goal=CrawlCompletionGoal.TESTCASE_CONTEXT,
+            goal_complete=True,
+            testcase_context=ContextCoverage(
+                declared_test_cases=2,
+                test_cases_discovered=2,
+                descriptions_captured=2,
+                stable_observations=2,
+                required_stable_observations=2,
+                context_complete=True,
+            ),
+            completion_reason="testcase context complete",
+        )
+    )
+    store.save_manifest(
+        store.run.model_copy(update={"completion_reason": "testcase context complete"})
+    )
+
+    knowledge = PortalKnowledgeBuilder(store).build()
+
+    assert knowledge.coverage.source_status == ScrapeRunStatus.COMPLETED
+    assert knowledge.coverage.source_bounded_complete is False
+    assert knowledge.coverage.testcase_context_complete is True
 
 
 def test_knowledge_export_is_deterministic_and_requires_explicit_overwrite(

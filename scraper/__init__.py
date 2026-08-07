@@ -53,6 +53,7 @@ from scraper.models import (
     CapturePolicy,
     CoverageReport,
     CrawlBehaviorPolicy,
+    CrawlCompletionGoal,
     CrawlLimits,
     ElementSnapshot,
     ExplorerBehaviorPolicy,
@@ -64,6 +65,7 @@ from scraper.models import (
     ScrapeRunStatus,
     SnapshotBehaviorPolicy,
     StateSnapshot,
+    TestcaseContextCoverage,
 )
 from scraper.recorder import (
     MUTATION_INIT_SCRIPT,
@@ -84,6 +86,7 @@ from scraper.runner import (
     ResumeUnavailableError,
     StorageStateExportError,
 )
+from scraper.testcase_context import TestcaseContextTracker
 
 __all__ = [
     "ActionCandidate",
@@ -115,6 +118,7 @@ __all__ = [
     "CapturedState",
     "CoverageReport",
     "CrawlBehaviorPolicy",
+    "CrawlCompletionGoal",
     "CrawlLimits",
     "CrawlRequest",
     "CrawlRunResult",
@@ -143,6 +147,8 @@ __all__ = [
     "SnapshotExtractionError",
     "StateSnapshot",
     "StateGraphExplorer",
+    "TestcaseContextCoverage",
+    "TestcaseContextTracker",
     "StoreAlreadyExistsError",
     "StoreCheckpoint",
     "StoreIntegrityError",

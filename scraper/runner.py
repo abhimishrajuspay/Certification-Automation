@@ -397,6 +397,10 @@ class CrawlRunner:
             explorer=ExplorerBehaviorPolicy(
                 restore_timeout_ms=explorer.restore_timeout_ms,
                 capture_initial_state=explorer.capture_initial_state,
+                completion_goal=explorer.completion_goal,
+                testcase_context_stability_observations=(
+                    explorer.testcase_context_stability_observations
+                ),
             ),
         )
 

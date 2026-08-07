@@ -48,6 +48,13 @@ class ScrapeRunStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class CrawlCompletionGoal(str, Enum):
+    """Configured condition that makes a crawl successful."""
+
+    BOUNDED_FRONTIER = "bounded_frontier"
+    TESTCASE_CONTEXT = "testcase_context"
+
+
 class ArtifactKind(str, Enum):
     """Kinds of content-addressed artifacts produced by the scraper."""
 
@@ -732,6 +739,8 @@ class ExplorerBehaviorPolicy(EvidenceModel):
 
     restore_timeout_ms: int = Field(default=15_000, gt=0)
     capture_initial_state: bool = True
+    completion_goal: CrawlCompletionGoal = CrawlCompletionGoal.BOUNDED_FRONTIER
+    testcase_context_stability_observations: int = Field(default=2, gt=0)
 
 
 class CrawlBehaviorPolicy(EvidenceModel):
@@ -810,6 +819,57 @@ class ScrapeRun(EvidenceModel):
         return self
 
 
+class TestcaseContextCoverage(EvidenceModel):
+    """Progress toward a complete, internally consistent testcase context."""
+
+    declared_test_cases: Optional[int] = Field(default=None, ge=0)
+    test_cases_discovered: int = Field(default=0, ge=0)
+    descriptions_captured: int = Field(default=0, ge=0)
+    missing_description_ids: tuple[str, ...] = ()
+    conflicting_test_case_ids: tuple[str, ...] = ()
+    declared_total_conflicts: tuple[str, ...] = ()
+    stable_observations: int = Field(default=0, ge=0)
+    required_stable_observations: int = Field(default=2, gt=0)
+    context_complete: bool = False
+
+    @model_validator(mode="after")
+    def validate_context_counts(self) -> "TestcaseContextCoverage":
+        if self.descriptions_captured > self.test_cases_discovered:
+            raise ValueError("description count cannot exceed testcase count")
+        if len(self.missing_description_ids) != (
+            self.test_cases_discovered - self.descriptions_captured
+        ):
+            raise ValueError("missing description IDs do not match coverage counts")
+        for values, name in (
+            (self.missing_description_ids, "missing description IDs"),
+            (self.conflicting_test_case_ids, "conflicting testcase IDs"),
+            (self.declared_total_conflicts, "declared total conflicts"),
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError(f"{name} must be unique")
+        complete = bool(
+            self.declared_test_cases is not None
+            and self.declared_test_cases == self.test_cases_discovered
+            and not self.missing_description_ids
+            and not self.conflicting_test_case_ids
+            and not self.declared_total_conflicts
+        )
+        if self.context_complete != complete:
+            raise ValueError("context_complete does not match testcase coverage")
+        if not self.context_complete and self.stable_observations:
+            raise ValueError("incomplete testcase context cannot be stable")
+        return self
+
+    @property
+    def stable_for_early_stop(self) -> bool:
+        """Return whether complete evidence remained stable long enough to stop."""
+
+        return bool(
+            self.context_complete
+            and self.stable_observations >= self.required_stable_observations
+        )
+
+
 class CoverageReport(EvidenceModel):
     """Machine-readable bounded-completeness report for a scrape run."""
 
@@ -833,6 +893,9 @@ class CoverageReport(EvidenceModel):
     unexplored_action_ids: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
     bounded_complete: bool = False
+    completion_goal: CrawlCompletionGoal = CrawlCompletionGoal.BOUNDED_FRONTIER
+    goal_complete: Optional[bool] = None
+    testcase_context: Optional[TestcaseContextCoverage] = None
     completion_reason: str = Field(min_length=1)
 
     @field_validator("generated_at")
@@ -852,7 +915,28 @@ class CoverageReport(EvidenceModel):
             raise ValueError("unexplored_action_ids must be unique")
         if self.bounded_complete and self.actions_pending:
             raise ValueError("a bounded-complete run cannot have pending actions")
+        if self.goal_complete is not None:
+            if (
+                self.completion_goal == CrawlCompletionGoal.BOUNDED_FRONTIER
+                and self.goal_complete != self.bounded_complete
+            ):
+                raise ValueError("frontier goal must match bounded completeness")
+            if self.completion_goal == CrawlCompletionGoal.TESTCASE_CONTEXT:
+                if self.testcase_context is None:
+                    raise ValueError("testcase goal requires testcase context coverage")
+                if self.goal_complete != self.testcase_context.context_complete:
+                    raise ValueError(
+                        "testcase goal must match testcase context coverage"
+                    )
         return self
+
+    @property
+    def configured_goal_complete(self) -> bool:
+        """Resolve legacy reports to their historical frontier-success meaning."""
+
+        if self.goal_complete is not None:
+            return self.goal_complete
+        return self.bounded_complete
 
 
 def _require_aware_datetime(value: datetime) -> datetime:
