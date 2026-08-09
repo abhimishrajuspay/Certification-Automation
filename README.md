@@ -14,6 +14,9 @@ session material into crawl evidence. Phase 9 compiles that cited context into
 strict, review-aware HTTP execution specifications through a LiteLLM proxy.
 Phase 10 deterministically renders execution-ready specifications as a Postman
 Collection v2.1 plus a secret-empty environment template.
+Phase 11 adds an agentic repository-remediation boundary that can search/read
+code and MCP guidance, propose new APIs or configuration, and apply an approved
+hash-locked plan only after isolated build/test verification succeeds.
 
 ## Active architecture
 
@@ -24,6 +27,7 @@ Instrumented browser
   -> normalized portal knowledge
   -> repository and MCP retrieval
   -> structured LLM synthesis
+  -> optional reviewed repository remediation
   -> Postman Collection v2.1
 ```
 
@@ -75,6 +79,13 @@ postman/
   exporter.py        # Atomic collection/environment/report export
   cli.py             # Execution-spec-to-Postman command
   __main__.py        # python -m postman entrypoint
+remediation/
+  models.py          # Tool turns, cited file changes, approvals, apply reports
+  workspace.py       # Confined search/read plus isolated verification and apply
+  builder.py         # Bounded LiteLLM repository/MCP tool loop
+  io.py              # Atomic plan/report persistence
+  cli.py             # Plan and apply subcommands
+  __main__.py        # python -m remediation entrypoint
 tests/
   test_models.py
   test_artifact_store.py
@@ -102,7 +113,8 @@ CZ_RUN_BROWSER_TESTS=1 python -m pytest -q \
   tests/test_browser_integration.py tests/test_snapshot_integration.py \
   tests/test_explorer_integration.py tests/test_runner_integration.py
 python -m py_compile \
-  scraper/*.py knowledge/*.py grounding/*.py synthesis/*.py postman/*.py
+  scraper/*.py knowledge/*.py grounding/*.py synthesis/*.py postman/*.py \
+  remediation/*.py
 ```
 
 ## Running a crawl
@@ -411,6 +423,57 @@ documentation. Phase 9 sends portal facts plus those excerpts to the configured
 LiteLLM model, which proposes the HTTP method/path, payload, typed variables,
 assertions, confidence, and ready/review/blocked disposition. Local validators
 reject unsupported or invented output before anything reaches Postman.
+
+## Reviewed repository remediation
+
+Phase 11 is optional. Use it when selected certification cases require code,
+configuration, routing, schema, or API implementation changes in the integration
+repository. Planning is agentic and read-only: the LiteLLM model may repeatedly
+search repository code, read complete files, and call allowlisted MCP search
+tools before it returns a typed change set.
+
+```bash
+export CZ_MCP_URL="http://10.200.3.108:8000/mcp"
+
+python -m remediation plan \
+  --synthesis artifacts/synthesis/portal-baseline \
+  --grounding artifacts/grounding/portal-baseline \
+  --repo-path /path/to/integration-repository \
+  --test-case FetchUAT_BOU_01 \
+  --test-case FetchUAT_BOU_02 \
+  --objective "Implement the missing bill-fetch API and required configuration"
+```
+
+The output is `artifacts/remediation/<run-id>/plan.json`. It contains complete
+new/replacement file contents, source/testcase citations, pre-change file hashes,
+tool/call audit records, risks, and a deterministic `plan_id`. Planning never
+changes the repository and the model cannot emit or run shell commands.
+
+Review the plan, then pass its exact ID and operator-chosen verification commands:
+
+```bash
+PLAN="artifacts/remediation/portal-baseline/plan.json"
+PLAN_ID=$(jq -r .plan_id "$PLAN")
+
+python -m remediation apply \
+  --plan "$PLAN" \
+  --repo-path /path/to/integration-repository \
+  --approve-plan-id "$PLAN_ID" \
+  --verify-command "./gradlew test" \
+  --verify-command "./gradlew build"
+```
+
+The applier rejects stale file/repository hashes and path traversal, symlinks,
+credential files, hardcoded secret-like values, deletes, and unapproved plans.
+It first copies the repository into a disposable temporary directory, applies
+the plan there, and executes each verification command without a shell and with
+ambient credential variables removed. The real repository is updated atomically
+only if every check passes. Failure returns `rolled_back` and leaves the real
+repository unchanged. `--allow-unverified` is available only as an explicit
+operator override; verification commands are never model-generated. This is
+worktree and environment isolation, not a kernel/network sandbox. Run the apply
+command inside your normal container/CI sandbox when executing untrusted build
+logic requires stronger process or network isolation.
 
 ## Postman Collection v2.1 generation
 
