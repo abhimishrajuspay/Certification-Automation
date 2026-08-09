@@ -26,8 +26,24 @@ from scraper.artifact_store import (
     StoreNotFoundError,
 )
 from scraper.browser import BrowserLaunchConfig, BrowserManager, BrowserName
-from scraper.explorer import ExplorerConfig, ExplorationResult, StateGraphExplorer
+from scraper.explorer import (
+    ExplorerConfig,
+    ExplorationResult,
+    ExplorationWorker,
+    StateGraphExplorer,
+)
 from scraper.extractor import PageStateExtractor, SnapshotConfig
+from scraper.guidance import (
+    CrawlGuide,
+    CrawlStrategy,
+    GuidanceError,
+    OperatorActionRecorder,
+    ParallelSessionMode,
+    compile_taught_guide,
+    guide_sha256,
+    load_crawl_guide,
+    write_crawl_guide,
+)
 from scraper.models import (
     ActionBehaviorPolicy,
     ActionCandidate,
@@ -63,6 +79,10 @@ class ResumeUnavailableError(CrawlRunnerError):
 
 class StorageStateExportError(CrawlRunnerError):
     """Raised when an explicitly requested reusable session cannot be saved."""
+
+
+class TeachingError(CrawlRunnerError):
+    """Raised when an explicit operator teaching session cannot be completed."""
 
 
 class AuthenticationMode(str, Enum):
@@ -109,6 +129,10 @@ class CrawlRequest:
     action_timeout_ms: int = 10_000
     popup_detection_timeout_ms: int = 100
     ready_selector: Optional[str] = None
+    guide_path: Optional[Path] = None
+    taught_guide_output_path: Optional[Path] = None
+    overwrite_taught_guide: bool = False
+    teaching_timeout_ms: int = 900_000
     limits: CrawlLimits = field(default_factory=CrawlLimits)
     capture_policy: CapturePolicy = field(default_factory=CapturePolicy)
     snapshot_config: SnapshotConfig = field(default_factory=SnapshotConfig)
@@ -124,6 +148,8 @@ class CrawlRequest:
             )
         if self.authentication_timeout_ms <= 0:
             raise ValueError("authentication_timeout_ms must be positive")
+        if self.teaching_timeout_ms <= 0:
+            raise ValueError("teaching_timeout_ms must be positive")
         if self.action_timeout_ms <= 0:
             raise ValueError("action_timeout_ms must be positive")
         if self.popup_detection_timeout_ms <= 0:
@@ -156,6 +182,31 @@ class CrawlRequest:
             raise ValueError(
                 "overwrite_storage_state_output requires storage_state_output_path"
             )
+        if self.guide_path is not None and not self.guide_path.expanduser().is_file():
+            raise ValueError("guide_path must reference an existing file")
+        if self.guide_path is not None and self.taught_guide_output_path is not None:
+            raise ValueError("guide replay and guide teaching are mutually exclusive")
+        if self.explorer_config.strategy == CrawlStrategy.EXHAUSTIVE:
+            if self.guide_path is not None or self.taught_guide_output_path is not None:
+                raise ValueError(
+                    "guide replay or teaching requires guided/hybrid strategy"
+                )
+        elif self.guide_path is None and self.taught_guide_output_path is None:
+            raise ValueError(
+                "guided/hybrid strategy requires a guide or teaching output"
+            )
+        if self.taught_guide_output_path is not None:
+            if self.authentication_mode != AuthenticationMode.MANUAL or self.headless:
+                raise ValueError("guide teaching requires headed manual authentication")
+            output = self.taught_guide_output_path.expanduser()
+            if output.exists() and not output.is_file():
+                raise ValueError("taught guide output must reference a file")
+            if output.exists() and not self.overwrite_taught_guide:
+                raise ValueError(
+                    "taught guide output already exists; explicit overwrite is required"
+                )
+        elif self.overwrite_taught_guide:
+            raise ValueError("overwrite_taught_guide requires taught_guide_output_path")
         if not self.explorer_config.capture_initial_state:
             raise ValueError("the crawl runner requires capture_initial_state=True")
 
@@ -230,6 +281,18 @@ class CrawlRunner:
         self.request = request
         self.login_callback = login_callback
         self.manual_confirmation = manual_confirmation
+        self.guide: Optional[CrawlGuide] = None
+        self.guide_sha256: Optional[str] = None
+        if request.guide_path is not None:
+            try:
+                self.guide, self.guide_sha256 = load_crawl_guide(request.guide_path)
+            except GuidanceError as exc:
+                raise CrawlRunnerError(str(exc)) from exc
+        self.teacher = (
+            OperatorActionRecorder(request.capture_policy.redacted_names)
+            if request.taught_guide_output_path is not None
+            else None
+        )
 
     async def run(self) -> CrawlRunResult:
         """Execute a new run or return a verified completed run by policy."""
@@ -239,11 +302,24 @@ class CrawlRunner:
             return await asyncio.to_thread(self._existing_result, store)
 
         manager = BrowserManager(store, self._browser_config())
+        managers = [manager]
         result: Optional[ExplorationResult] = None
         try:
             page = await manager.start()
+            if self.teacher is not None:
+                await self.teacher.install(manager.context)
             await manager.navigate(self.request.root_url)
             await self._authenticate(page)
+            taught = False
+            if self.teacher is not None:
+                await self._teach()
+                await asyncio.to_thread(
+                    store.save_manifest,
+                    store.run.model_copy(
+                        update={"behavior_policy": self._behavior_policy()}
+                    ),
+                )
+                taught = True
             await self._export_storage_state(page)
 
             extractor = PageStateExtractor(
@@ -259,6 +335,50 @@ class CrawlRunner:
                 action_timeout_ms=self.request.action_timeout_ms,
                 popup_detection_timeout_ms=(self.request.popup_detection_timeout_ms),
             )
+            additional_workers: list[ExplorationWorker] = []
+            for worker_number in range(
+                2, self.request.explorer_config.worker_count + 1
+            ):
+                worker_manager = BrowserManager(store, self._browser_config())
+                try:
+                    worker_page = await worker_manager.start()
+                except Exception:
+                    if (
+                        self.request.explorer_config.parallel_session_mode
+                        == ParallelSessionMode.FORCE
+                    ):
+                        raise
+                    break
+                managers.append(worker_manager)
+                worker_extractor = PageStateExtractor(
+                    store,
+                    worker_manager.recorder,
+                    self.request.snapshot_config,
+                )
+                additional_workers.append(
+                    ExplorationWorker(
+                        worker_id=f"worker-{worker_number}",
+                        page=worker_page,
+                        recorder=worker_manager.recorder,
+                        extractor=worker_extractor,
+                        executor=ActionExecutor(
+                            store,
+                            worker_manager.recorder,
+                            worker_extractor,
+                            action_timeout_ms=self.request.action_timeout_ms,
+                            popup_detection_timeout_ms=(
+                                self.request.popup_detection_timeout_ms
+                            ),
+                        ),
+                    )
+                )
+            runtime_guide = self.guide
+            if taught and runtime_guide is not None:
+                runtime_guide = (
+                    runtime_guide.model_copy(update={"steps": ()})
+                    if runtime_guide.repeat_rules
+                    else None
+                )
             result = await StateGraphExplorer(
                 store,
                 manager.recorder,
@@ -266,19 +386,16 @@ class CrawlRunner:
                 planner,
                 executor,
                 self.request.explorer_config,
+                guide=runtime_guide,
+                additional_workers=tuple(additional_workers),
             ).explore(page)
         except BaseException as exc:
             await self._finalize_early_failure(store, exc)
-            try:
-                await manager.stop()
-            except Exception:
-                # Preserve the primary exception on Python 3.10. The manifest is
-                # already terminal and no raw shutdown detail is made durable.
-                pass
+            await self._stop_managers(managers, suppress_errors=True)
             raise
 
         try:
-            await manager.stop()
+            await self._stop_managers(managers, suppress_errors=False)
         except Exception as exc:
             await self._mark_partial_after_shutdown_failure(store, exc)
             raise
@@ -291,6 +408,22 @@ class CrawlRunner:
             status=store.run.status,
             exploration=result,
         )
+
+    @staticmethod
+    async def _stop_managers(
+        managers: list[BrowserManager],
+        *,
+        suppress_errors: bool,
+    ) -> None:
+        first_error: Optional[Exception] = None
+        for manager in reversed(managers):
+            try:
+                await manager.stop()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None and not suppress_errors:
+            raise first_error
 
     def _prepare_store(self) -> tuple[ArtifactStore, bool]:
         requested_id = self.request.run_id or _new_run_id()
@@ -401,6 +534,15 @@ class CrawlRunner:
                 testcase_context_stability_observations=(
                     explorer.testcase_context_stability_observations
                 ),
+                strategy=explorer.strategy.value,
+                guide_configured=self.guide_sha256 is not None,
+                guide_sha256=self.guide_sha256,
+                teaching_enabled=self.teacher is not None,
+                root_scope_configured=bool(
+                    self.guide and self.guide.root_scope_selector
+                ),
+                worker_count=explorer.worker_count,
+                parallel_session_mode=explorer.parallel_session_mode.value,
             ),
         )
 
@@ -519,6 +661,44 @@ class CrawlRunner:
             raise StorageStateExportError(
                 "failed to export reusable storage state"
             ) from exc
+
+    async def _teach(self) -> CrawlGuide:
+        """Record post-login operator clicks and persist their reusable guide."""
+
+        teacher = self.teacher
+        output = self.request.taught_guide_output_path
+        if teacher is None or output is None:  # pragma: no cover - caller invariant
+            raise TeachingError("teaching was not configured")
+        prompt = (
+            "Teaching active: click the route to the testcase page, demonstrate "
+            "one testcase info button and close its dialog, then press Enter: "
+        )
+        confirmation = self.manual_confirmation or _console_confirmation
+        teacher.activate()
+        try:
+            await asyncio.wait_for(
+                confirmation(prompt),
+                timeout=self.request.teaching_timeout_ms / 1000,
+            )
+            # Let the final pointer binding cross the Playwright transport before
+            # freezing the immutable click sequence.
+            await asyncio.sleep(0.05)
+        except asyncio.TimeoutError as exc:
+            raise TeachingError("operator teaching timed out") from exc
+        finally:
+            teacher.deactivate()
+        try:
+            guide = compile_taught_guide(teacher.clicks)
+            write_crawl_guide(
+                output,
+                guide,
+                overwrite=self.request.overwrite_taught_guide,
+            )
+        except GuidanceError as exc:
+            raise TeachingError(str(exc)) from exc
+        self.guide = guide
+        self.guide_sha256 = guide_sha256(guide)
+        return guide
 
     async def _finalize_early_failure(
         self,
@@ -706,4 +886,5 @@ __all__ = [
     "ManualConfirmation",
     "ResumeUnavailableError",
     "StorageStateExportError",
+    "TeachingError",
 ]

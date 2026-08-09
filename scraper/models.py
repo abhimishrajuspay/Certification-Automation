@@ -298,6 +298,7 @@ class ElementContext(EvidenceModel):
     form_id: Optional[str] = None
     table_id: Optional[str] = None
     row_label: Optional[str] = None
+    inside_main: bool = False
     ancestor_summary: tuple[str, ...] = ()
 
 
@@ -741,6 +742,28 @@ class ExplorerBehaviorPolicy(EvidenceModel):
     capture_initial_state: bool = True
     completion_goal: CrawlCompletionGoal = CrawlCompletionGoal.BOUNDED_FRONTIER
     testcase_context_stability_observations: int = Field(default=2, gt=0)
+    strategy: Literal["exhaustive", "guided", "hybrid"] = "exhaustive"
+    guide_configured: bool = False
+    guide_sha256: Optional[str] = Field(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=SHA256_PATTERN,
+    )
+    teaching_enabled: bool = False
+    root_scope_configured: bool = False
+    worker_count: int = Field(default=1, gt=0, le=32)
+    parallel_session_mode: Literal["off", "probe", "force"] = "off"
+
+    @model_validator(mode="after")
+    def validate_guidance_and_workers(self) -> "ExplorerBehaviorPolicy":
+        if self.guide_configured != (self.guide_sha256 is not None):
+            raise ValueError("configured guide requires a matching guide hash")
+        if self.worker_count == 1 and self.parallel_session_mode != "off":
+            raise ValueError("single-worker exploration requires parallel mode off")
+        if self.worker_count > 1 and self.parallel_session_mode == "off":
+            raise ValueError("multiple workers require probe or force parallel mode")
+        return self
 
 
 class CrawlBehaviorPolicy(EvidenceModel):

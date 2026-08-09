@@ -18,6 +18,16 @@ from scraper.artifact_store import ArtifactStore
 from scraper.cli import async_main
 from scraper.explorer import ExplorerConfig
 from scraper.extractor import SnapshotConfig
+from scraper.guidance import (
+    CrawlGuide,
+    CrawlStrategy,
+    GuideStep,
+    GuideTarget,
+    ParallelSessionMode,
+    guide_sha256,
+    load_crawl_guide,
+    write_crawl_guide,
+)
 from scraper.models import (
     CoverageReport,
     CrawlCompletionGoal,
@@ -269,6 +279,101 @@ async def test_cli_exposes_testcase_context_completion_goal(
     assert request.explorer_config.completion_goal == (
         CrawlCompletionGoal.TESTCASE_CONTEXT
     )
+
+
+@pytest.mark.asyncio
+async def test_cli_validates_hybrid_guide_and_parallel_worker_policy(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    guide_path = tmp_path / "portal-guide.json"
+    write_crawl_guide(
+        guide_path,
+        CrawlGuide(
+            steps=(
+                GuideStep(
+                    name="open",
+                    target=GuideTarget(test_id="open", test_id_attribute="data-test"),
+                ),
+            ),
+        ),
+    )
+
+    status = await async_main(
+        [
+            "--url",
+            PORTAL_URL,
+            "--crawl-guide",
+            str(guide_path),
+            "--workers",
+            "3",
+            "--validate-only",
+        ]
+    )
+
+    summary = json.loads(capsys.readouterr().out)
+    assert status == 0
+    assert summary["strategy"] == "hybrid"
+    assert summary["crawl_guide_configured"] is True
+    assert summary["worker_count"] == 3
+    assert summary["parallel_session_mode"] == "probe"
+
+    request = CrawlRequest(
+        root_url=PORTAL_URL,
+        artifact_root=tmp_path / "crawls",
+        run_id="guided-behavior",
+        guide_path=guide_path,
+        explorer_config=ExplorerConfig(
+            strategy=CrawlStrategy.HYBRID,
+            worker_count=3,
+            parallel_session_mode=ParallelSessionMode.PROBE,
+        ),
+    )
+    store, _ = CrawlRunner(request)._prepare_store()
+    behavior = store.run.behavior_policy.explorer
+    assert behavior.strategy == "hybrid"
+    assert behavior.guide_configured is True
+    assert behavior.guide_sha256 is not None
+    assert behavior.worker_count == 3
+
+
+@pytest.mark.asyncio
+async def test_teaching_boundary_writes_clicks_without_browser_credentials(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "learned.json"
+    runner: CrawlRunner
+
+    async def confirm(prompt: str) -> None:
+        assert prompt.startswith("Teaching active")
+        assert runner.teacher is not None
+        await runner.teacher._receive(  # noqa: SLF001 - explicit boundary fixture
+            {},
+            {
+                "tag": "button",
+                "role": "button",
+                "accessibleName": "Open testcases",
+                "stableId": "open-testcases",
+                "css": "#open-testcases",
+            },
+        )
+
+    request = CrawlRequest(
+        root_url=PORTAL_URL,
+        authentication_mode=AuthenticationMode.MANUAL,
+        headless=False,
+        taught_guide_output_path=output,
+        explorer_config=ExplorerConfig(strategy=CrawlStrategy.HYBRID),
+    )
+    runner = CrawlRunner(request, manual_confirmation=confirm)
+
+    guide = await runner._teach()
+    loaded, _ = load_crawl_guide(output)
+
+    assert guide == loaded
+    assert loaded.source == "taught"
+    assert loaded.steps[0].target.stable_id == "open-testcases"
+    assert runner.guide_sha256 == guide_sha256(loaded)
 
 
 @pytest.mark.asyncio

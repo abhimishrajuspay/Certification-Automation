@@ -223,6 +223,7 @@ FRAME_EXTRACTION_SCRIPT = r"""
             formId: form ? (form.id || form.getAttribute('name') || form.getAttribute('action') || '') : '',
             tableId: table ? (table.id || normalized(caption ? caption.textContent : '')) : '',
             rowLabel: rowHeading ? normalized(rowHeading.innerText || rowHeading.textContent) : '',
+            insideMain: Boolean(element.closest && element.closest('main, [role=main]')),
             ancestors: ancestorSummary(element),
         };
     };
@@ -853,6 +854,7 @@ class PageStateExtractor:
                         form_id=self._safe_optional(context.get("formId")),
                         table_id=self._safe_optional(context.get("tableId")),
                         row_label=self._safe_optional(context.get("rowLabel")),
+                        inside_main=bool(context.get("insideMain")),
                         ancestor_summary=tuple(
                             self._safe_text(item)
                             for item in _string_list(context.get("ancestors"))

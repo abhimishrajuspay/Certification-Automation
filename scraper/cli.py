@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from scraper.browser import BrowserName
 from scraper.explorer import ExplorerConfig
+from scraper.guidance import CrawlStrategy, ParallelSessionMode
 from scraper.models import CapturePolicy, CrawlCompletionGoal, CrawlLimits
 from scraper.runner import (
     AuthenticationMode,
@@ -79,6 +80,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ready-selector",
         help="caller-supplied selector that marks the authenticated portal ready",
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=[item.value for item in CrawlStrategy],
+        help=(
+            "exhaustive discovery, guide-only replay, or guide-first discovery; "
+            "defaults to hybrid when a guide/teaching output is supplied"
+        ),
+    )
+    parser.add_argument(
+        "--crawl-guide",
+        type=Path,
+        help="strict JSON guide to replay after authentication",
+    )
+    parser.add_argument(
+        "--teach-guide",
+        type=Path,
+        help="record post-login operator clicks into this reusable JSON guide",
+    )
+    parser.add_argument(
+        "--overwrite-taught-guide",
+        action="store_true",
+        help="allow replacing an existing --teach-guide output",
+    )
+    parser.add_argument(
+        "--teaching-timeout-seconds",
+        type=_positive_int,
+        default=900,
+    )
+    parser.add_argument(
+        "--workers",
+        type=_positive_int,
+        default=1,
+        help="isolated browser workers used for sibling branches (maximum 32)",
+    )
+    parser.add_argument(
+        "--parallel-session-mode",
+        choices=[item.value for item in ParallelSessionMode],
+        help="off, probe-and-fallback, or force cloned authenticated sessions",
     )
     parser.add_argument(
         "--authentication-timeout-seconds",
@@ -205,6 +245,22 @@ def request_from_args(args: argparse.Namespace) -> CrawlRequest:
     if args.allowed_origin:
         values = (_url_origin(args.url), *args.allowed_origin)
         allowed_origins = tuple(dict.fromkeys(values))
+    strategy = (
+        CrawlStrategy(args.strategy)
+        if args.strategy is not None
+        else (
+            CrawlStrategy.HYBRID
+            if args.crawl_guide is not None or args.teach_guide is not None
+            else CrawlStrategy.EXHAUSTIVE
+        )
+    )
+    parallel_mode = (
+        ParallelSessionMode(args.parallel_session_mode)
+        if args.parallel_session_mode is not None
+        else (
+            ParallelSessionMode.PROBE if args.workers > 1 else ParallelSessionMode.OFF
+        )
+    )
     return CrawlRequest(
         root_url=args.url,
         artifact_root=args.artifact_root,
@@ -222,6 +278,10 @@ def request_from_args(args: argparse.Namespace) -> CrawlRequest:
         ignore_https_errors=args.ignore_https_errors,
         authentication_timeout_ms=args.authentication_timeout_seconds * 1_000,
         ready_selector=args.ready_selector,
+        guide_path=args.crawl_guide,
+        taught_guide_output_path=args.teach_guide,
+        overwrite_taught_guide=args.overwrite_taught_guide,
+        teaching_timeout_ms=args.teaching_timeout_seconds * 1_000,
         limits=limits,
         capture_policy=capture_policy,
         explorer_config=ExplorerConfig(
@@ -229,6 +289,9 @@ def request_from_args(args: argparse.Namespace) -> CrawlRequest:
             testcase_context_stability_observations=(
                 args.testcase_context_stability_observations
             ),
+            strategy=strategy,
+            worker_count=args.workers,
+            parallel_session_mode=parallel_mode,
         ),
     )
 
@@ -304,6 +367,11 @@ def _validation_summary(request: CrawlRequest) -> dict[str, object]:
         "testcase_context_stability_observations": (
             request.explorer_config.testcase_context_stability_observations
         ),
+        "strategy": request.explorer_config.strategy.value,
+        "crawl_guide_configured": request.guide_path is not None,
+        "teaching_configured": request.taught_guide_output_path is not None,
+        "worker_count": request.explorer_config.worker_count,
+        "parallel_session_mode": (request.explorer_config.parallel_session_mode.value),
         "capture_policy": request.capture_policy.model_dump(mode="json"),
     }
 

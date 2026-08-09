@@ -17,6 +17,8 @@ Collection v2.1 plus a secret-empty environment template.
 Phase 11 adds an agentic repository-remediation boundary that can search/read
 code and MCP guidance, propose new APIs or configuration, and apply an approved
 hash-locked plan only after isolated build/test verification succeeds.
+The crawler also supports operator-taught or hand-authored guides, promoted
+testcase roots, in-place row sweeps, and configurable browser-worker fan-out.
 
 ## Active architecture
 
@@ -48,6 +50,7 @@ scraper/
   browser.py         # Pre-navigation Playwright lifecycle and trace/HAR ingest
   extractor.py       # Frame/DOM/element/storage/screenshot state snapshots
   actions.py         # Candidate derivation, safety policy, replay, and effects
+  guidance.py        # Typed guides, semantic target matching, and click teaching
   explorer.py        # Parent restoration, bounded frontier, coverage/finalize
   runner.py          # Typed auth/session boundary and production orchestration
   cli.py             # Secret-safe validation and crawl command
@@ -94,6 +97,7 @@ tests/
   test_extractor.py
   test_snapshot_integration.py
   test_actions.py
+  test_guidance.py
   test_explorer_integration.py
   test_runner.py
   test_runner_integration.py
@@ -199,6 +203,70 @@ storage artifacts contain hashes, not cookie or Web Storage plaintext. The
 explicit reusable session export is the intentional exception. Screenshots and
 raw traces can still show sensitive rendered data and must be protected.
 
+### Teach, promote, and replay a fast crawl
+
+For an immediate manual-root crawl with the current exhaustive mode, log in,
+navigate all the way to the testcase listing, and only then press Enter. The
+page open at that authentication boundary becomes the initial crawl root.
+
+To learn the route for later runs, supply a guide output. After login, the first
+Enter starts a separate teaching window. Click the route to the testcase page,
+click one testcase information control, close its dialog, and press Enter a
+second time:
+
+```bash
+python -m scraper \
+  --url "https://portal.example.test/start" \
+  --run-id portal-teach \
+  --auth manual --headed \
+  --save-storage-state artifacts/sessions/portal.json \
+  --teach-guide artifacts/guides/portal.json \
+  --completion-goal testcase_context
+```
+
+Recording is disabled during login. The learned file contains no typed form
+values or session state. It stores ordered semantic locator fallbacks and turns
+the demonstrated row/dialog interaction into a repeated rule, so one example
+can cover every homologous testcase row. The demonstrated final page is
+promoted to graph depth zero. On the teaching run itself, the crawler uses the
+learned repeat rule from the already-open testcase page without replaying the
+navigation clicks.
+
+Reuse the ignored session and learned guide without manual navigation:
+
+```bash
+python -m scraper \
+  --url "https://portal.example.test/start" \
+  --run-id portal-guided \
+  --auth storage_state \
+  --storage-state artifacts/sessions/portal.json \
+  --crawl-guide artifacts/guides/portal.json \
+  --strategy hybrid \
+  --workers 4 \
+  --parallel-session-mode probe \
+  --completion-goal testcase_context
+```
+
+`guided` executes only configured route and repeated-row actions. `hybrid`
+executes them first and resumes generic discovery inside the promoted content
+root when coverage is still incomplete. `exhaustive` preserves the original
+selector-free crawler and remains the default when no guide is supplied.
+
+The guide is strict JSON and can also be authored manually. A step target may
+use test ID, role plus accessible name, stable ID, title, text, CSS, and a frame
+path. Targets resolve from strong semantic locators to structural CSS fallback
+and must resolve uniquely before execution. Optional URL, visible-text, modal,
+and table postconditions detect replay drift.
+
+`--workers N` creates isolated browser/recorder/executor stacks. `probe` clones
+the authenticated in-memory checkpoint, checks the promoted URL, title, tables,
+row labels, and modal state, then falls back to the valid worker count if the
+portal rejects concurrent use. `force` fails instead; `off` requires one worker.
+Safe sibling branches and guided rows can run concurrently. Review-required
+actions remain serialized and terminal. For SPA roots that cannot be rebuilt by
+direct reload, a replayed guide acts as a bounded recovery recipe and the
+recovered structure is validated before another action runs.
+
 Run IDs are exclusive by default. `--existing-run return_completed` verifies
 integrity and returns an already completed compatible run without launching a
 browser. `--existing-run new_attempt` creates `RUN_ID-attempt-N` without
@@ -265,10 +333,14 @@ are skipped as duplicate click targets. Broad delegated-listener containers with
 multiple interactive descendants are also retained but not clicked because no
 single deterministic target can be inferred.
 
-Before each safe sibling action, the explorer restores the root cookies and
-root-state Web Storage, reloads the root page, then replays the safe locator
-path to the parent. Detached iframe predecessors are excluded so frame paths and
-state fingerprints remain stable across reloads. Popup creation is observed
+Before each generic safe sibling action, the explorer restores the promoted
+root cookies and Web Storage, validates the root structure, then replays only
+the path below that root. A configured guide runs once before promotion; if a
+deep SPA route cannot be reconstructed by URL, the validated guide is replayed
+as its recovery recipe. Demonstrated row controls instead use an in-place
+click/capture/close sweep, partitioned across validated workers when configured.
+Detached iframe predecessors are excluded so frame paths and state fingerprints
+remain stable across reloads. Popup creation is observed
 from before the triggering action so initial execution and replay select the
 same resulting page. Review-required actions are
 disabled by default; when explicitly enabled, their immediate result is

@@ -12,7 +12,9 @@ import pytest
 from playwright.async_api import Page
 
 from scraper.artifact_store import ArtifactStore
+from scraper.explorer import ExplorerConfig
 from scraper.extractor import SnapshotConfig
+from scraper.guidance import ParallelSessionMode
 from scraper.models import (
     ActionCandidate,
     ActionStatus,
@@ -138,6 +140,10 @@ async def test_runner_crawls_local_portal_and_finalizes_integrity(
             quiet_timeout_ms=2_000,
             full_page_screenshot=False,
         ),
+        explorer_config=ExplorerConfig(
+            worker_count=2,
+            parallel_session_mode=ParallelSessionMode.PROBE,
+        ),
     )
 
     result = await CrawlRunner(request).run()
@@ -148,6 +154,10 @@ async def test_runner_crawls_local_portal_and_finalizes_integrity(
     assert result.exploration.coverage.bounded_complete is True
     assert result.exploration.coverage.actions_succeeded >= 1
     assert result.exploration.coverage.actions_failed == 0
+    assert any(
+        "2 isolated browser workers" in limitation
+        for limitation in result.exploration.coverage.limitations
+    )
     review = next(
         action
         for action in actions

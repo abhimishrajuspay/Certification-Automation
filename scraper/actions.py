@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import AbstractSet, Optional
 from urllib.parse import urljoin, urlsplit
 
 from playwright.async_api import Error as PlaywrightError
@@ -138,20 +138,30 @@ class ActionPlanner:
         self.config = config or ActionPolicyConfig()
         self.policy = store.run.capture_policy
 
-    async def plan(self, capture: CapturedState) -> tuple[PlannedAction, ...]:
-        """Derive and append all candidates for a newly discovered state."""
+    async def plan(
+        self,
+        capture: CapturedState,
+        *,
+        element_ids: Optional[AbstractSet[str]] = None,
+        action_kinds: Optional[AbstractSet[ActionKind]] = None,
+    ) -> tuple[PlannedAction, ...]:
+        """Derive candidates, optionally constrained by an explicit guide."""
 
         frame_paths = {
             frame.frame_id: frame.frame_path for frame in capture.state.frames
         }
         planned: list[PlannedAction] = []
         for element in capture.elements:
+            if element_ids is not None and element.element_id not in element_ids:
+                continue
             frame_path = frame_paths.get(element.frame_id)
             if frame_path is None:
                 raise ActionPlanningError(
                     f"element {element.element_id} references an unknown frame"
                 )
             for kind, parameters, option_text in self._action_shapes(element):
+                if action_kinds is not None and kind not in action_kinds:
+                    continue
                 risk, rule, rationale = self._classify(
                     capture.state,
                     element,
@@ -212,7 +222,11 @@ class ActionPlanner:
                     )
                 )
 
-        if self.config.include_scroll_actions:
+        if (
+            self.config.include_scroll_actions
+            and element_ids is None
+            and (action_kinds is None or ActionKind.SCROLL in action_kinds)
+        ):
             scroll_action = self._scroll_action(capture, frame_paths)
             if scroll_action is not None:
                 await asyncio.to_thread(

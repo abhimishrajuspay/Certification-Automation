@@ -182,6 +182,35 @@ async def test_planner_records_every_candidate_with_auditable_risk(
     )
     assert any(item.candidate.kind == ActionKind.SCROLL for item in planned)
     assert len(list(store.iter_records(ActionCandidate))) == len(planned)
+
+
+@pytest.mark.asyncio
+async def test_planner_can_be_constrained_to_guide_selected_elements(
+    tmp_path: Path,
+) -> None:
+    run = ScrapeRun(
+        run_id="guided-action-run",
+        root_url="https://portal.test/start",
+        allowed_origins=("https://portal.test",),
+    )
+    store = ArtifactStore.create(tmp_path / "crawls", run)
+    capture = _capture(
+        store,
+        (
+            _element("selected", name="Selected"),
+            _element("ignored", name="Ignored"),
+        ),
+    )
+
+    planned = await ActionPlanner(store).plan(
+        capture,
+        element_ids={"selected"},
+        action_kinds={ActionKind.CLICK},
+    )
+
+    assert [item.element.element_id for item in planned] == ["selected"]
+    assert [item.candidate.kind for item in planned] == [ActionKind.CLICK]
+    assert len(list(store.iter_records(ActionCandidate))) == 1
     assert len({item.candidate.action_id for item in planned}) == len(planned)
 
 

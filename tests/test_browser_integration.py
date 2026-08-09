@@ -17,6 +17,7 @@ import pytest
 
 from scraper.artifact_store import ArtifactStore
 from scraper.browser import BrowserLaunchConfig, BrowserManager
+from scraper.guidance import OperatorActionRecorder, compile_taught_guide
 from scraper.models import (
     BrowserEvent,
     BrowserEventKind,
@@ -243,7 +244,6 @@ async def test_real_browser_events_are_recorded_before_and_after_actions(
     }
     assert page_opened_details["url"] == "about:blank"
     assert page_opened_index < first_request_index
-
     expected_action_events = {
         BrowserEventKind.DOM_MUTATION: "action-fetch",
         BrowserEventKind.DIALOG: "action-dialog",
@@ -308,3 +308,49 @@ async def test_real_browser_events_are_recorded_before_and_after_actions(
         assert secret not in serialized_evidence
 
     assert store.verify_integrity(strict=True).valid is True
+
+
+@pytest.mark.skipif(
+    not RUN_BROWSER_TESTS,
+    reason="set CZ_RUN_BROWSER_TESTS=1 to run real Chromium verification",
+)
+@pytest.mark.asyncio
+async def test_operator_teaching_records_only_the_explicit_post_login_window(
+    tmp_path: Path,
+    fixture_portal: str,
+) -> None:
+    run = ScrapeRun(
+        run_id="teaching-browser-run",
+        root_url=fixture_portal,
+        allowed_origins=(fixture_portal,),
+        capture_policy=CapturePolicy(capture_trace=False, capture_har=False),
+    )
+    store = ArtifactStore.create(tmp_path / "crawls", run)
+    manager = BrowserManager(
+        store,
+        BrowserLaunchConfig(headless=True, viewport_width=1280, viewport_height=720),
+    )
+    teacher = OperatorActionRecorder(run.capture_policy.redacted_names)
+
+    try:
+        page = await manager.start()
+        await teacher.install(manager.context)
+        await manager.navigate(fixture_portal)
+        await page.click("#action")
+        await page.wait_for_selector("#result[data-done='true']")
+        assert teacher.clicks == ()
+
+        teacher.activate()
+        await page.click("#dialog")
+        await page.wait_for_timeout(100)
+        teacher.deactivate()
+    finally:
+        await manager.stop()
+
+    guide = compile_taught_guide(teacher.clicks)
+    serialized = guide.model_dump_json()
+
+    assert len(teacher.clicks) == 1
+    assert teacher.clicks[0].target.stable_id == "dialog"
+    assert len(guide.steps) == 1
+    assert "dialog-secret" not in serialized

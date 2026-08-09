@@ -14,11 +14,20 @@ import pytest
 from scraper.actions import ActionExecutor, ActionPlanner
 from scraper.artifact_store import ArtifactStore
 from scraper.browser import BrowserLaunchConfig, BrowserManager
-from scraper.explorer import ExplorerConfig, StateGraphExplorer
+from scraper.explorer import ExplorerConfig, ExplorationWorker, StateGraphExplorer
 from scraper.extractor import PageStateExtractor, SnapshotConfig
+from scraper.guidance import (
+    CrawlGuide,
+    CrawlStrategy,
+    GuideRepeatRule,
+    GuideStep,
+    GuideTarget,
+    ParallelSessionMode,
+)
 from scraper.models import (
     ActionCandidate,
     ActionStatus,
+    BrowserEvent,
     CapturePolicy,
     CrawlCompletionGoal,
     CrawlLimits,
@@ -42,6 +51,10 @@ class _ExplorerFixtureHandler(BaseHTTPRequestHandler):
             self._send_html(_EXPLORER_HTML)
         elif path == "/testcase-context":
             self._send_html(_TESTCASE_CONTEXT_HTML)
+        elif path == "/guided-entry":
+            self._send_html(_GUIDED_ENTRY_HTML)
+        elif path == "/spa-guided":
+            self._send_html(_SPA_GUIDED_HTML)
         elif path == "/frame":
             self._send_html(_FRAME_HTML)
         elif path == "/popup":
@@ -179,6 +192,54 @@ _TESTCASE_CONTEXT_HTML = """<!doctype html>
         });
       });
     }
+  </script>
+</body>
+</html>
+"""
+
+
+_GUIDED_ENTRY_HTML = """<!doctype html>
+<html>
+<head><title>Guided entry fixture</title></head>
+<body>
+  <nav><a href="/">Home</a></nav>
+  <main>
+    <h1>Certification portal</h1>
+    <button data-testid="open-testcases" onclick="location.href='/testcase-context'">Open testcases</button>
+  </main>
+</body>
+</html>
+"""
+
+
+_SPA_GUIDED_HTML = """<!doctype html>
+<html>
+<head><title>SPA guided fixture</title></head>
+<body>
+  <main><button data-testid="open-spa-testcases">Open SPA testcases</button></main>
+  <script>
+    document.querySelector('[data-testid=open-spa-testcases]').addEventListener('click', () => {
+      document.body.innerHTML = `
+        <main>
+          <table><thead><tr><th>API Name</th><th>Total TCs</th></tr></thead>
+            <tbody><tr><td>Payments</td><td>2</td></tr></tbody></table>
+          <table><thead><tr><th>TC ID</th><th>API Name</th><th>Status</th><th>Info</th></tr></thead>
+            <tbody>
+              <tr><td>TC_01</td><td>Payments</td><td>pending</td><td><button data-case="TC_01" aria-label="Information for TC_01">i</button></td></tr>
+              <tr><td>TC_02</td><td>Payments</td><td>pending</td><td><button data-case="TC_02" aria-label="Information for TC_02">i</button></td></tr>
+            </tbody>
+          </table>
+          <div id="modal-root"></div>
+        </main>`;
+      const modalRoot = document.querySelector('#modal-root');
+      for (const button of document.querySelectorAll('button[data-case]')) {
+        button.addEventListener('click', () => {
+          const caseId = button.dataset.case;
+          modalRoot.innerHTML = `<div role="dialog" aria-label="Test Case Details"><div role="document">${caseId}: validates the SPA payment flow</div><button aria-label="Close details">Close</button></div>`;
+          modalRoot.querySelector('button').addEventListener('click', () => modalRoot.replaceChildren());
+        });
+      }
+    });
   </script>
 </body>
 </html>
@@ -391,3 +452,358 @@ async def test_testcase_context_goal_stops_with_success_before_frontier_exhausti
     assert context.descriptions_captured == 2
     assert context.stable_for_early_stop is True
     assert store.run.status == ScrapeRunStatus.COMPLETED
+
+
+@pytest.mark.skipif(
+    not RUN_BROWSER_TESTS,
+    reason="set CZ_RUN_BROWSER_TESTS=1 to run real Chromium verification",
+)
+@pytest.mark.asyncio
+async def test_guided_route_promotes_testcase_root_and_sweeps_rows_in_place(
+    tmp_path: Path,
+    explorer_portal: str,
+) -> None:
+    entry_url = f"{explorer_portal}/guided-entry"
+    run = ScrapeRun(
+        run_id="guided-root-run",
+        root_url=entry_url,
+        allowed_origins=(explorer_portal,),
+        limits=CrawlLimits(
+            maximum_depth=5,
+            maximum_states=30,
+            maximum_actions=30,
+            maximum_runtime_seconds=60,
+        ),
+        capture_policy=CapturePolicy(
+            capture_dom=False,
+            capture_screenshots=False,
+            capture_accessibility_tree=False,
+            capture_trace=False,
+            capture_har=False,
+        ),
+    )
+    store = ArtifactStore.create(tmp_path / "crawls", run)
+    manager = BrowserManager(
+        store,
+        BrowserLaunchConfig(headless=True, viewport_width=1280, viewport_height=720),
+    )
+    guide = CrawlGuide(
+        steps=(
+            GuideStep(
+                name="open_testcases",
+                target=GuideTarget(
+                    test_id="open-testcases",
+                    test_id_attribute="data-testid",
+                ),
+            ),
+        ),
+        repeat_rules=(
+            GuideRepeatRule(
+                name="open_each_description",
+                target=GuideTarget(tag="button", role="button", text="i"),
+                close_target=GuideTarget(
+                    role="button",
+                    accessible_name="Close details",
+                ),
+            ),
+        ),
+        root_scope_selector=None,
+    )
+
+    try:
+        page = await manager.start()
+        await manager.navigate(entry_url)
+        extractor = PageStateExtractor(
+            store,
+            manager.recorder,
+            SnapshotConfig(
+                quiet_window_ms=100,
+                quiet_timeout_ms=2_000,
+                full_page_screenshot=False,
+            ),
+        )
+        result = await StateGraphExplorer(
+            store,
+            manager.recorder,
+            extractor,
+            ActionPlanner(store),
+            ActionExecutor(store, manager.recorder, extractor),
+            ExplorerConfig(
+                completion_goal=CrawlCompletionGoal.TESTCASE_CONTEXT,
+                testcase_context_stability_observations=2,
+                strategy=CrawlStrategy.HYBRID,
+            ),
+            guide=guide,
+        ).explore(page)
+    finally:
+        await manager.stop()
+
+    context = result.coverage.testcase_context
+    root = next(
+        state
+        for state in store.iter_records(StateSnapshot)
+        if state.state_id == result.root_state_id
+    )
+    actions = tuple(store.iter_records(ActionCandidate))
+    transitions = tuple(store.iter_records(InteractionTransition))
+
+    assert root.url.endswith("/testcase-context")
+    assert context is not None
+    assert context.test_cases_discovered == 2
+    assert context.descriptions_captured == 2
+    assert context.stable_for_early_stop is True
+    assert result.completion_reason == "testcase context complete"
+    assert all(action.status == ActionStatus.PENDING for action in actions)
+    assert len(actions) == 5
+    assert len(transitions) == 5
+    assert all(
+        transition.status == ActionStatus.SUCCEEDED for transition in transitions
+    )
+    assert any(
+        "promoted to exploration root" in limitation
+        for limitation in result.coverage.limitations
+    )
+
+
+@pytest.mark.skipif(
+    not RUN_BROWSER_TESTS,
+    reason="set CZ_RUN_BROWSER_TESTS=1 to run real Chromium verification",
+)
+@pytest.mark.asyncio
+async def test_parallel_worker_probe_fans_out_safe_root_siblings(
+    tmp_path: Path,
+    explorer_portal: str,
+) -> None:
+    run = ScrapeRun(
+        run_id="parallel-root-run",
+        root_url=explorer_portal,
+        allowed_origins=(explorer_portal,),
+        limits=CrawlLimits(
+            maximum_depth=1,
+            maximum_states=20,
+            maximum_actions=4,
+            maximum_runtime_seconds=60,
+        ),
+        capture_policy=CapturePolicy(
+            capture_dom=False,
+            capture_screenshots=False,
+            capture_accessibility_tree=False,
+            capture_trace=False,
+            capture_har=False,
+        ),
+    )
+    store = ArtifactStore.create(tmp_path / "crawls", run)
+    managers = tuple(
+        BrowserManager(
+            store,
+            BrowserLaunchConfig(
+                headless=True,
+                viewport_width=1280,
+                viewport_height=720,
+            ),
+        )
+        for _ in range(2)
+    )
+
+    try:
+        primary_page = await managers[0].start()
+        await managers[0].navigate(explorer_portal)
+        secondary_page = await managers[1].start()
+        primary_extractor = PageStateExtractor(
+            store,
+            managers[0].recorder,
+            SnapshotConfig(
+                quiet_window_ms=100,
+                quiet_timeout_ms=2_000,
+                full_page_screenshot=False,
+            ),
+        )
+        secondary_extractor = PageStateExtractor(
+            store,
+            managers[1].recorder,
+            SnapshotConfig(
+                quiet_window_ms=100,
+                quiet_timeout_ms=2_000,
+                full_page_screenshot=False,
+            ),
+        )
+        result = await StateGraphExplorer(
+            store,
+            managers[0].recorder,
+            primary_extractor,
+            ActionPlanner(store),
+            ActionExecutor(store, managers[0].recorder, primary_extractor),
+            ExplorerConfig(
+                worker_count=2,
+                parallel_session_mode=ParallelSessionMode.PROBE,
+            ),
+            additional_workers=(
+                ExplorationWorker(
+                    worker_id="worker-2",
+                    page=secondary_page,
+                    recorder=managers[1].recorder,
+                    extractor=secondary_extractor,
+                    executor=ActionExecutor(
+                        store,
+                        managers[1].recorder,
+                        secondary_extractor,
+                    ),
+                ),
+            ),
+        ).explore(primary_page)
+    finally:
+        for manager in reversed(managers):
+            await manager.stop()
+
+    transitions = tuple(
+        transition
+        for transition in store.iter_records(InteractionTransition)
+        if transition.status == ActionStatus.SUCCEEDED
+    )
+    event_by_id = {event.event_id: event for event in store.iter_records(BrowserEvent)}
+    action_page_ids = {
+        event_by_id[event_id].page_id
+        for transition in transitions
+        for event_id in transition.event_ids
+        if event_id in event_by_id and event_by_id[event_id].page_id is not None
+    }
+
+    assert result.coverage.actions_succeeded == 4
+    assert len(action_page_ids) >= 2
+    assert any(
+        "used 2 isolated browser workers" in limitation
+        for limitation in result.coverage.limitations
+    )
+
+
+@pytest.mark.skipif(
+    not RUN_BROWSER_TESTS,
+    reason="set CZ_RUN_BROWSER_TESTS=1 to run real Chromium verification",
+)
+@pytest.mark.asyncio
+async def test_parallel_workers_partition_guided_testcase_rows(
+    tmp_path: Path,
+    explorer_portal: str,
+) -> None:
+    url = f"{explorer_portal}/spa-guided"
+    run = ScrapeRun(
+        run_id="parallel-row-run",
+        root_url=url,
+        allowed_origins=(explorer_portal,),
+        limits=CrawlLimits(
+            maximum_depth=5,
+            maximum_states=20,
+            maximum_actions=20,
+            maximum_runtime_seconds=60,
+        ),
+        capture_policy=CapturePolicy(
+            capture_dom=False,
+            capture_screenshots=False,
+            capture_accessibility_tree=False,
+            capture_trace=False,
+            capture_har=False,
+        ),
+    )
+    store = ArtifactStore.create(tmp_path / "crawls", run)
+    managers = tuple(
+        BrowserManager(
+            store,
+            BrowserLaunchConfig(
+                headless=True,
+                viewport_width=1280,
+                viewport_height=720,
+            ),
+        )
+        for _ in range(2)
+    )
+    guide = CrawlGuide(
+        steps=(
+            GuideStep(
+                name="open_spa_testcases",
+                target=GuideTarget(
+                    test_id="open-spa-testcases",
+                    test_id_attribute="data-testid",
+                ),
+            ),
+        ),
+        repeat_rules=(
+            GuideRepeatRule(
+                name="parallel_descriptions",
+                target=GuideTarget(tag="button", role="button", text="i"),
+                close_target=GuideTarget(
+                    role="button",
+                    accessible_name="Close details",
+                ),
+            ),
+        ),
+        root_scope_selector=None,
+    )
+
+    try:
+        primary_page = await managers[0].start()
+        await managers[0].navigate(url)
+        secondary_page = await managers[1].start()
+        extractors = tuple(
+            PageStateExtractor(
+                store,
+                manager.recorder,
+                SnapshotConfig(
+                    quiet_window_ms=100,
+                    quiet_timeout_ms=2_000,
+                    full_page_screenshot=False,
+                ),
+            )
+            for manager in managers
+        )
+        result = await StateGraphExplorer(
+            store,
+            managers[0].recorder,
+            extractors[0],
+            ActionPlanner(store),
+            ActionExecutor(store, managers[0].recorder, extractors[0]),
+            ExplorerConfig(
+                completion_goal=CrawlCompletionGoal.TESTCASE_CONTEXT,
+                worker_count=2,
+                parallel_session_mode=ParallelSessionMode.PROBE,
+            ),
+            guide=guide,
+            additional_workers=(
+                ExplorationWorker(
+                    worker_id="worker-2",
+                    page=secondary_page,
+                    recorder=managers[1].recorder,
+                    extractor=extractors[1],
+                    executor=ActionExecutor(
+                        store,
+                        managers[1].recorder,
+                        extractors[1],
+                    ),
+                ),
+            ),
+        ).explore(primary_page)
+    finally:
+        for manager in reversed(managers):
+            await manager.stop()
+
+    context = result.coverage.testcase_context
+    transitions = tuple(store.iter_records(InteractionTransition))
+    events = {event.event_id: event for event in store.iter_records(BrowserEvent)}
+    page_ids = {
+        events[event_id].page_id
+        for transition in transitions
+        for event_id in transition.event_ids
+        if event_id in events and events[event_id].page_id is not None
+    }
+
+    assert context is not None and context.stable_for_early_stop is True
+    assert context.descriptions_captured == 2
+    assert result.coverage.actions_succeeded == 5
+    assert len(page_ids) >= 2
+    assert any(
+        "row sweep distributed across 2 workers" in limitation
+        for limitation in result.coverage.limitations
+    )
+    assert any(
+        "URL drift falls back" in limitation
+        for limitation in result.coverage.limitations
+    )
