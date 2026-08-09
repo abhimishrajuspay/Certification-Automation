@@ -143,6 +143,23 @@ def test_verified_plan_is_applied_after_isolated_checks(
     assert (repository / "config/api.yaml").is_file()
 
 
+def test_code_index_includes_haskell_repository_sources(tmp_path: Path) -> None:
+    repository = tmp_path / "newton-hs"
+    repository.mkdir()
+    (repository / "BillFetch.hs").write_text(
+        "module BillFetch where\nbillFetchHandler = pure ()\n"
+    )
+
+    matches = RepositoryWorkspace(repository).search(
+        "BillFetch billFetchHandler",
+        limit=3,
+    )
+
+    assert matches
+    assert matches[0].repository is not None
+    assert matches[0].repository.path == "BillFetch.hs"
+
+
 class _Dump:
     def __init__(self, **values: object) -> None:
         self.__dict__.update(values)
