@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cz-certification-automation"
-version = "0.12.1"
+version = "0.13.0"
 description = "Cited CZ portal evidence, LLM synthesis, and Postman generation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,7 @@ cz-ground = "grounding.cli:entrypoint"
 cz-synthesize = "synthesis.cli:entrypoint"
 cz-postman = "postman.cli:entrypoint"
 cz-remediate = "remediation.cli:entrypoint"
+cz-campaign = "campaign.cli:entrypoint"
 
 [project.optional-dependencies]
 dev = [
@@ -33,7 +34,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["scraper*", "knowledge*", "grounding*", "synthesis*", "postman*", "remediation*"]
+include = ["scraper*", "knowledge*", "grounding*", "synthesis*", "postman*", "remediation*", "campaign*"]
 exclude = ["tests*"]
 
 [tool.pytest.ini_options]

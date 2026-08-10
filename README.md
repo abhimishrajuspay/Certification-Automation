@@ -17,6 +17,10 @@ Collection v2.1 plus a secret-empty environment template.
 Phase 11 adds an agentic repository-remediation boundary that can search/read
 code and MCP guidance, propose new APIs or configuration, and apply an approved
 hash-locked plan only after isolated build/test verification succeeds.
+Campaign mode adds the repository-wide path requested for large portals: one
+group-first coding agent consumes the Phase 8 grounding package as a lazy tool,
+assesses every testcase, reuses repository/MCP investigation across API groups,
+and stages one shared reviewed change set before Phase 9 and Postman rendering.
 The crawler also supports operator-taught or hand-authored guides, promoted
 testcase roots, in-place row sweeps, and configurable browser-worker fan-out.
 
@@ -28,8 +32,9 @@ Instrumented browser
   -> immutable crawl evidence
   -> normalized portal knowledge
   -> repository and MCP retrieval
+  -> optional repository-wide support campaign and approved code changes
   -> structured LLM synthesis
-  -> optional reviewed repository remediation
+  -> optional focused repository remediation
   -> Postman Collection v2.1
 ```
 
@@ -90,6 +95,13 @@ remediation/
   io.py              # Atomic plan/report persistence
   cli.py             # Plan and apply subcommands
   __main__.py        # python -m remediation entrypoint
+campaign/
+  models.py          # Support matrix, lazy actions, checkpoints, campaign plan
+  workspace.py       # Read-only repository plus isolated staged-file overlay
+  builder.py         # Group-first testcase/repository/MCP coding-agent loop
+  io.py              # Atomic checkpoint, plan, matrix, and apply persistence
+  cli.py              # Inspect, plan, status, and approved apply commands
+  __main__.py         # python -m campaign entrypoint
 tests/
   test_models.py
   test_artifact_store.py
@@ -106,6 +118,7 @@ tests/
   test_grounding.py
   test_synthesis.py
   test_postman.py
+  test_campaign.py
 ```
 
 ## Development
@@ -119,7 +132,7 @@ CZ_RUN_BROWSER_TESTS=1 python -m pytest -q \
   tests/test_explorer_integration.py tests/test_runner_integration.py
 python -m py_compile \
   scraper/*.py knowledge/*.py grounding/*.py synthesis/*.py postman/*.py \
-  remediation/*.py
+  remediation/*.py campaign/*.py
 ```
 
 ## Running a crawl
@@ -451,6 +464,113 @@ Grounding is complete only when Phase 7 testcase context is complete, every
 testcase has repository or MCP context, and configured MCP retrieval completed.
 Repository-only diagnostics can use `--no-mcp`. Incomplete output returns exit
 code 2 unless `--allow-incomplete-grounding` is explicitly supplied.
+
+## Repository-wide campaign mode
+
+Use campaign mode when the intended workflow is: “here is the complete scraped
+testcase package; inspect this repository and MCP knowledge, tell me which cases
+are already supported, and stage the shared code/config/API work.” It runs before
+Phase 9, so it does not require one pre-existing synthesis specification or a
+repeated `--test-case` argument for every portal row.
+
+First inspect the deterministic API grouping without calling the model:
+
+```bash
+RUN_ID="portal-baseline"
+REPO_PATH="/path/to/integration-repository"
+
+python -m campaign inspect \
+  --grounding "artifacts/grounding/$RUN_ID"
+```
+
+Then start one resumable campaign. Omitting `--test-case` intentionally selects
+every testcase in the grounding package:
+
+```bash
+export CZ_LITELLM_URL="https://litellm.example.test/v1/chat/completions"
+export CZ_LITELLM_MODEL="your-proxy-model-name"
+export CZ_MCP_URL="http://10.200.3.108:8000/mcp"
+# Inject CZ_LITELLM_API_KEY with the shell or secret manager.
+
+python -m campaign plan \
+  --grounding "artifacts/grounding/$RUN_ID" \
+  --repo-path "$REPO_PATH" \
+  --objective "Assess every testcase, implement missing shared capabilities, add required configuration/APIs and focused tests" \
+  --mcp-tool search_docs \
+  --response-format json_object \
+  --maximum-output-tokens 20000 \
+  --timeout-seconds 600
+```
+
+The initial model prompt contains only the objective, repository summary,
+semantic group index, IDs, and progress. The model must explicitly call
+`list_test_cases`/`read_test_cases`, `read_evidence`, repository search/read, or
+MCP search. It records support assessments in bounded batches and stages shared
+complete files incrementally; it never receives the entire grounding file or
+repository tree in every request. Existing files require an exact digest from a
+prior read. Planning never mutates the repository.
+
+Monitor or resume without guessing whether the process is alive:
+
+```bash
+python -m campaign status --run-id "$RUN_ID"
+tail -f "artifacts/campaign/$RUN_ID/progress.log"
+
+# Re-run the same plan command with this additional flag after interruption:
+#   --resume
+```
+
+The completed package contains `plan.json`, a one-row-per-case
+`support_matrix.jsonl`, `checkpoint.json`, and `progress.log`. Each testcase is
+classified as `supported_as_is`, `supported_after_change`,
+`unsupported_missing_requirement`, or `needs_review`. A plan with file changes
+has an immutable approval ID; no-change campaigns require no apply step.
+
+Review and apply a change-bearing plan using operator-selected verification:
+
+```bash
+CAMPAIGN_PLAN="artifacts/campaign/$RUN_ID/plan.json"
+CAMPAIGN_PLAN_ID=$(jq -r .plan_id "$CAMPAIGN_PLAN")
+
+python -m campaign apply \
+  --plan "$CAMPAIGN_PLAN" \
+  --repo-path "$REPO_PATH" \
+  --approve-plan-id "$CAMPAIGN_PLAN_ID" \
+  --verify-command "your focused test command" \
+  --verify-command "your build command"
+```
+
+Application uses the same hardened boundary as focused remediation: changes are
+first applied and verified in a disposable repository copy, then the real
+repository is compare-and-swapped only after every check passes. The model
+cannot choose or execute verification commands.
+
+If files were applied, refresh Phase 8 so Phase 9 cites the new repository
+contents, then continue through the existing synthesis and Postman boundaries:
+
+```bash
+python -m grounding \
+  --run-id "$RUN_ID" \
+  --repo-path "$REPO_PATH" \
+  --mcp-tool search_docs \
+  --overwrite
+
+python -m synthesis \
+  --run-id "$RUN_ID" \
+  --strategy agentic \
+  --repo-path "$REPO_PATH" \
+  --mcp-tool search_docs \
+  --response-format json_object \
+  --maximum-output-tokens 8000 \
+  --timeout-seconds 600
+
+python -m postman --run-id "$RUN_ID"
+```
+
+This preserves a deliberate human checkpoint between “the agent proposes code”
+and “the repository changes.” Postman remains deterministic: the campaign and
+MCP can establish support and evidence, but only locally validated Phase 9 HTTP
+specifications are rendered into the collection.
 
 ## Constrained execution-spec synthesis
 

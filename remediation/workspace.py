@@ -154,16 +154,50 @@ class RepositoryWorkspace:
     ) -> RemediationApplyReport:
         """Verify in a disposable copy, then atomically update the real repository."""
 
-        if approved_plan_id != plan.plan_id:
-            return self._rejected(plan, "approval hash does not match plan_id")
-        if self._current_repository_id() != plan.repository_id:
-            return self._rejected(plan, "repository changed since plan generation")
+        return self.apply_changes(
+            plan_id=plan.plan_id,
+            repository_id=plan.repository_id,
+            changes=plan.proposal.changes,
+            approved_plan_id=approved_plan_id,
+            verification_commands=verification_commands,
+            verification_timeout_seconds=verification_timeout_seconds,
+            allow_unverified=allow_unverified,
+        )
+
+    def validate_changes(
+        self,
+        changes: tuple[RepositoryFileChange, ...],
+    ) -> None:
+        """Validate a proposed immutable change set without applying it."""
+
+        self._validate_changes(changes)
+
+    def apply_changes(
+        self,
+        *,
+        plan_id: str,
+        repository_id: str,
+        changes: tuple[RepositoryFileChange, ...],
+        approved_plan_id: str,
+        verification_commands: tuple[tuple[str, ...], ...],
+        verification_timeout_seconds: int = 600,
+        allow_unverified: bool = False,
+    ) -> RemediationApplyReport:
+        """Verify and apply any approved, hash-locked repository change set."""
+
+        if approved_plan_id != plan_id:
+            return self._rejected(plan_id, "approval hash does not match plan_id")
+        if self._current_repository_id() != repository_id:
+            return self._rejected(plan_id, "repository changed since plan generation")
         if not verification_commands and not allow_unverified:
-            return self._rejected(plan, "at least one verification command is required")
+            return self._rejected(
+                plan_id,
+                "at least one verification command is required",
+            )
         try:
-            self._validate_changes(plan.proposal.changes)
+            self._validate_changes(changes)
         except RepositoryWorkspaceError as exc:
-            return self._rejected(plan, str(exc))
+            return self._rejected(plan_id, str(exc))
 
         verification: tuple[VerificationResult, ...] = ()
         with tempfile.TemporaryDirectory(prefix="cz-remediation-") as temporary:
@@ -176,34 +210,45 @@ class RepositoryWorkspace:
                     ignore=self._copy_ignore,
                 )
                 self._reject_stage_symlinks(stage)
-                self._apply_to_root(stage, plan.proposal.changes)
+                self._apply_to_root(stage, changes)
                 verification = self._verify(
                     stage,
                     verification_commands,
                     timeout_seconds=verification_timeout_seconds,
                 )
             except (OSError, RepositoryWorkspaceError) as exc:
-                return self._rolled_back(plan, verification, str(exc))
+                return self._rolled_back(
+                    plan_id,
+                    repository_id,
+                    verification,
+                    str(exc),
+                )
             if any(not result.passed for result in verification):
                 return self._rolled_back(
-                    plan,
+                    plan_id,
+                    repository_id,
                     verification,
                     "one or more verification commands failed",
                 )
 
         # Compare-and-swap is repeated after potentially long verification.
         try:
-            if self._current_repository_id() != plan.repository_id:
+            if self._current_repository_id() != repository_id:
                 raise RepositoryWorkspaceError(
                     "repository changed while verification was running"
                 )
-            self._validate_changes(plan.proposal.changes)
-            files = self._apply_to_root(self.root, plan.proposal.changes)
+            self._validate_changes(changes)
+            files = self._apply_to_root(self.root, changes)
         except (OSError, RepositoryWorkspaceError) as exc:
-            return self._rolled_back(plan, verification, str(exc))
+            return self._rolled_back(
+                plan_id,
+                repository_id,
+                verification,
+                str(exc),
+            )
         return RemediationApplyReport(
-            plan_id=plan.plan_id,
-            repository_id_before=plan.repository_id,
+            plan_id=plan_id,
+            repository_id_before=repository_id,
             applied_at=datetime.now(timezone.utc),
             status=ApplyStatus.APPLIED,
             files=files,
@@ -377,9 +422,9 @@ class RepositoryWorkspace:
                         "staged verification does not permit repository symlinks"
                     )
 
-    def _rejected(self, plan: RemediationPlan, reason: str) -> RemediationApplyReport:
+    def _rejected(self, plan_id: str, reason: str) -> RemediationApplyReport:
         return RemediationApplyReport(
-            plan_id=plan.plan_id,
+            plan_id=plan_id,
             repository_id_before=self.repository_id,
             applied_at=datetime.now(timezone.utc),
             status=ApplyStatus.REJECTED,
@@ -390,13 +435,14 @@ class RepositoryWorkspace:
 
     def _rolled_back(
         self,
-        plan: RemediationPlan,
+        plan_id: str,
+        repository_id: str,
         verification: tuple[VerificationResult, ...],
         reason: str,
     ) -> RemediationApplyReport:
         return RemediationApplyReport(
-            plan_id=plan.plan_id,
-            repository_id_before=plan.repository_id,
+            plan_id=plan_id,
+            repository_id_before=repository_id,
             applied_at=datetime.now(timezone.utc),
             status=ApplyStatus.ROLLED_BACK,
             files=(),
