@@ -310,7 +310,10 @@ def _guided_paginated_html(page: int) -> str:
   for (const button of document.querySelectorAll('button[data-case]')) {{
     button.addEventListener('click', () => {{
       const caseId = button.dataset.case;
-      body.textContent = `${{caseId}}: validates a paginated CSS-modal payment flow`;
+      const dependency = caseId === 'TC_PAGE_02'
+        ? ' Dependency Case TC_PAGE_01'
+        : '';
+      body.textContent = `${{caseId}}: validates a paginated CSS-modal payment flow${{dependency}}`;
       layer.classList.remove('hidden');
     }});
   }}

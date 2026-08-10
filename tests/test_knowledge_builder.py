@@ -261,7 +261,13 @@ def _state(
     return state
 
 
-def _modal_elements(test_case_id: str, sequence: int) -> tuple[ElementSnapshot, ...]:
+def _modal_elements(
+    test_case_id: str,
+    sequence: int,
+    *,
+    dependency_case_id: str | None = None,
+) -> tuple[ElementSnapshot, ...]:
+    dependency = f" Dependency Case {dependency_case_id}" if dependency_case_id else ""
     return (
         _element(
             f"dialog-{sequence}",
@@ -274,14 +280,19 @@ def _modal_elements(test_case_id: str, sequence: int) -> tuple[ElementSnapshot, 
         _element(
             f"dialog-body-{sequence}",
             tag="div",
-            text=f"{test_case_id}: validates the payment flow",
+            text=f"{test_case_id}: validates the payment flow{dependency}",
             parent_css_path=f"{ROOT} > div[role=dialog]",
             ancestors=("div[role=dialog]", "main[role=main]"),
         ),
     )
 
 
-def _build_store(tmp_path: Path, *, completed: bool) -> ArtifactStore:
+def _build_store(
+    tmp_path: Path,
+    *,
+    completed: bool,
+    description_dependency_collision: bool = False,
+) -> ArtifactStore:
     run = ScrapeRun(
         run_id="knowledge-run",
         root_url="https://portal.example.test/start",
@@ -310,7 +321,11 @@ def _build_store(tmp_path: Path, *, completed: bool) -> ArtifactStore:
         state_id="state-modal-2",
         sequence=2,
         url=base.url,
-        elements=_modal_elements("TC_02", 2),
+        elements=_modal_elements(
+            "TC_02",
+            2,
+            dependency_case_id=("TC_01" if description_dependency_collision else None),
+        ),
         modal_count=1,
     )
 
@@ -455,6 +470,60 @@ def test_completed_crawl_normalizes_testcases_dependencies_and_descriptions(
     assert execute.action_status == ActionStatus.SKIPPED
     assert execute.policy_rule == "semantic.review.test_execution"
     assert store.verify_integrity(strict=True).valid is True
+
+
+def test_modal_dependency_id_is_not_misattributed_as_parent_description(
+    tmp_path: Path,
+) -> None:
+    store = _build_store(
+        tmp_path,
+        completed=True,
+        description_dependency_collision=True,
+    )
+
+    knowledge = PortalKnowledgeBuilder(store).build()
+    cases = {case.test_case_id: case for case in knowledge.test_cases}
+
+    assert knowledge.coverage.testcase_context_complete is True
+    assert knowledge.coverage.conflicting_test_case_ids == ()
+    assert cases["TC_01"].description == "TC_01: validates the payment flow"
+    assert cases["TC_01"].conflicts == ()
+    assert cases["TC_02"].description == (
+        "TC_02: validates the payment flow Dependency Case TC_01"
+    )
+
+
+def test_tracker_uses_clicked_case_to_disambiguate_dependency_ids(
+    tmp_path: Path,
+) -> None:
+    store = _build_store(
+        tmp_path,
+        completed=True,
+        description_dependency_collision=True,
+    )
+    states = tuple(store.iter_records(StateSnapshot))
+    tracker = ContextTracker(required_stable_observations=2)
+    coverage: ContextCoverage | None = None
+
+    for state, expected_id in zip(states, (None, "TC_01", "TC_02")):
+        frame = state.frames[0]
+        assert frame.elements_artifact is not None
+        elements = FrameElementCollection.model_validate_json(
+            store.read_bytes(frame.elements_artifact)
+        ).elements
+        coverage = tracker.observe(
+            CapturedState(
+                state=state,
+                elements=elements,
+                receipt=cast(AppendReceipt, object()),
+            ),
+            description_test_case_id=expected_id,
+        )
+
+    assert coverage is not None
+    assert coverage.context_complete is True
+    assert coverage.conflicting_test_case_ids == ()
+    assert coverage.descriptions_captured == 2
 
 
 def test_incomplete_crawl_is_rejected_unless_explicitly_allowed(

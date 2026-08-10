@@ -689,7 +689,10 @@ class StateGraphExplorer:
                             f"row identity {row_key!r}"
                         )
                     if context_tracker is not None:
-                        testcase_context = context_tracker.observe(modal_capture)
+                        testcase_context = context_tracker.observe(
+                            modal_capture,
+                            description_test_case_id=row_key,
+                        )
                     current_page = outcome.active_page
                     current_capture = modal_capture
                     processed_rows.add(row_key)
@@ -969,7 +972,10 @@ class StateGraphExplorer:
                         processed_rows.add(row_key)
                         modal_captures.append(modal_capture)
                         if context_tracker is not None:
-                            testcase_context = context_tracker.observe(modal_capture)
+                            testcase_context = context_tracker.observe(
+                                modal_capture,
+                                description_test_case_id=row_key,
+                            )
 
                     close_actions: list[PlannedAction] = []
                     for modal_capture in modal_captures:

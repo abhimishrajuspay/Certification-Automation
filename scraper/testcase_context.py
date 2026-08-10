@@ -90,10 +90,19 @@ class TestcaseContextTracker:
         self._declared_conflicts: set[str] = set()
         self._cases: dict[str, _CaseEvidence] = {}
         self._modal_texts: set[tuple[int, str]] = set()
+        self._associated_modal_texts: dict[
+            str,
+            set[tuple[int, str]],
+        ] = defaultdict(set)
         self._last_complete_signature: Optional[tuple[object, ...]] = None
         self._stable_observations = 0
 
-    def observe(self, capture: CapturedState) -> TestcaseContextCoverage:
+    def observe(
+        self,
+        capture: CapturedState,
+        *,
+        description_test_case_id: Optional[str] = None,
+    ) -> TestcaseContextCoverage:
         """Ingest one capture and return current cumulative coverage."""
 
         if capture.state.fingerprint not in self._observed_fingerprints:
@@ -101,7 +110,10 @@ class TestcaseContextTracker:
             self._collect_tables(capture.elements)
             self._collect_pagination_total(capture)
             if capture.state.modal_count > 0:
-                self._collect_modal_text(capture.elements)
+                self._collect_modal_text(
+                    capture.elements,
+                    test_case_id=description_test_case_id,
+                )
 
         coverage, signature = self._assess()
         if coverage.context_complete:
@@ -266,14 +278,22 @@ class TestcaseContextTracker:
                 f"{identity}: conflicting pagination totals {previous} and {value}"
             )
 
-    def _collect_modal_text(self, elements: tuple[ElementSnapshot, ...]) -> None:
+    def _collect_modal_text(
+        self,
+        elements: tuple[ElementSnapshot, ...],
+        *,
+        test_case_id: Optional[str],
+    ) -> None:
         for element in elements:
             if not element.visible or not _inside_dialog(element):
                 continue
             text = _element_text(element)
             if len(text) < 3:
                 continue
-            self._modal_texts.add((_modal_text_priority(element), text))
+            candidate = (_modal_text_priority(element), text)
+            self._modal_texts.add(candidate)
+            if test_case_id is not None:
+                self._associated_modal_texts[test_case_id].add(candidate)
 
     def _assess(self) -> tuple[TestcaseContextCoverage, tuple[object, ...]]:
         missing: list[str] = []
@@ -281,11 +301,13 @@ class TestcaseContextTracker:
         selected_descriptions: list[tuple[str, str]] = []
         for test_case_id, case in sorted(self._cases.items()):
             case_conflicted = any(len(values) > 1 for values in case.fields.values())
-            matching = [
-                (priority, text)
-                for priority, text in self._modal_texts
-                if _contains_identifier(text, test_case_id)
-            ]
+            matching = list(self._associated_modal_texts.get(test_case_id, ()))
+            if not matching:
+                matching = [
+                    (priority, text)
+                    for priority, text in self._modal_texts
+                    if _contains_identifier(text, test_case_id)
+                ]
             best_priority = min(
                 (priority for priority, _ in matching),
                 default=None,

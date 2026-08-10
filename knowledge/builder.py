@@ -203,21 +203,27 @@ class PortalKnowledgeBuilder:
         if not states:
             raise KnowledgeBuildError("crawl contains no state evidence")
 
+        action_records = tuple(self.store.iter_records(ActionCandidate))
         actions = {
-            (action.state_id, action.element_id): action
-            for action in self.store.iter_records(ActionCandidate)
+            (action.state_id, action.element_id): action for action in action_records
         }
+        actions_by_id = {action.action_id: action for action in action_records}
+        transitions = tuple(self.store.iter_records(InteractionTransition))
         transition_status = {
-            transition.action_id: transition.status
-            for transition in self.store.iter_records(InteractionTransition)
+            transition.action_id: transition.status for transition in transitions
         }
 
         artifact_cache: dict[str, FrameElementCollection] = {}
+        elements_by_state: dict[tuple[str, str], ElementSnapshot] = {}
         tables: dict[str, _TableAccumulator] = {}
         modal_texts: list[_ModalText] = []
         for state in states:
             for frame in sorted(state.frames, key=lambda item: item.frame_path):
                 elements = self._frame_elements(frame, artifact_cache)
+                elements_by_state.update(
+                    ((state.state_id, element.element_id), element)
+                    for element in elements
+                )
                 self._collect_tables(
                     state,
                     frame,
@@ -230,7 +236,16 @@ class PortalKnowledgeBuilder:
                     modal_texts.extend(self._modal_text(state, frame, elements))
 
         normalized_tables = self._finalize_tables(tables)
-        test_cases = self._build_test_cases(normalized_tables, modal_texts)
+        description_sources = self._description_sources(
+            transitions,
+            actions_by_id,
+            elements_by_state,
+        )
+        test_cases = self._build_test_cases(
+            normalized_tables,
+            modal_texts,
+            description_sources,
+        )
         declared_total, declared_limitations = self._declared_testcase_total(
             normalized_tables
         )
@@ -552,6 +567,7 @@ class PortalKnowledgeBuilder:
         self,
         tables: tuple[NormalizedTable, ...],
         modal_texts: list[_ModalText],
+        description_sources: dict[str, tuple[str, ...]],
     ) -> tuple[TestCaseKnowledge, ...]:
         cases: dict[str, _CaseAccumulator] = {}
         for table in tables:
@@ -580,6 +596,14 @@ class PortalKnowledgeBuilder:
                     case.evidence[_evidence_key(pointer)] = pointer
 
         known_ids = tuple(sorted(cases))
+        associated_ids_by_state = {
+            state_id: tuple(
+                test_case_id
+                for test_case_id in known_ids
+                if any(_contains_identifier(value, test_case_id) for value in values)
+            )
+            for state_id, values in description_sources.items()
+        }
         result: list[TestCaseKnowledge] = []
         for test_case_id in known_ids:
             case = cases[test_case_id]
@@ -601,11 +625,16 @@ class PortalKnowledgeBuilder:
                 )
 
             dependencies = _dependencies(test_case_id, tuple(fields), known_ids)
-            matching_descriptions = [
-                item
-                for item in modal_texts
-                if _contains_identifier(item.text, test_case_id)
-            ]
+            matching_descriptions = []
+            for item in modal_texts:
+                associated_ids = associated_ids_by_state.get(
+                    item.evidence.state_id,
+                    (),
+                )
+                if test_case_id in associated_ids or (
+                    not associated_ids and _contains_identifier(item.text, test_case_id)
+                ):
+                    matching_descriptions.append(item)
             best_priority = min(
                 (item.priority for item in matching_descriptions),
                 default=None,
@@ -650,6 +679,36 @@ class PortalKnowledgeBuilder:
                 )
             )
         return tuple(result)
+
+    @staticmethod
+    def _description_sources(
+        transitions: tuple[InteractionTransition, ...],
+        actions_by_id: dict[str, ActionCandidate],
+        elements_by_state: dict[tuple[str, str], ElementSnapshot],
+    ) -> dict[str, tuple[str, ...]]:
+        """Map a resulting observation state to evidence on its clicked control."""
+
+        sources: dict[str, set[str]] = defaultdict(set)
+        for transition in transitions:
+            if (
+                transition.status != ActionStatus.SUCCEEDED
+                or transition.resulting_state_id is None
+            ):
+                continue
+            action = actions_by_id.get(transition.action_id)
+            if action is None:
+                continue
+            element = elements_by_state.get((action.state_id, action.element_id))
+            if element is None:
+                continue
+            sources[transition.resulting_state_id].update(
+                _description_source_values(element)
+            )
+        return {
+            state_id: tuple(sorted(values))
+            for state_id, values in sources.items()
+            if values
+        }
 
     @staticmethod
     def _declared_testcase_total(
@@ -806,6 +865,45 @@ def _attribute(element: ElementSnapshot, name: str) -> Optional[str]:
 
 def _captured_value(value: Optional[str], safe_value: Optional[str]) -> str:
     return value if value is not None else safe_value or ""
+
+
+def _description_source_values(element: ElementSnapshot) -> tuple[str, ...]:
+    """Extract testcase identity evidence from one activated row control."""
+
+    preferred_names = {
+        "data-case",
+        "data-case-id",
+        "data-tc",
+        "data-tc-id",
+        "data-test-case",
+        "data-test-case-id",
+        "data-testcase",
+        "data-testcase-id",
+    }
+    preferred = {
+        _captured_value(attribute.value, attribute.safe_value)
+        for attribute in element.attributes
+        if attribute.name.casefold() in preferred_names
+        and _captured_value(attribute.value, attribute.safe_value)
+    }
+    if preferred:
+        return tuple(sorted(preferred))
+
+    values = {
+        value.strip()
+        for value in (
+            element.accessible_name,
+            element.label,
+            element.text,
+            element.title,
+            element.context.row_label,
+        )
+        if value and value.strip()
+    }
+    href = _attribute(element, "href")
+    if href:
+        values.update(value for _, value in parse_qsl(urlsplit(href).query) if value)
+    return tuple(sorted(values))
 
 
 def _inside_dialog(element: ElementSnapshot) -> bool:
