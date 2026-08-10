@@ -58,7 +58,8 @@ from synthesis.models import (
     ResponseAssertion,
     SynthesisBatchResponse,
     SynthesisAgentAction,
-    SynthesisAgentResponse,
+    SynthesisAgentDecision,
+    SynthesisCallStage,
     SynthesisDisposition,
     SynthesisStrategy,
     SynthesisToolObservation,
@@ -292,14 +293,22 @@ class _FakeTransport:
 
 
 class _AgentLLM:
-    def __init__(self, responses: list[SynthesisAgentResponse]) -> None:
+    def __init__(
+        self,
+        responses: list[BaseModel],
+        *,
+        response_format: str = "json_schema",
+    ) -> None:
         self._config = LiteLLMConfig(
             endpoint="https://llm.example.test",
             model="fixture-agent-model",
-            response_format="json_schema",
+            response_format=response_format,
         )
         self.responses = responses
         self.prompts: list[str] = []
+        self.system_prompts: list[str] = []
+        self.response_models: list[Type[BaseModel]] = []
+        self.maximum_output_tokens: list[int | None] = []
 
     @property
     def config(self) -> LiteLLMConfig:
@@ -312,10 +321,15 @@ class _AgentLLM:
         user_prompt: str,
         response_model: Type[BaseModel],
         schema_name: str,
+        maximum_output_tokens: int | None = None,
     ) -> LiteLLMCompletion:
-        del system_prompt, response_model, schema_name
+        del schema_name
         self.prompts.append(user_prompt)
+        self.system_prompts.append(system_prompt)
+        self.response_models.append(response_model)
+        self.maximum_output_tokens.append(maximum_output_tokens)
         response = self.responses[len(self.prompts) - 1]
+        assert isinstance(response, response_model)
         content = response.model_dump_json()
         return LiteLLMCompletion(
             content=content,
@@ -365,8 +379,15 @@ class _UnavailableLLM:
         user_prompt: str,
         response_model: Type[BaseModel],
         schema_name: str,
+        maximum_output_tokens: int | None = None,
     ) -> LiteLLMCompletion:
-        del system_prompt, user_prompt, response_model, schema_name
+        del (
+            system_prompt,
+            user_prompt,
+            response_model,
+            schema_name,
+            maximum_output_tokens,
+        )
         self.calls += 1
         raise LiteLLMRetryableError(self.error)
 
@@ -415,11 +436,11 @@ async def test_agentic_synthesis_finishes_from_portal_facts_without_tools() -> N
     specification = _portal_ready_spec("TC_01", "state-1")
     llm = _AgentLLM(
         [
-            SynthesisAgentResponse(
+            SynthesisAgentDecision(
                 action=SynthesisAgentAction.FINAL,
                 rationale="Portal facts contain the complete request and assertions",
-                specification=specification,
-            )
+            ),
+            specification,
         ]
     )
     tools = SynthesisEvidenceTools(grounding)
@@ -436,9 +457,123 @@ async def test_agentic_synthesis_finishes_from_portal_facts_without_tools() -> N
     assert package.coverage.synthesis_complete is True
     assert package.agent_observations == ()
     assert package.retrieved_snippets == ()
-    assert len(package.calls) == 1
-    assert len(llm.prompts) == 1
-    assert len(llm.prompts[0]) < 10_000
+    assert [item.stage for item in package.calls] == [
+        SynthesisCallStage.AGENT_TURN,
+        SynthesisCallStage.SPECIFICATION,
+    ]
+    assert len(llm.prompts) == 2
+    assert len(llm.prompts[0]) < len(llm.prompts[1])
+    assert llm.maximum_output_tokens == [2_048, None]
+
+
+@pytest.mark.asyncio
+async def test_json_object_mode_keeps_decision_schema_separate() -> None:
+    grounding = _grounding()
+    specification = _portal_ready_spec("TC_01", "state-1")
+    llm = _AgentLLM(
+        [
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.FINAL,
+                rationale="Portal evidence is complete",
+            ),
+            specification,
+        ],
+        response_format="json_object",
+    )
+
+    await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        SynthesisEvidenceTools(grounding),
+        config=AgenticSynthesisConfig(maximum_turns_per_case=2),
+    ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    assert "variable_bindings" not in llm.prompts[0]
+    assert "variable_bindings" in llm.prompts[1]
+    assert len(llm.prompts[0]) < 6_000
+
+
+@pytest.mark.asyncio
+async def test_agent_normalizes_description_literal_binding_without_retry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    grounding = _grounding()
+    first = grounding.test_cases[0]
+    context = first.context.model_copy(
+        update={
+            "description": (
+                "Request payload has merchantCustomerId CUST0001 and returns 200"
+            )
+        }
+    )
+    grounding = grounding.model_copy(
+        update={
+            "test_cases": (
+                first.model_copy(update={"context": context}),
+                grounding.test_cases[1],
+            )
+        }
+    )
+    base = _portal_ready_spec("TC_01", "state-1")
+    assert base.request is not None
+    request = base.request.model_copy(
+        update={
+            "body": RequestBodySpec(
+                mode=RequestBodyMode.JSON,
+                content_type="application/json",
+                template=('{"merchantCustomerId":"{{MERCHANT_CUSTOMER_ID}}"}'),
+            )
+        }
+    )
+    bad_binding = TemplateVariableBinding(
+        name="MERCHANT_CUSTOMER_ID",
+        source=TemplateVariableSource.PORTAL_FIELD,
+        source_key="api_name",
+        value="CUST0001",
+        description="Customer ID copied from the portal description",
+    )
+    specification = ExecutionSpec.model_validate(
+        base.model_dump(mode="python")
+        | {
+            "request": request,
+            "variable_bindings": (
+                base.variable_bindings[0],
+                bad_binding,
+            ),
+        }
+    )
+    llm = _AgentLLM(
+        [
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.FINAL,
+                rationale="Portal description contains the complete request",
+            ),
+            specification,
+        ]
+    )
+    caplog.set_level(logging.INFO, logger="cz.synthesis.agent")
+
+    package = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        SynthesisEvidenceTools(grounding),
+        config=AgenticSynthesisConfig(maximum_turns_per_case=2),
+    ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    normalized = package.specifications[0]
+    customer = next(
+        item
+        for item in normalized.variable_bindings
+        if item.name == "MERCHANT_CUSTOMER_ID"
+    )
+    assert customer.source == TemplateVariableSource.EVIDENCE_LITERAL
+    assert customer.source_key is None
+    assert "detail-1" in normalized.portal_evidence_state_ids
+    assert len(package.calls) == 2
+    assert "MERCHANT_CUSTOMER_ID:evidence_literal" in caplog.text
+    assert "CUST0001" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -470,21 +605,21 @@ async def test_agentic_synthesis_searches_then_reads_bounded_evidence(
     }
     llm = _AgentLLM(
         [
-            SynthesisAgentResponse(
+            SynthesisAgentDecision(
                 action=SynthesisAgentAction.SEARCH_REPOSITORY,
                 rationale="Find the exact API contract",
                 query="BillFetchRequest requestId endpoint",
             ),
-            SynthesisAgentResponse(
+            SynthesisAgentDecision(
                 action=SynthesisAgentAction.READ_EVIDENCE,
                 rationale="Read the matching API contract",
                 snippet_id=live_snippet.snippet_id,
             ),
-            SynthesisAgentResponse(
+            SynthesisAgentDecision(
                 action=SynthesisAgentAction.FINAL,
                 rationale="The read contract supports the execution specification",
-                specification=_ready_spec(case),
             ),
+            _ready_spec(case),
         ]
     )
     grounding = _grounding()
@@ -530,16 +665,12 @@ async def test_agent_rejects_unread_external_citation_then_self_corrects() -> No
     }
     llm = _AgentLLM(
         [
-            SynthesisAgentResponse(
+            SynthesisAgentDecision(
                 action=SynthesisAgentAction.FINAL,
                 rationale="Attempt an unread citation",
-                specification=_ready_spec(invalid_case),
             ),
-            SynthesisAgentResponse(
-                action=SynthesisAgentAction.FINAL,
-                rationale="Use the directly observed portal evidence",
-                specification=_portal_ready_spec("TC_01", "state-1"),
-            ),
+            _ready_spec(invalid_case),
+            _portal_ready_spec("TC_01", "state-1"),
         ]
     )
 
@@ -552,8 +683,8 @@ async def test_agent_rejects_unread_external_citation_then_self_corrects() -> No
     ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
 
     assert package.coverage.synthesis_complete is True
-    assert [item.valid for item in package.calls] == [False, True]
-    assert "evidence that was not read" in llm.prompts[1]
+    assert [item.valid for item in package.calls] == [True, False, True]
+    assert "evidence that was not read" in llm.prompts[2]
 
 
 @pytest.mark.asyncio
@@ -786,11 +917,13 @@ async def test_litellm_client_uses_structured_response_without_key_in_payload() 
         user_prompt="user",
         response_model=SynthesisBatchResponse,
         schema_name="test_schema",
+        maximum_output_tokens=321,
     )
 
     assert completion.content == '{"specifications":[]}'
     assert transport.request is not None
     assert transport.request["response_format"]["type"] == "json_schema"
+    assert transport.request["max_tokens"] == 321
     response_schema = transport.request["response_format"]["json_schema"]["schema"]
     assert response_schema["required"] == ["specifications"]
     assert response_schema["additionalProperties"] is False
@@ -894,7 +1027,8 @@ def test_grounding_loader_and_plan_only_cli_verify_phase_boundary(
     )
     plan = json.loads(capsys.readouterr().out)
     assert plan["test_cases"] == 2
-    assert plan["planned_model_calls"] == 2
+    assert plan["minimum_model_calls"] == 4
+    assert plan["planned_model_calls"] == 4
 
     exported.grounding_path.write_bytes(exported.grounding_path.read_bytes() + b"\n")
     with pytest.raises(SynthesisBuildError, match="does not match"):

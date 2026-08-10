@@ -18,7 +18,7 @@ from knowledge.models import SHA256_PATTERN
 
 
 SYNTHESIS_SCHEMA_VERSION = "1.2"
-PROMPT_VERSION = "2.0"
+PROMPT_VERSION = "2.1"
 _ENVIRONMENT_VALUE = re.compile(r"^\{\{[A-Za-z_][A-Za-z0-9_]*\}\}$")
 _TEMPLATE_VALUE = re.compile(r"\{\{[A-Za-z_][A-Za-z0-9_]*\}\}")
 _SENSITIVE_HEADER_NAMES = {
@@ -444,8 +444,51 @@ class SynthesisBatchResponse(SynthesisModel):
     specifications: tuple[TestCaseExecutionSpec, ...]
 
 
+class SynthesisAgentDecision(SynthesisModel):
+    """Small next-action envelope kept separate from final specification data."""
+
+    action: SynthesisAgentAction
+    rationale: str = Field(min_length=1, max_length=1_000)
+    query: Optional[str] = Field(default=None, min_length=1, max_length=2_000)
+    tool_name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    snippet_id: Optional[str] = Field(default=None, pattern=SHA256_PATTERN)
+
+    @model_validator(mode="after")
+    def validate_action_payload(self) -> "SynthesisAgentDecision":
+        if self.action == SynthesisAgentAction.SEARCH_REPOSITORY:
+            valid = self.query is not None
+        elif self.action == SynthesisAgentAction.SEARCH_MCP:
+            valid = self.query is not None and self.tool_name is not None
+        elif self.action == SynthesisAgentAction.READ_EVIDENCE:
+            valid = self.snippet_id is not None
+        else:
+            valid = True
+        if not valid:
+            raise ValueError(f"{self.action.value} lacks its required payload")
+        if (
+            self.action != SynthesisAgentAction.SEARCH_MCP
+            and self.tool_name is not None
+        ):
+            raise ValueError("tool_name is valid only for search_mcp")
+        if (
+            self.action
+            not in {
+                SynthesisAgentAction.SEARCH_REPOSITORY,
+                SynthesisAgentAction.SEARCH_MCP,
+            }
+            and self.query is not None
+        ):
+            raise ValueError("query is invalid for this action")
+        if (
+            self.action != SynthesisAgentAction.READ_EVIDENCE
+            and self.snippet_id is not None
+        ):
+            raise ValueError("snippet_id is valid only for read_evidence")
+        return self
+
+
 class SynthesisAgentResponse(SynthesisModel):
-    """Exactly one tool action or final specification from an agent turn."""
+    """Legacy combined agent response retained for artifact compatibility."""
 
     action: SynthesisAgentAction
     rationale: str = Field(min_length=1, max_length=1_000)
@@ -801,6 +844,7 @@ __all__ = [
     "SYNTHESIS_SCHEMA_VERSION",
     "SynthesisBatchResponse",
     "SynthesisAgentAction",
+    "SynthesisAgentDecision",
     "SynthesisAgentResponse",
     "SynthesisCallRecord",
     "SynthesisCallStage",

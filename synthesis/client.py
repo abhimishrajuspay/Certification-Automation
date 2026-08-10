@@ -120,6 +120,7 @@ class SynthesisLLM(Protocol):
         user_prompt: str,
         response_model: Type[BaseModel],
         schema_name: str,
+        maximum_output_tokens: Optional[int] = None,
     ) -> LiteLLMCompletion: ...
 
 
@@ -224,7 +225,15 @@ class LiteLLMClient:
         user_prompt: str,
         response_model: Type[BaseModel],
         schema_name: str,
+        maximum_output_tokens: Optional[int] = None,
     ) -> LiteLLMCompletion:
+        effective_output_tokens = (
+            self.config.maximum_output_tokens
+            if maximum_output_tokens is None
+            else maximum_output_tokens
+        )
+        if effective_output_tokens <= 0:
+            raise ValueError("per-request maximum output tokens must be positive")
         payload: dict[str, object] = {
             "model": self.config.model,
             "messages": [
@@ -232,7 +241,7 @@ class LiteLLMClient:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0,
-            "max_tokens": self.config.maximum_output_tokens,
+            "max_tokens": effective_output_tokens,
         }
         if self.config.response_format == "json_schema":
             payload["response_format"] = {
@@ -259,7 +268,7 @@ class LiteLLMClient:
                 self.config.maximum_transport_attempts,
                 self.config.model,
                 self.config.timeout_seconds,
-                self.config.maximum_output_tokens,
+                effective_output_tokens,
             )
             try:
                 response = await self._post_with_heartbeat(

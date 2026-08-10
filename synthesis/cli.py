@@ -162,13 +162,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--maximum-agent-turns",
         type=int,
         default=8,
-        help="maximum search/read/final model turns for one testcase",
+        help="maximum evidence decisions and specification corrections per testcase",
     )
     parser.add_argument(
         "--maximum-agent-prompt-characters",
         type=int,
         default=40_000,
         help="hard context limit for one agent turn",
+    )
+    parser.add_argument(
+        "--agent-decision-output-tokens",
+        type=int,
+        default=2_048,
+        help="completion-token cap for the small evidence-decision call",
     )
     parser.add_argument(
         "--agent-repository-results",
@@ -320,17 +326,18 @@ async def _run(args: argparse.Namespace) -> int:
                     "test_cases": len(loaded.grounding.test_cases),
                     "semantic_groups": plan.semantic_groups,
                     "minimum_model_calls": (
-                        len(loaded.grounding.test_cases)
+                        len(loaded.grounding.test_cases) * 2
                         if strategy == SynthesisStrategy.AGENTIC
                         else plan.batches
                     ),
                     "planned_model_calls": (
-                        len(loaded.grounding.test_cases)
+                        len(loaded.grounding.test_cases) * 2
                         if strategy == SynthesisStrategy.AGENTIC
                         else plan.batches
                     ),
                     "maximum_model_calls": (
-                        len(loaded.grounding.test_cases) * args.maximum_agent_turns
+                        len(loaded.grounding.test_cases)
+                        * (args.maximum_agent_turns + 1)
                         if strategy == SynthesisStrategy.AGENTIC
                         else plan.batches * args.maximum_validation_attempts
                     ),
@@ -404,6 +411,7 @@ async def _run(args: argparse.Namespace) -> int:
             concurrency=args.concurrency,
             maximum_turns_per_case=args.maximum_agent_turns,
             maximum_prompt_characters=args.maximum_agent_prompt_characters,
+            decision_maximum_output_tokens=args.agent_decision_output_tokens,
             repository_search_results=args.agent_repository_results,
             mcp_search_results=args.agent_mcp_results,
             evidence_preview_characters=args.agent_evidence_preview_characters,

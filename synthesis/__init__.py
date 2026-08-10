@@ -29,8 +29,9 @@ from synthesis.exporter import (
 )
 from synthesis.models import (
     HTTPRequestSpec,
-    SynthesisCoverage,
     SynthesisAgentAction,
+    SynthesisAgentDecision,
+    SynthesisCoverage,
     SynthesisDisposition,
     SynthesisPackage,
     SynthesisStrategy,
@@ -51,8 +52,9 @@ __all__ = [
     "SynthesisBuildConfig",
     "SynthesisBuildError",
     "SynthesisBuilder",
-    "SynthesisCoverage",
     "SynthesisAgentAction",
+    "SynthesisAgentDecision",
+    "SynthesisCoverage",
     "SynthesisDisposition",
     "SynthesisExportError",
     "SynthesisExportResult",

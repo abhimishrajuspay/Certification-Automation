@@ -478,6 +478,7 @@ python -m synthesis \
   --mcp-tool search_docs \
   --concurrency 1 \
   --maximum-agent-turns 6 \
+  --agent-decision-output-tokens 2048 \
   --maximum-output-tokens 8000 \
   --timeout-seconds 600 \
   --maximum-transport-attempts 2 \
@@ -485,16 +486,26 @@ python -m synthesis \
   --progress-interval-seconds 15
 ```
 
-Agentic synthesis is the default. Each model turn starts with exactly one
-testcase's portal fields, description, dependency IDs, and state citations. The
-model may immediately return the final specification when those facts are
-sufficient. Otherwise it chooses one bounded action: `search_repository`,
-`search_mcp`, or `read_evidence`. Searches return metadata plus short previews;
+For Grid deployments of `kimi-latest`, add `--response-format json_object`.
+The tested route returned ordinary JSON reliably while its strict
+`json_schema` constrained-decoding path stalled. Local Pydantic validation and
+the correction loop remain active in either mode.
+
+Agentic synthesis is the default. A small decision call starts with exactly one
+testcase's portal fields, description, dependency IDs, and state citations. It
+either selects `search_repository`, `search_mcp`, or `read_evidence`, or signals
+that evidence is complete. Only then does a separate call receive the full
+execution-specification schema. Searches return metadata plus short previews;
 the model must explicitly read a result before its content can enter context or
 its snippet ID can be cited. Retrieved content is capped at 2,000 characters by
 default. Generated build trees such as `dist-newstyle`, caches, artifacts,
 virtual environments, and package dependencies are excluded from repository
 indexing.
+
+`portal_field` bindings are exact whole-field copies. Description/payload
+substrings are `evidence_literal` bindings. The validator safely normalizes this
+specific source-classification mistake when the value appears verbatim in cited
+portal description evidence, preventing an otherwise redundant model retry.
 
 The legacy eager batching implementation remains available only through
 `--strategy bulk --maximum-cases-per-batch <n>`. Bulk mode unions all selected
