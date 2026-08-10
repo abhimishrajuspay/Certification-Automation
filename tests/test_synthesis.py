@@ -345,12 +345,13 @@ class _SlowTransport(_FakeTransport):
         )
 
 
-class _RateLimitedLLM:
-    def __init__(self) -> None:
+class _UnavailableLLM:
+    def __init__(self, error: str) -> None:
         self._config = LiteLLMConfig(
             endpoint="https://llm.example.test",
             model="fixture-agent-model",
         )
+        self.error = error
         self.calls = 0
 
     @property
@@ -367,7 +368,7 @@ class _RateLimitedLLM:
     ) -> LiteLLMCompletion:
         del system_prompt, user_prompt, response_model, schema_name
         self.calls += 1
-        raise LiteLLMRetryableError("LiteLLM HTTP 429")
+        raise LiteLLMRetryableError(self.error)
 
 
 def test_request_models_reject_unsafe_or_invalid_ready_specs() -> None:
@@ -605,10 +606,16 @@ async def test_agent_rejects_resumed_specification_with_unread_evidence() -> Non
     assert resumed.agent_observations == (read_observation,)
 
 
+@pytest.mark.parametrize(
+    "provider_error",
+    ("LiteLLM HTTP 429", "LiteLLM request failed: read operation timed out"),
+)
 @pytest.mark.asyncio
-async def test_agent_opens_provider_circuit_after_rate_limit() -> None:
+async def test_agent_opens_provider_circuit_after_transport_failure(
+    provider_error: str,
+) -> None:
     grounding = _grounding()
-    llm = _RateLimitedLLM()
+    llm = _UnavailableLLM(provider_error)
 
     package = await AgenticSynthesisBuilder(
         grounding,

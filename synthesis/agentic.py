@@ -419,8 +419,14 @@ class AgenticSynthesisBuilder:
                         ),
                     )
                 outcome = await self._run_case(case)
-                if outcome.error is not None and "HTTP 429" in outcome.error:
-                    provider_halt_reason = "LiteLLM HTTP 429"
+                if (
+                    outcome.error is not None
+                    and "agent transport failed:" in outcome.error
+                ):
+                    provider_halt_reason = outcome.error.split(
+                        "agent transport failed:",
+                        maxsplit=1,
+                    )[1].strip()[:500]
                     LOGGER.error(
                         "provider circuit opened reason=%s; queued testcases will "
                         "not call the model",
