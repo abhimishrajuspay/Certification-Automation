@@ -140,7 +140,7 @@ class CampaignAgentResponse(CampaignModel):
 
         allowed: dict[CampaignAction, set[str]] = {
             CampaignAction.LIST_TEST_CASES: {"group_id", "offset", "limit"},
-            CampaignAction.READ_TEST_CASES: {"test_case_ids"},
+            CampaignAction.READ_TEST_CASES: {"group_id", "test_case_ids"},
             CampaignAction.READ_EVIDENCE: {"snippet_id"},
             CampaignAction.SEARCH_REPOSITORY: {"query"},
             CampaignAction.READ_REPOSITORY_FILE: {"path"},

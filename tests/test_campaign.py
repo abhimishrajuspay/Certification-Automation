@@ -136,7 +136,7 @@ def _grounding() -> GroundingPackage:
 
 
 class _CampaignLLM:
-    def __init__(self, source: str, snippet_id: str) -> None:
+    def __init__(self, source: str, snippet_id: str, group_id: str) -> None:
         self._config = LiteLLMConfig(
             endpoint="https://llm.example.test",
             model="fixture-model",
@@ -144,6 +144,7 @@ class _CampaignLLM:
         )
         self.source = source
         self.snippet_id = snippet_id
+        self.group_id = group_id
         self.prompts: list[str] = []
 
     @property
@@ -165,6 +166,7 @@ class _CampaignLLM:
             response = CampaignAgentResponse(
                 action=CampaignAction.READ_TEST_CASES,
                 rationale="Read the related API group in one bounded request",
+                group_id=self.group_id,
                 test_case_ids=("TC_01", "TC_02"),
             )
         elif turn == 2:
@@ -239,7 +241,8 @@ async def test_campaign_reads_lazily_and_builds_one_shared_change(
     (repository / "service.py").write_text(source)
     grounding = _grounding()
     snippet_id = grounding.snippets[0].snippet_id
-    llm = _CampaignLLM(source, snippet_id)
+    groups = campaign_groups(grounding.test_cases)
+    llm = _CampaignLLM(source, snippet_id, groups[0].group_id)
     checkpoints = []
 
     plan = await CertificationCampaignAgent(
@@ -250,7 +253,7 @@ async def test_campaign_reads_lazily_and_builds_one_shared_change(
         objective="Support every grounded testcase and stage required code",
     ).build(progress=checkpoints.append)
 
-    assert len(campaign_groups(grounding.test_cases)) == 1
+    assert len(groups) == 1
     assert len(plan.assessments) == 2
     assert plan.proposal is not None
     assert len(plan.proposal.changes) == 1
@@ -301,6 +304,17 @@ def test_campaign_action_contract_rejects_mixed_tool_payloads() -> None:
             query="bill fetch handler",
             path="service.py",
         )
+
+
+def test_read_testcases_accepts_optional_group_context() -> None:
+    response = CampaignAgentResponse(
+        action=CampaignAction.READ_TEST_CASES,
+        rationale="Read one bounded API group",
+        group_id="group-001-fixture",
+        test_case_ids=("TC_01", "TC_02"),
+    )
+
+    assert response.group_id == "group-001-fixture"
 
 
 def test_complete_supported_campaign_needs_no_repository_approval() -> None:

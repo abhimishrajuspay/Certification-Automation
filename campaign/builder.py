@@ -343,6 +343,14 @@ class CertificationCampaignAgent:
                     raise ValueError(
                         f"unknown or unselected testcases: {sorted(unknown)}"
                     )
+                if response.group_id is not None:
+                    group = self._group(response.group_id)
+                    outside_group = set(case_ids) - set(group.test_case_ids)
+                    if outside_group:
+                        raise ValueError(
+                            "read_test_cases contains IDs outside its supplied group: "
+                            f"{sorted(outside_group)}"
+                        )
                 self._read_case_ids.update(case_ids)
                 for case_id in case_ids:
                     case = self.cases[case_id]
