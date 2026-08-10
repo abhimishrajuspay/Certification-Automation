@@ -107,10 +107,15 @@ class CampaignAgentResponse(CampaignModel):
     """One structured action from the repository-wide campaign agent."""
 
     action: CampaignAction
-    rationale: str = Field(min_length=1)
+    rationale: str = Field(
+        default="Model selected this bounded campaign action.",
+        min_length=1,
+    )
     group_id: Optional[str] = None
     offset: Optional[int] = Field(default=None, ge=0)
     limit: Optional[int] = Field(default=None, ge=1, le=50)
+    line_start: Optional[int] = Field(default=None, ge=1)
+    line_end: Optional[int] = Field(default=None, ge=1)
     test_case_ids: Optional[tuple[str, ...]] = None
     snippet_id: Optional[str] = None
     query: Optional[str] = None
@@ -122,6 +127,16 @@ class CampaignAgentResponse(CampaignModel):
 
     @model_validator(mode="after")
     def validate_action_payload(self) -> "CampaignAgentResponse":
+        if (self.line_start is None) != (self.line_end is None):
+            raise ValueError(
+                "repository line_start and line_end must be supplied together"
+            )
+        if (
+            self.line_start is not None
+            and self.line_end is not None
+            and self.line_end < self.line_start
+        ):
+            raise ValueError("repository line_end cannot precede line_start")
         valid = {
             CampaignAction.LIST_TEST_CASES: self.group_id is not None,
             CampaignAction.READ_TEST_CASES: bool(self.test_case_ids),
@@ -140,13 +155,46 @@ class CampaignAgentResponse(CampaignModel):
 
         allowed: dict[CampaignAction, set[str]] = {
             CampaignAction.LIST_TEST_CASES: {"group_id", "offset", "limit"},
-            CampaignAction.READ_TEST_CASES: {"group_id", "test_case_ids"},
-            CampaignAction.READ_EVIDENCE: {"snippet_id"},
-            CampaignAction.SEARCH_REPOSITORY: {"query"},
-            CampaignAction.READ_REPOSITORY_FILE: {"path"},
-            CampaignAction.SEARCH_MCP: {"query", "tool_name"},
-            CampaignAction.RECORD_ASSESSMENTS: {"assessments"},
-            CampaignAction.STAGE_FILE: {"change"},
+            CampaignAction.READ_TEST_CASES: {
+                "group_id",
+                "test_case_ids",
+                "limit",
+            },
+            CampaignAction.READ_EVIDENCE: {
+                "snippet_id",
+                "group_id",
+                "test_case_ids",
+            },
+            CampaignAction.SEARCH_REPOSITORY: {
+                "query",
+                "limit",
+                "group_id",
+                "test_case_ids",
+            },
+            CampaignAction.READ_REPOSITORY_FILE: {
+                "path",
+                "line_start",
+                "line_end",
+                "group_id",
+                "test_case_ids",
+            },
+            CampaignAction.SEARCH_MCP: {
+                "query",
+                "tool_name",
+                "limit",
+                "group_id",
+                "test_case_ids",
+            },
+            CampaignAction.RECORD_ASSESSMENTS: {
+                "assessments",
+                "group_id",
+                "test_case_ids",
+            },
+            CampaignAction.STAGE_FILE: {
+                "change",
+                "group_id",
+                "test_case_ids",
+            },
             CampaignAction.FINAL: {"conclusion"},
         }
         present = {
@@ -155,6 +203,8 @@ class CampaignAgentResponse(CampaignModel):
                 "group_id",
                 "offset",
                 "limit",
+                "line_start",
+                "line_end",
                 "test_case_ids",
                 "snippet_id",
                 "query",

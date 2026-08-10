@@ -177,11 +177,19 @@ class _CampaignLLM:
             )
         elif turn == 3:
             response = CampaignAgentResponse(
+                action=CampaignAction.SEARCH_REPOSITORY,
+                query="bill_fetch",
+                limit=50,
+                group_id=self.group_id,
+                test_case_ids=("TC_01", "TC_02"),
+            )
+        elif turn == 4:
+            response = CampaignAgentResponse(
                 action=CampaignAction.READ_REPOSITORY_FILE,
                 rationale="Inspect the existing implementation before replacement",
                 path="service.py",
             )
-        elif turn == 4:
+        elif turn == 5:
             response = CampaignAgentResponse(
                 action=CampaignAction.RECORD_ASSESSMENTS,
                 rationale="Both cases share the same missing handler capability",
@@ -199,7 +207,7 @@ class _CampaignLLM:
                     for index in (1, 2)
                 ),
             )
-        elif turn == 5:
+        elif turn == 6:
             response = CampaignAgentResponse(
                 action=CampaignAction.STAGE_FILE,
                 rationale="Implement the shared capability once for both cases",
@@ -259,7 +267,7 @@ async def test_campaign_reads_lazily_and_builds_one_shared_change(
     assert len(plan.proposal.changes) == 1
     assert plan.proposal.changes[0].test_case_ids == ("TC_01", "TC_02")
     assert plan.approval_required is True
-    assert len(checkpoints) == 6
+    assert len(checkpoints) == 7
     assert checkpoints[-1].assessments == plan.assessments
     assert "validates the bill fetch API" not in llm.prompts[0]
     assert "POST /bill/fetch" not in llm.prompts[0]
@@ -296,6 +304,53 @@ def test_campaign_workspace_stages_without_mutating_and_rejects_stale_hash(
         stale_workspace.stage(change.model_copy(update={"expected_sha256": "0" * 64}))
 
 
+@pytest.mark.asyncio
+async def test_large_repository_files_require_safe_bounded_range_reads(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    large_content = "".join(
+        f"line_{index:04d} = '{('x' * 180)}'\n" for index in range(1, 501)
+    )
+    (repository / "large.py").write_text(large_content)
+    grounding = _grounding()
+    group = campaign_groups(grounding.test_cases)[0]
+    workspace = CampaignWorkspace(repository)
+    agent = CertificationCampaignAgent(
+        grounding=grounding,
+        grounding_sha256="d" * 64,
+        workspace=workspace,
+        llm=_CampaignLLM(
+            large_content,
+            grounding.snippets[0].snippet_id,
+            group.group_id,
+        ),
+        objective="Inspect safely",
+    )
+
+    full_result, _, full_error = await agent._execute_tool(
+        CampaignAgentResponse(
+            action=CampaignAction.READ_REPOSITORY_FILE,
+            path="large.py",
+        )
+    )
+    range_result, _, range_error = await agent._execute_tool(
+        CampaignAgentResponse(
+            action=CampaignAction.READ_REPOSITORY_FILE,
+            path="large.py",
+            line_start=1,
+            line_end=100,
+        )
+    )
+
+    assert full_error is not None
+    assert "retry read_repository_file" in full_result
+    assert range_error is None
+    assert json.loads(range_result)["replacement_allowed"] is False
+    assert "large.py" not in workspace.read_paths
+
+
 def test_campaign_action_contract_rejects_mixed_tool_payloads() -> None:
     with pytest.raises(ValueError, match="invalid fields"):
         CampaignAgentResponse(
@@ -315,6 +370,37 @@ def test_read_testcases_accepts_optional_group_context() -> None:
     )
 
     assert response.group_id == "group-001-fixture"
+
+
+def test_search_accepts_and_locally_bounds_model_scope() -> None:
+    response = CampaignAgentResponse(
+        action=CampaignAction.SEARCH_REPOSITORY,
+        query="session registration route",
+        limit=50,
+        group_id="group-001-fixture",
+        test_case_ids=("TC_01", "TC_02"),
+    )
+
+    assert response.limit == 50
+    assert response.rationale == "Model selected this bounded campaign action."
+
+
+def test_repository_range_contract_requires_complete_ordered_bounds() -> None:
+    with pytest.raises(ValueError, match="supplied together"):
+        CampaignAgentResponse(
+            action=CampaignAction.READ_REPOSITORY_FILE,
+            path="large.py",
+            line_start=1,
+        )
+
+    response = CampaignAgentResponse(
+        action=CampaignAction.READ_REPOSITORY_FILE,
+        path="large.py",
+        line_start=200,
+        line_end=400,
+    )
+    assert response.line_start == 200
+    assert response.line_end == 400
 
 
 def test_complete_supported_campaign_needs_no_repository_approval() -> None:

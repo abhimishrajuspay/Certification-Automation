@@ -59,6 +59,9 @@ Rules:
 1. Work group-first. Reuse one repository/MCP investigation across related cases.
 2. Never invent testcase requirements or repository contents. Read before citing.
 3. Read every existing file before replacement and use its exact SHA-256.
+   For a large file, retry read_repository_file with line_start and line_end to
+   inspect at most 400 lines at a time. A range read supports assessment but does
+   not authorize complete-file replacement.
 4. Stage complete files only. Do not delete, rename, run shell commands, or include secrets.
 5. Add production code, configuration, APIs, and focused tests when evidence requires them.
 6. supported_as_is means no missing capability. supported_after_change must be covered by
@@ -81,6 +84,7 @@ _GROUP_FIELD_KEYS = {
     "service",
     "service_name",
 }
+_MAXIMUM_REPOSITORY_LINES_PER_READ = 400
 
 
 class CampaignBuildError(RuntimeError):
@@ -307,6 +311,7 @@ class CertificationCampaignAgent:
         response: CampaignAgentResponse,
     ) -> tuple[str, tuple[str, ...], Optional[str]]:
         try:
+            self._validate_scope(response)
             if response.action == CampaignAction.LIST_TEST_CASES:
                 assert response.group_id is not None
                 group = self._group(response.group_id)
@@ -387,9 +392,13 @@ class CertificationCampaignAgent:
 
             if response.action == CampaignAction.SEARCH_REPOSITORY:
                 assert response.query is not None
+                result_limit = min(
+                    response.limit or self.config.repository_search_results,
+                    self.config.repository_search_results,
+                )
                 snippets = self.workspace.search(
                     response.query,
-                    limit=self.config.repository_search_results,
+                    limit=result_limit,
                 )
                 self._add_dynamic(snippets)
                 return (
@@ -400,14 +409,54 @@ class CertificationCampaignAgent:
 
             if response.action == CampaignAction.READ_REPOSITORY_FILE:
                 assert response.path is not None
-                content, digest = self.workspace.read_file(response.path)
-                if len(content) > self.config.maximum_repository_file_characters:
+                content, digest = self.workspace.inspect_file(response.path)
+                lines = content.splitlines(keepends=True)
+                total_lines = len(lines)
+                full_file_read = response.line_start is None
+                if (
+                    full_file_read
+                    and len(content) > self.config.maximum_repository_file_characters
+                ):
                     raise RepositoryWorkspaceError(
-                        "repository file exceeds campaign prompt limit"
+                        f"repository file has {len(content)} characters and "
+                        f"{total_lines} lines; retry read_repository_file with "
+                        "line_start and line_end (maximum 400 lines)"
                     )
+                actual_start = 1
+                actual_end = total_lines
+                if response.line_start is not None and response.line_end is not None:
+                    if response.line_start > total_lines:
+                        raise RepositoryWorkspaceError(
+                            "repository line_start exceeds the file's total lines"
+                        )
+                    if (
+                        response.line_end - response.line_start + 1
+                        > _MAXIMUM_REPOSITORY_LINES_PER_READ
+                    ):
+                        raise RepositoryWorkspaceError(
+                            "repository range exceeds the 400-line read limit"
+                        )
+                    actual_start = response.line_start
+                    actual_end = min(response.line_end, total_lines)
+                    content = "".join(lines[actual_start - 1 : actual_end])
+                    if len(content) > self.config.maximum_repository_file_characters:
+                        raise RepositoryWorkspaceError(
+                            "repository line range exceeds campaign prompt limit"
+                        )
+                else:
+                    self.workspace.mark_completely_read(response.path)
                 return (
                     _json_text(
-                        {"path": response.path, "sha256": digest, "content": content}
+                        {
+                            "path": response.path,
+                            "sha256": digest,
+                            "total_lines": total_lines,
+                            "line_start": actual_start,
+                            "line_end": actual_end,
+                            "full_file_read": full_file_read,
+                            "replacement_allowed": full_file_read,
+                            "content": content,
+                        }
                     ),
                     (),
                     None,
@@ -422,16 +471,20 @@ class CertificationCampaignAgent:
                     raise MCPError(
                         f"MCP tool is unavailable or not allowlisted: {response.tool_name}"
                     )
+                result_limit = min(
+                    response.limit or self.config.mcp_search_results,
+                    self.config.mcp_search_results,
+                )
                 arguments: dict[str, object] = {"query": response.query}
                 if response.tool_name == "search_documents":
-                    arguments["top_k"] = self.config.mcp_search_results
+                    arguments["top_k"] = result_limit
                 else:
-                    arguments["limit"] = self.config.mcp_search_results
+                    arguments["limit"] = result_limit
                 result = await self.mcp.call_tool(response.tool_name, arguments)
                 snippets = self.mcp.to_snippets(
                     result,
                     maximum_content_characters=self.config.maximum_evidence_characters,
-                )[: self.config.mcp_search_results]
+                )[:result_limit]
                 self._add_dynamic(snippets)
                 return (
                     _json_text([_snippet_metadata(item) for item in snippets]),
@@ -502,6 +555,23 @@ class CertificationCampaignAgent:
         ) as exc:
             safe_error = str(exc)[:2_000]
             return _json_text({"error": safe_error}), (), safe_error
+
+    def _validate_scope(self, response: CampaignAgentResponse) -> None:
+        scoped_ids = tuple(dict.fromkeys(response.test_case_ids or ()))
+        unknown = set(scoped_ids) - set(self.cases)
+        if unknown:
+            raise ValueError(
+                f"campaign action scopes unknown testcases: {sorted(unknown)}"
+            )
+        if response.group_id is None:
+            return
+        group = self._group(response.group_id)
+        outside_group = set(scoped_ids) - set(group.test_case_ids)
+        if outside_group:
+            raise ValueError(
+                "campaign action contains IDs outside its supplied group: "
+                f"{sorted(outside_group)}"
+            )
 
     def _validate_assessment(self, assessment: CampaignAssessment) -> None:
         case = self.cases.get(assessment.test_case_id)
@@ -670,8 +740,17 @@ class CertificationCampaignAgent:
         )
         self._catalog.update(self._dynamic)
         self._candidate_snippet_ids.update(checkpoint.read_evidence_snippet_ids)
+        last_read_errors: dict[str, Optional[str]] = {}
+        for observation in checkpoint.observations:
+            if observation.action == CampaignAction.READ_REPOSITORY_FILE:
+                last_read_errors[observation.request] = observation.error
+        safe_read_paths = tuple(
+            path
+            for path in checkpoint.read_repository_paths
+            if path not in last_read_errors or last_read_errors[path] is None
+        )
         self.workspace.restore(
-            read_paths=checkpoint.read_repository_paths,
+            read_paths=safe_read_paths,
             staged_changes=checkpoint.staged_changes,
         )
         self._calls.extend(checkpoint.calls)
@@ -855,16 +934,16 @@ def _call_record(
 
 
 def _request_label(response: CampaignAgentResponse) -> str:
-    if response.group_id is not None:
-        return response.group_id
-    if response.test_case_ids is not None:
-        return ",".join(response.test_case_ids)
-    if response.snippet_id is not None:
-        return response.snippet_id
     if response.query is not None:
         return response.query
     if response.path is not None:
         return response.path
+    if response.snippet_id is not None:
+        return response.snippet_id
+    if response.test_case_ids is not None:
+        return ",".join(response.test_case_ids)
+    if response.group_id is not None:
+        return response.group_id
     if response.assessments is not None:
         return ",".join(item.test_case_id for item in response.assessments)
     if response.change is not None:

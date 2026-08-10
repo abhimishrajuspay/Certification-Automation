@@ -48,14 +48,23 @@ class CampaignWorkspace:
         return self.repository.search(query, limit=limit)
 
     def read_file(self, relative_path: str) -> tuple[str, str]:
+        content, digest = self.inspect_file(relative_path)
+        self._read_paths.add(relative_path)
+        return content, digest
+
+    def inspect_file(self, relative_path: str) -> tuple[str, str]:
+        """Read content without authorizing a later complete-file replacement."""
+
         staged = self._staged.get(relative_path)
         if staged is not None:
             content = staged.content
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         else:
             content, digest = self.repository.read_file(relative_path)
-        self._read_paths.add(relative_path)
         return content, digest
+
+    def mark_completely_read(self, relative_path: str) -> None:
+        self._read_paths.add(relative_path)
 
     def stage(self, change: RepositoryFileChange) -> RepositoryFileChange:
         """Validate and retain one complete file without touching the repository."""
