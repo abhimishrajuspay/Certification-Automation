@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -40,6 +41,7 @@ from scraper.models import (
     CoverageReport,
     CrawlCompletionGoal,
     EffectKind,
+    ElementSnapshot,
     InteractionTransition,
     ScrapeRunStatus,
     TestcaseContextCoverage,
@@ -58,6 +60,17 @@ RESTORE_STORAGE_SCRIPT = r"""
     for (const [name, value] of payload.sessionStorage) sessionStorage.setItem(name, value);
 }
 """
+
+_PAGINATION_WINDOW = re.compile(
+    r"\bshowing\s+(?P<start>\d[\d,]*)\s+to\s+(?P<end>\d[\d,]*)\s+"
+    r"of\s+(?P<total>\d[\d,]*)\s+"
+    r"(?:entries|items|records|results|test\s*cases?|tests?)\b",
+    re.IGNORECASE,
+)
+_NEXT_PAGE_LABEL = re.compile(
+    r"^(?:next(?:\s+page)?|more)(?:\s*[>›»→]+)?$",
+    re.IGNORECASE,
+)
 
 
 class ExplorationError(RuntimeError):
@@ -212,6 +225,7 @@ class StateGraphExplorer:
                     active_page,
                     root_capture,
                     ledger,
+                    context_tracker=context_tracker,
                 )
             checkpoint = await self._capture_checkpoint(active_page)
             root_page = active_page
@@ -515,6 +529,8 @@ class StateGraphExplorer:
         active_page: Page,
         capture: CapturedState,
         ledger: _ExplorationLedger,
+        *,
+        context_tracker: Optional[TestcaseContextTracker],
     ) -> tuple[Page, CapturedState, tuple[PlannedAction, ...]]:
         """Replay explicit setup steps once, then promote the result to root."""
 
@@ -523,7 +539,7 @@ class StateGraphExplorer:
         current_page = active_page
         current_capture = capture
         recovery_path: list[PlannedAction] = []
-        for step in self.guide.steps:
+        for index, step in enumerate(self.guide.steps):
             matches = target_elements(current_capture, step.target, allow_many=False)
             if len(matches) != 1:
                 message = f"guide step {step.name!r} did not resolve uniquely"
@@ -531,6 +547,8 @@ class StateGraphExplorer:
                     ledger.limitations.add(f"{message}; generic discovery resumed")
                     break
                 raise ExplorationError(message)
+            if context_tracker is not None and index == len(self.guide.steps) - 1:
+                context_tracker.observe_selected_total(current_capture, matches[0])
             planned = await self.planner.plan(
                 current_capture,
                 element_ids={matches[0].element_id},
@@ -594,103 +612,148 @@ class StateGraphExplorer:
         attempts = 0
         for rule in self.guide.repeat_rules if self.guide else ():
             processed_rows: set[str] = set()
+            seen_pages: set[tuple[str, ...]] = set()
+            pagination_transitions = 0
             while len(processed_rows) < rule.maximum_rows:
-                if asyncio.get_running_loop().time() >= deadline:
+                page_signature = _repeat_page_signature(current_capture, rule)
+                if page_signature in seen_pages:
+                    break
+                if len(seen_pages) >= rule.maximum_pages:
                     raise ExplorationError(
-                        "maximum runtime reached during guided row sweep"
+                        f"repeat rule {rule.name!r} reached maximum_pages"
                     )
+                seen_pages.add(page_signature)
+                page_matched = False
+                while len(processed_rows) < rule.maximum_rows:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise ExplorationError(
+                            "maximum runtime reached during guided row sweep"
+                        )
+                    if attempted_actions + attempts >= self.limits.maximum_actions:
+                        raise ExplorationError(
+                            "maximum executed actions reached during guided row sweep"
+                        )
+                    matches = tuple(
+                        element
+                        for element in target_elements(
+                            current_capture,
+                            rule.target,
+                            allow_many=True,
+                        )
+                        if element.visible
+                        and element.enabled
+                        and (
+                            not rule.require_row_label
+                            or bool(element.context.row_label)
+                        )
+                        and _repeat_row_key(element) not in processed_rows
+                    )
+                    if not matches:
+                        break
+                    page_matched = True
+                    selected_element = min(
+                        matches,
+                        key=lambda element: (
+                            _repeat_row_key(element),
+                            element.element_id,
+                        ),
+                    )
+                    row_key = _repeat_row_key(selected_element)
+                    planned = await self.planner.plan(
+                        current_capture,
+                        element_ids={selected_element.element_id},
+                        action_kinds={ActionKind.CLICK},
+                    )
+                    selected = self._one_pending_repeat_action(rule, planned)
+                    ledger.actions.extend(item.candidate for item in planned)
+                    outcome = await self.executor.execute(
+                        current_page,
+                        selected,
+                        current_capture,
+                        sequence=ledger.sequence,
+                    )
+                    ledger.transitions.append(outcome.transition)
+                    attempts += 1
+                    if outcome.capture is None:
+                        raise ExplorationError(
+                            f"repeat rule {rule.name!r} failed for row {row_key!r}"
+                        )
+                    ledger.sequence += 1
+                    self._retain_capture(ledger, outcome.capture)
+                    modal_capture = outcome.capture
+                    if rule.expect_dialog_contains_row_label and not _capture_contains(
+                        modal_capture, row_key
+                    ):
+                        raise ExplorationError(
+                            f"repeat rule {rule.name!r} dialog did not contain "
+                            f"row identity {row_key!r}"
+                        )
+                    if context_tracker is not None:
+                        testcase_context = context_tracker.observe(modal_capture)
+                    current_page = outcome.active_page
+                    current_capture = modal_capture
+                    processed_rows.add(row_key)
+
+                    (
+                        current_page,
+                        current_capture,
+                        close_attempts,
+                    ) = await self._close_repeated_observation(
+                        current_page,
+                        current_capture,
+                        rule,
+                        ledger,
+                    )
+                    attempts += close_attempts
+                    if context_tracker is not None:
+                        testcase_context = context_tracker.observe(current_capture)
+                    if testcase_context and testcase_context.stable_for_early_stop:
+                        return (
+                            current_page,
+                            current_capture,
+                            testcase_context,
+                            attempts,
+                        )
+
+                if not page_matched and not processed_rows:
+                    raise ExplorationError(
+                        f"repeat rule {rule.name!r} matched no row controls"
+                    )
+                next_action, planned = await self._pagination_action(
+                    current_capture,
+                    rule,
+                )
+                ledger.actions.extend(item.candidate for item in planned)
+                if next_action is None:
+                    break
                 if attempted_actions + attempts >= self.limits.maximum_actions:
                     raise ExplorationError(
-                        "maximum executed actions reached during guided row sweep"
+                        "maximum executed actions reached during guided pagination"
                     )
-                matches = tuple(
-                    element
-                    for element in target_elements(
-                        current_capture,
-                        rule.target,
-                        allow_many=True,
-                    )
-                    if element.visible
-                    and element.enabled
-                    and (not rule.require_row_label or bool(element.context.row_label))
-                    and (element.context.row_label or element.element_id)
-                    not in processed_rows
-                )
-                if not matches:
-                    if not processed_rows:
-                        raise ExplorationError(
-                            f"repeat rule {rule.name!r} matched no row controls"
-                        )
-                    break
-                selected_element = min(
-                    matches,
-                    key=lambda element: (
-                        element.context.row_label or "",
-                        element.element_id,
-                    ),
-                )
-                row_key = (
-                    selected_element.context.row_label or selected_element.element_id
-                )
-                planned = await self.planner.plan(
-                    current_capture,
-                    element_ids={selected_element.element_id},
-                    action_kinds={ActionKind.CLICK},
-                )
-                selected = self._one_pending_repeat_action(rule, planned)
-                ledger.actions.extend(item.candidate for item in planned)
                 outcome = await self.executor.execute(
                     current_page,
-                    selected,
+                    next_action,
                     current_capture,
                     sequence=ledger.sequence,
                 )
                 ledger.transitions.append(outcome.transition)
                 attempts += 1
+                ledger.sequence += 1
                 if outcome.capture is None:
                     raise ExplorationError(
-                        f"repeat rule {rule.name!r} failed for row {row_key!r}"
+                        f"repeat rule {rule.name!r} pagination failed"
                     )
-                ledger.sequence += 1
                 self._retain_capture(ledger, outcome.capture)
-                modal_capture = outcome.capture
-                if (
-                    rule.expect_dialog_contains_row_label
-                    and selected_element.context.row_label
-                    and not _capture_contains(
-                        modal_capture,
-                        selected_element.context.row_label,
-                    )
-                ):
-                    raise ExplorationError(
-                        f"repeat rule {rule.name!r} dialog did not contain row label"
-                    )
-                if context_tracker is not None:
-                    testcase_context = context_tracker.observe(modal_capture)
                 current_page = outcome.active_page
-                current_capture = modal_capture
-                processed_rows.add(row_key)
-
-                (
-                    current_page,
-                    current_capture,
-                    close_attempts,
-                ) = await self._close_repeated_observation(
-                    current_page,
-                    current_capture,
-                    rule,
-                    ledger,
-                )
-                attempts += close_attempts
+                current_capture = outcome.capture
+                pagination_transitions += 1
                 if context_tracker is not None:
                     testcase_context = context_tracker.observe(current_capture)
-                if testcase_context and testcase_context.stable_for_early_stop:
-                    return (
-                        current_page,
-                        current_capture,
-                        testcase_context,
-                        attempts,
-                    )
+            if pagination_transitions:
+                ledger.limitations.add(
+                    f"guided row sweep followed {pagination_transitions} pagination "
+                    "transition(s)"
+                )
         return current_page, current_capture, testcase_context, attempts
 
     async def _close_repeated_observation(
@@ -725,6 +788,49 @@ class StateGraphExplorer:
         self._retain_capture(ledger, outcome.capture)
         return outcome.active_page, outcome.capture, 1
 
+    async def _pagination_action(
+        self,
+        capture: CapturedState,
+        rule: GuideRepeatRule,
+    ) -> tuple[Optional[PlannedAction], tuple[PlannedAction, ...]]:
+        """Resolve one explicit or semantic next-page control, if pagination remains."""
+
+        if _pagination_reached_end(capture):
+            return None, ()
+        if rule.next_page_target is not None:
+            matches = target_elements(
+                capture,
+                rule.next_page_target,
+                allow_many=False,
+            )
+            if not matches:
+                return None, ()
+            if len(matches) != 1:  # pragma: no cover - matcher contract
+                raise ExplorationError(
+                    f"repeat rule {rule.name!r} next-page target is ambiguous"
+                )
+            selected_element = matches[0]
+        elif rule.auto_paginate:
+            scoped_ids = self._scoped_element_ids(capture)
+            matches = _automatic_next_page_elements(capture, scoped_ids)
+            if not matches:
+                return None, ()
+            destinations = {_pagination_destination(element) for element in matches}
+            if len(destinations) > 1:
+                raise ExplorationError(
+                    f"repeat rule {rule.name!r} found ambiguous next-page controls"
+                )
+            selected_element = min(matches, key=lambda item: item.element_id)
+        else:
+            return None, ()
+
+        planned = await self.planner.plan(
+            capture,
+            element_ids={selected_element.element_id},
+            action_kinds={ActionKind.CLICK},
+        )
+        return self._one_pending_repeat_action(rule, planned), planned
+
     async def _execute_repeat_rules_parallel(
         self,
         workers: tuple[ExplorationWorker, ...],
@@ -744,160 +850,230 @@ class StateGraphExplorer:
     ]:
         """Partition repeated root-row observations across validated workers."""
 
-        root_capture = capture
+        page_capture = capture
         primary_capture = capture
         attempts = 0
         for rule in self.guide.repeat_rules if self.guide else ():
-            matches = tuple(
-                sorted(
-                    (
-                        element
-                        for element in target_elements(
-                            root_capture,
-                            rule.target,
-                            allow_many=True,
-                        )
-                        if element.visible
-                        and element.enabled
-                        and (
-                            not rule.require_row_label
-                            or bool(element.context.row_label)
-                        )
-                    ),
-                    key=lambda element: (
-                        element.context.row_label or "",
-                        element.element_id,
-                    ),
-                )[: rule.maximum_rows]
-            )
-            if not matches:
-                raise ExplorationError(
-                    f"repeat rule {rule.name!r} matched no row controls"
-                )
-
-            for offset in range(0, len(matches), len(workers)):
-                if asyncio.get_running_loop().time() >= deadline:
+            page_capture = capture
+            primary_capture = capture
+            processed_rows: set[str] = set()
+            seen_pages: set[tuple[str, ...]] = set()
+            pagination_path: list[PlannedAction] = []
+            pagination_transitions = 0
+            while len(processed_rows) < rule.maximum_rows:
+                page_signature = _repeat_page_signature(page_capture, rule)
+                if page_signature in seen_pages:
+                    break
+                if len(seen_pages) >= rule.maximum_pages:
                     raise ExplorationError(
-                        "maximum runtime reached during parallel row sweep"
+                        f"repeat rule {rule.name!r} reached maximum_pages"
                     )
-                batch = matches[offset : offset + len(workers)]
-                remaining = self.limits.maximum_actions - (attempted_actions + attempts)
-                if remaining < 2:
-                    raise ExplorationError(
-                        "maximum executed actions reached during parallel row sweep"
-                    )
-                batch = batch[: remaining // 2]
-
-                info_actions: list[PlannedAction] = []
-                for element in batch:
-                    planned = await self.planner.plan(
-                        root_capture,
-                        element_ids={element.element_id},
-                        action_kinds={ActionKind.CLICK},
-                    )
-                    ledger.actions.extend(item.candidate for item in planned)
-                    info_actions.append(self._one_pending_repeat_action(rule, planned))
-
-                info_sequences = tuple(
-                    range(ledger.sequence, ledger.sequence + len(info_actions))
+                seen_pages.add(page_signature)
+                matches = tuple(
+                    sorted(
+                        (
+                            element
+                            for element in target_elements(
+                                page_capture,
+                                rule.target,
+                                allow_many=True,
+                            )
+                            if element.visible
+                            and element.enabled
+                            and (
+                                not rule.require_row_label
+                                or bool(element.context.row_label)
+                            )
+                            and _repeat_row_key(element) not in processed_rows
+                        ),
+                        key=lambda element: (
+                            _repeat_row_key(element),
+                            element.element_id,
+                        ),
+                    )[: rule.maximum_rows - len(processed_rows)]
                 )
-                ledger.sequence += len(info_actions)
-                node = _GraphNode(capture=root_capture, path=(), depth=0)
-                info_outcomes = await asyncio.gather(
-                    *(
-                        self._execute_from_parent(
-                            workers[index],
-                            checkpoint,
-                            node,
-                            action,
-                            sequence=info_sequences[index],
-                        )
-                        for index, action in enumerate(info_actions)
-                    )
-                )
-                attempts += len(info_actions)
-
-                modal_captures: list[CapturedState] = []
-                for element, outcome in zip(batch, info_outcomes):
-                    ledger.transitions.append(outcome.transition)
-                    if outcome.capture is None:
+                if not matches:
+                    if not processed_rows:
                         raise ExplorationError(
-                            f"repeat rule {rule.name!r} failed for row "
-                            f"{(element.context.row_label or element.element_id)!r}"
+                            f"repeat rule {rule.name!r} matched no row controls"
                         )
-                    modal_capture = outcome.capture
-                    self._retain_capture(ledger, modal_capture)
-                    if (
-                        rule.expect_dialog_contains_row_label
-                        and element.context.row_label
-                        and not _capture_contains(
+                    break
+
+                for offset in range(0, len(matches), len(workers)):
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise ExplorationError(
+                            "maximum runtime reached during parallel row sweep"
+                        )
+                    batch = matches[offset : offset + len(workers)]
+                    remaining = self.limits.maximum_actions - (
+                        attempted_actions + attempts
+                    )
+                    if remaining < len(batch) * 2:
+                        raise ExplorationError(
+                            "maximum executed actions reached during parallel row sweep"
+                        )
+
+                    info_actions: list[PlannedAction] = []
+                    for element in batch:
+                        planned = await self.planner.plan(
+                            page_capture,
+                            element_ids={element.element_id},
+                            action_kinds={ActionKind.CLICK},
+                        )
+                        ledger.actions.extend(item.candidate for item in planned)
+                        info_actions.append(
+                            self._one_pending_repeat_action(rule, planned)
+                        )
+
+                    info_sequences = tuple(
+                        range(ledger.sequence, ledger.sequence + len(info_actions))
+                    )
+                    ledger.sequence += len(info_actions)
+                    node = _GraphNode(
+                        capture=page_capture,
+                        path=tuple(pagination_path),
+                        depth=len(pagination_path),
+                    )
+                    info_outcomes = await asyncio.gather(
+                        *(
+                            self._execute_from_parent(
+                                workers[index],
+                                checkpoint,
+                                node,
+                                action,
+                                sequence=info_sequences[index],
+                            )
+                            for index, action in enumerate(info_actions)
+                        )
+                    )
+                    attempts += len(info_actions)
+
+                    modal_captures: list[CapturedState] = []
+                    for element, outcome in zip(batch, info_outcomes):
+                        ledger.transitions.append(outcome.transition)
+                        row_key = _repeat_row_key(element)
+                        if outcome.capture is None:
+                            raise ExplorationError(
+                                f"repeat rule {rule.name!r} failed for row {row_key!r}"
+                            )
+                        modal_capture = outcome.capture
+                        self._retain_capture(ledger, modal_capture)
+                        if (
+                            rule.expect_dialog_contains_row_label
+                            and not _capture_contains(modal_capture, row_key)
+                        ):
+                            raise ExplorationError(
+                                f"repeat rule {rule.name!r} dialog did not contain "
+                                f"row identity {row_key!r}"
+                            )
+                        processed_rows.add(row_key)
+                        modal_captures.append(modal_capture)
+                        if context_tracker is not None:
+                            testcase_context = context_tracker.observe(modal_capture)
+
+                    close_actions: list[PlannedAction] = []
+                    for modal_capture in modal_captures:
+                        close_matches = target_elements(
                             modal_capture,
-                            element.context.row_label,
+                            rule.close_target,
+                            allow_many=False,
                         )
-                    ):
-                        raise ExplorationError(
-                            f"repeat rule {rule.name!r} dialog did not contain row label"
+                        if len(close_matches) != 1:
+                            raise ExplorationError(
+                                f"repeat rule {rule.name!r} close target did not "
+                                "resolve uniquely"
+                            )
+                        planned = await self.planner.plan(
+                            modal_capture,
+                            element_ids={close_matches[0].element_id},
+                            action_kinds={ActionKind.CLICK},
                         )
-                    modal_captures.append(modal_capture)
-                    if context_tracker is not None:
-                        testcase_context = context_tracker.observe(modal_capture)
+                        ledger.actions.extend(item.candidate for item in planned)
+                        close_actions.append(
+                            self._one_pending_repeat_action(rule, planned)
+                        )
 
-                close_actions: list[PlannedAction] = []
-                for modal_capture in modal_captures:
-                    close_matches = target_elements(
-                        modal_capture,
-                        rule.close_target,
-                        allow_many=False,
+                    close_sequences = tuple(
+                        range(ledger.sequence, ledger.sequence + len(close_actions))
                     )
-                    if len(close_matches) != 1:
-                        raise ExplorationError(
-                            f"repeat rule {rule.name!r} close target did not resolve uniquely"
+                    ledger.sequence += len(close_actions)
+                    close_outcomes = await asyncio.gather(
+                        *(
+                            workers[index].executor.execute(
+                                info_outcomes[index].active_page,
+                                action,
+                                modal_captures[index],
+                                sequence=close_sequences[index],
+                            )
+                            for index, action in enumerate(close_actions)
                         )
-                    planned = await self.planner.plan(
-                        modal_capture,
-                        element_ids={close_matches[0].element_id},
-                        action_kinds={ActionKind.CLICK},
                     )
-                    ledger.actions.extend(item.candidate for item in planned)
-                    close_actions.append(self._one_pending_repeat_action(rule, planned))
+                    attempts += len(close_actions)
 
-                close_sequences = tuple(
-                    range(ledger.sequence, ledger.sequence + len(close_actions))
+                    for outcome in close_outcomes:
+                        ledger.transitions.append(outcome.transition)
+                        if outcome.capture is None:
+                            raise ExplorationError(
+                                f"repeat rule {rule.name!r} could not close dialog"
+                            )
+                        self._retain_capture(ledger, outcome.capture)
+                        if context_tracker is not None:
+                            testcase_context = context_tracker.observe(outcome.capture)
+                    primary_capture = close_outcomes[0].capture or primary_capture
+                    if testcase_context and testcase_context.stable_for_early_stop:
+                        ledger.limitations.add(
+                            f"guided row sweep distributed across {len(workers)} "
+                            "workers"
+                        )
+                        if pagination_transitions:
+                            ledger.limitations.add(
+                                "guided row sweep followed "
+                                f"{pagination_transitions} pagination transition(s)"
+                            )
+                        return (
+                            workers[0].page,
+                            primary_capture,
+                            testcase_context,
+                            attempts,
+                        )
+
+                next_action, planned = await self._pagination_action(
+                    primary_capture,
+                    rule,
                 )
-                ledger.sequence += len(close_actions)
-                close_outcomes = await asyncio.gather(
-                    *(
-                        workers[index].executor.execute(
-                            info_outcomes[index].active_page,
-                            action,
-                            modal_captures[index],
-                            sequence=close_sequences[index],
-                        )
-                        for index, action in enumerate(close_actions)
+                ledger.actions.extend(item.candidate for item in planned)
+                if next_action is None:
+                    break
+                if attempted_actions + attempts >= self.limits.maximum_actions:
+                    raise ExplorationError(
+                        "maximum executed actions reached during guided pagination"
                     )
+                outcome = await workers[0].executor.execute(
+                    workers[0].page,
+                    next_action,
+                    primary_capture,
+                    sequence=ledger.sequence,
                 )
-                attempts += len(close_actions)
+                ledger.transitions.append(outcome.transition)
+                attempts += 1
+                ledger.sequence += 1
+                if outcome.capture is None:
+                    raise ExplorationError(
+                        f"repeat rule {rule.name!r} pagination failed"
+                    )
+                self._retain_capture(ledger, outcome.capture)
+                pagination_path.append(next_action)
+                pagination_transitions += 1
+                page_capture = outcome.capture
+                primary_capture = outcome.capture
+                if context_tracker is not None:
+                    testcase_context = context_tracker.observe(page_capture)
 
-                for outcome in close_outcomes:
-                    ledger.transitions.append(outcome.transition)
-                    if outcome.capture is None:
-                        raise ExplorationError(
-                            f"repeat rule {rule.name!r} could not close dialog"
-                        )
-                    self._retain_capture(ledger, outcome.capture)
-                    if context_tracker is not None:
-                        testcase_context = context_tracker.observe(outcome.capture)
-                primary_capture = close_outcomes[0].capture or primary_capture
-                if testcase_context and testcase_context.stable_for_early_stop:
-                    ledger.limitations.add(
-                        f"guided row sweep distributed across {len(workers)} workers"
-                    )
-                    return (
-                        workers[0].page,
-                        primary_capture,
-                        testcase_context,
-                        attempts,
-                    )
+            if pagination_transitions:
+                ledger.limitations.add(
+                    f"guided row sweep followed {pagination_transitions} pagination "
+                    "transition(s)"
+                )
 
         ledger.limitations.add(
             f"guided row sweep distributed across {len(workers)} workers"
@@ -1172,8 +1348,21 @@ class StateGraphExplorer:
             )
             actual_table_count = await page.locator("table, [role=table]").count()
             actual_modal_count = await page.locator(
-                "dialog, [role=dialog], [aria-modal=true]"
-            ).count()
+                "dialog[open], [role=dialog], [role=alertdialog], "
+                "[aria-modal=true], [data-modal], .modal"
+            ).evaluate_all(
+                """elements => elements.filter((element) => {
+                    const style = getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && style.visibility !== 'collapse'
+                        && Number(style.opacity) !== 0
+                        && rect.width > 0
+                        && rect.height > 0
+                        && element.getClientRects().length > 0;
+                }).length"""
+            )
         except PlaywrightError:
             return False
         expected_rows = {
@@ -1470,6 +1659,139 @@ def _capture_contains(capture: CapturedState, value: str) -> bool:
             element.title or "",
         )
         if candidate
+    )
+
+
+def _repeat_row_key(element: ElementSnapshot) -> str:
+    """Prefer a testcase data identifier over page-local row ordinals."""
+
+    preferred_names = {
+        "data-case",
+        "data-case-id",
+        "data-tc",
+        "data-tc-id",
+        "data-test-case",
+        "data-test-case-id",
+        "data-testcase",
+        "data-testcase-id",
+    }
+    identifiers = sorted(
+        {
+            attribute.value or attribute.safe_value or ""
+            for attribute in element.attributes
+            if attribute.name.casefold() in preferred_names
+            and (attribute.value or attribute.safe_value)
+        }
+    )
+    if identifiers:
+        return identifiers[0]
+    row_label = element.context.row_label or ""
+    tokens = [
+        token
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.:-]{2,}", row_label)
+        if token.casefold() not in {"details", "info", "test"}
+    ]
+    if tokens:
+        return sorted(tokens, key=lambda item: (-len(item), item))[0]
+    return row_label or element.element_id
+
+
+def _repeat_page_signature(
+    capture: CapturedState,
+    rule: GuideRepeatRule,
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                _repeat_row_key(element)
+                for element in target_elements(
+                    capture,
+                    rule.target,
+                    allow_many=True,
+                )
+                if element.visible
+                and element.enabled
+                and (not rule.require_row_label or bool(element.context.row_label))
+            }
+        )
+    )
+
+
+def _pagination_reached_end(capture: CapturedState) -> bool:
+    windows = [
+        (
+            int(match.group("start").replace(",", "")),
+            int(match.group("end").replace(",", "")),
+            int(match.group("total").replace(",", "")),
+        )
+        for element in capture.elements
+        if element.visible
+        for value in (element.text or element.accessible_name or element.label or "",)
+        if 0 < len(value) <= 200
+        for match in (_PAGINATION_WINDOW.search(" ".join(value.split())),)
+        if match is not None
+    ]
+    return bool(windows and all(end >= total for _, end, total in windows))
+
+
+def _automatic_next_page_elements(
+    capture: CapturedState,
+    scoped_ids: Optional[set[str]],
+) -> tuple[ElementSnapshot, ...]:
+    ranked: list[tuple[int, ElementSnapshot]] = []
+    for element in capture.elements:
+        if (
+            not element.visible
+            or not element.enabled
+            or not element.interactive
+            or (scoped_ids is not None and element.element_id not in scoped_ids)
+        ):
+            continue
+        class_value = (_element_attribute(element, "class") or "").casefold()
+        aria_disabled = (_element_attribute(element, "aria-disabled") or "").casefold()
+        if "disabled" in class_value.split() or aria_disabled == "true":
+            continue
+        rel = (_element_attribute(element, "rel") or "").casefold().split()
+        labels = tuple(
+            " ".join(value.split())
+            for value in (
+                element.accessible_name or "",
+                element.text or "",
+                element.title or "",
+                element.label or "",
+            )
+            if value
+        )
+        if "next" in rel:
+            rank = 0
+        elif any(_NEXT_PAGE_LABEL.fullmatch(value) for value in labels):
+            rank = 1
+        elif any(value in {">", "›", "»", "→"} for value in labels):
+            rank = 2
+        else:
+            continue
+        ranked.append((rank, element))
+    if not ranked:
+        return ()
+    best = min(rank for rank, _ in ranked)
+    return tuple(element for rank, element in ranked if rank == best)
+
+
+def _pagination_destination(element: ElementSnapshot) -> tuple[str, str]:
+    return (
+        _element_attribute(element, "href") or "",
+        _element_attribute(element, "data-page") or "",
+    )
+
+
+def _element_attribute(element: ElementSnapshot, name: str) -> Optional[str]:
+    return next(
+        (
+            attribute.value or attribute.safe_value
+            for attribute in element.attributes
+            if attribute.name.casefold() == name.casefold()
+        ),
+        None,
     )
 
 

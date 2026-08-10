@@ -139,9 +139,12 @@ class GuideRepeatRule(GuideModel):
     name: str = Field(min_length=1, max_length=200)
     target: GuideTarget
     close_target: GuideTarget
+    next_page_target: Optional[GuideTarget] = None
+    auto_paginate: bool = True
     require_row_label: bool = True
     expect_dialog_contains_row_label: bool = True
     maximum_rows: int = Field(default=10_000, gt=0)
+    maximum_pages: int = Field(default=1_000, gt=0)
 
 
 class CrawlGuide(GuideModel):

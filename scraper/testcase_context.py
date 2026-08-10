@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from scraper.extractor import CapturedState
 from scraper.models import ElementSnapshot, TestcaseContextCoverage
@@ -48,6 +48,22 @@ _TOTAL_TEST_CASE_KEYS = {
 }
 _ORDINAL_KEYS = {"column_1", "index", "no", "number", "row", "serial", "sr_no"}
 _IDENTIFIER_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{2,}")
+_PAGINATION_TOTAL = re.compile(
+    r"\bshowing\s+(?P<start>\d[\d,]*)\s+to\s+(?P<end>\d[\d,]*)\s+"
+    r"of\s+(?P<total>\d[\d,]*)\s+"
+    r"(?:entries|items|records|results|test\s*cases?|tests?)\b",
+    re.IGNORECASE,
+)
+_PAGINATION_QUERY_KEYS = {
+    "cursor",
+    "limit",
+    "offset",
+    "page",
+    "pageindex",
+    "pagenumber",
+    "pagesize",
+    "start",
+}
 
 
 @dataclass
@@ -70,6 +86,7 @@ class TestcaseContextTracker:
         self.required_stable_observations = required_stable_observations
         self._observed_fingerprints: set[str] = set()
         self._declared_totals: dict[str, int] = {}
+        self._pagination_totals: dict[str, int] = {}
         self._declared_conflicts: set[str] = set()
         self._cases: dict[str, _CaseEvidence] = {}
         self._modal_texts: set[tuple[int, str]] = set()
@@ -82,6 +99,7 @@ class TestcaseContextTracker:
         if capture.state.fingerprint not in self._observed_fingerprints:
             self._observed_fingerprints.add(capture.state.fingerprint)
             self._collect_tables(capture.elements)
+            self._collect_pagination_total(capture)
             if capture.state.modal_count > 0:
                 self._collect_modal_text(capture.elements)
 
@@ -99,6 +117,22 @@ class TestcaseContextTracker:
             update={"stable_observations": self._stable_observations}
         )
 
+    def observe_selected_total(
+        self,
+        capture: CapturedState,
+        control: ElementSnapshot,
+    ) -> TestcaseContextCoverage:
+        """Collect only the summary-table row selected by the final guide step."""
+
+        row_path = _control_row_path(control)
+        if row_path is not None:
+            self._collect_tables(
+                capture.elements,
+                declared_total_rows={row_path},
+                collect_test_cases=False,
+            )
+        return self.snapshot()
+
     def snapshot(self) -> TestcaseContextCoverage:
         """Return current progress without counting another observation."""
 
@@ -107,7 +141,13 @@ class TestcaseContextTracker:
             update={"stable_observations": self._stable_observations}
         )
 
-    def _collect_tables(self, elements: tuple[ElementSnapshot, ...]) -> None:
+    def _collect_tables(
+        self,
+        elements: tuple[ElementSnapshot, ...],
+        *,
+        declared_total_rows: Optional[set[str]] = None,
+        collect_test_cases: bool = True,
+    ) -> None:
         headers_by_root: dict[tuple[str, str], list[ElementSnapshot]] = defaultdict(
             list
         )
@@ -144,7 +184,10 @@ class TestcaseContextTracker:
                     )
                     for index, cell in enumerate(cells)
                 )
-                self._collect_declared_total(fields, row_path)
+                if declared_total_rows is None or row_path in declared_total_rows:
+                    self._collect_declared_total(fields, row_path)
+                if not collect_test_cases:
+                    continue
                 if not (header_keys & _TEST_CASE_ID_KEYS):
                     continue
                 if len(header_keys & _TEST_CASE_SIGNAL_KEYS) < 1:
@@ -196,6 +239,33 @@ class TestcaseContextTracker:
                 f"{identity}: conflicting totals {previous} and {value}"
             )
 
+    def _collect_pagination_total(self, capture: CapturedState) -> None:
+        totals = {
+            int(match.group("total").replace(",", ""))
+            for element in capture.elements
+            if element.visible
+            for text in (_element_text(element),)
+            if 0 < len(text) <= 200
+            for match in (_PAGINATION_TOTAL.search(text),)
+            if match is not None
+        }
+        if not totals:
+            return
+        identity = _logical_pagination_url(capture.state.url)
+        if len(totals) > 1:
+            self._declared_conflicts.add(
+                f"{identity}: conflicting pagination totals {sorted(totals)}"
+            )
+            return
+        value = next(iter(totals))
+        previous = self._pagination_totals.get(identity)
+        if previous is None:
+            self._pagination_totals[identity] = value
+        elif previous != value:
+            self._declared_conflicts.add(
+                f"{identity}: conflicting pagination totals {previous} and {value}"
+            )
+
     def _collect_modal_text(self, elements: tuple[ElementSnapshot, ...]) -> None:
         for element in elements:
             if not element.visible or not _inside_dialog(element):
@@ -237,7 +307,13 @@ class TestcaseContextTracker:
                 conflicts.append(test_case_id)
 
         declared_total = (
-            sum(self._declared_totals.values()) if self._declared_totals else None
+            sum(self._declared_totals.values())
+            if self._declared_totals
+            else (
+                sum(self._pagination_totals.values())
+                if self._pagination_totals
+                else None
+            )
         )
         context_complete = bool(
             declared_total is not None
@@ -285,6 +361,25 @@ def _belongs_to_row(element: ElementSnapshot, row_path: str) -> bool:
     return path == row_path or path.startswith(f"{row_path} >")
 
 
+def _control_row_path(element: ElementSnapshot) -> Optional[str]:
+    path = element.parent_css_path or ""
+    positions = [path.find(marker) for marker in (" > td", " > th") if marker in path]
+    return path[: min(positions)] if positions else None
+
+
+def _logical_pagination_url(url: str) -> str:
+    parsed = urlsplit(url)
+    query = [
+        (name, value)
+        for name, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if _normalize_key(name).replace("_", "") not in _PAGINATION_QUERY_KEYS
+        and _normalize_key(name) not in _PAGINATION_QUERY_KEYS
+    ]
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query, doseq=True), "")
+    )
+
+
 def _field_keys(headers: tuple[str, ...]) -> tuple[str, ...]:
     result: list[str] = []
     counts: dict[str, int] = defaultdict(int)
@@ -318,6 +413,8 @@ def _attribute(element: ElementSnapshot, name: str) -> Optional[str]:
 
 
 def _inside_dialog(element: ElementSnapshot) -> bool:
+    if element.context.inside_dialog:
+        return True
     if (element.role or "").lower() in {"alertdialog", "dialog"}:
         return True
     return any(

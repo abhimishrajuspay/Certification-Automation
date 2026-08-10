@@ -299,6 +299,7 @@ class ElementContext(EvidenceModel):
     table_id: Optional[str] = None
     row_label: Optional[str] = None
     inside_main: bool = False
+    inside_dialog: bool = False
     ancestor_summary: tuple[str, ...] = ()
 
 

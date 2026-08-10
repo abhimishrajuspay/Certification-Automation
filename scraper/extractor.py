@@ -105,6 +105,20 @@ FRAME_EXTRACTION_SCRIPT = r"""
         const rect = element.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0 && element.getClientRects().length > 0;
     };
+    const modalSelector = [
+        'dialog[open]',
+        '[role=dialog]',
+        '[role=alertdialog]',
+        '[aria-modal=true]',
+        '[data-modal]',
+        '.modal'
+    ].join(', ');
+    const visibleModalRoots = () => {
+        const matches = visibleMatches(modalSelector);
+        return matches.filter((element) => !matches.some(
+            (candidate) => candidate !== element && candidate.contains(element)
+        ));
+    };
     const implicitRole = (element) => {
         const tag = element.tagName.toLowerCase();
         const type = String(element.getAttribute('type') || '').toLowerCase();
@@ -224,6 +238,10 @@ FRAME_EXTRACTION_SCRIPT = r"""
             tableId: table ? (table.id || normalized(caption ? caption.textContent : '')) : '',
             rowLabel: rowHeading ? normalized(rowHeading.innerText || rowHeading.textContent) : '',
             insideMain: Boolean(element.closest && element.closest('main, [role=main]')),
+            insideDialog: Boolean(
+                element.matches(modalSelector)
+                || (element.closest && element.closest(modalSelector))
+            ),
             ancestors: ancestorSummary(element),
         };
     };
@@ -416,7 +434,7 @@ FRAME_EXTRACTION_SCRIPT = r"""
         truncated: eligibleCount > records.length,
         closedShadowHosts,
         activeElement: activeDescriptor(),
-        modalCount: visibleMatches('dialog[open], [role=dialog], [aria-modal=true]').length,
+        modalCount: visibleModalRoots().length,
         loadingIndicators: describeMatches('[aria-busy=true], progress, [role=progressbar], .loading, .spinner, [class*=loading], [class*=spinner]'),
         notifications: describeMatches('[role=alert], [role=status], [aria-live]'),
         errors: describeMatches('[aria-invalid=true], [role=alert], .error, .errors, [class*=error]'),
@@ -855,6 +873,7 @@ class PageStateExtractor:
                         table_id=self._safe_optional(context.get("tableId")),
                         row_label=self._safe_optional(context.get("rowLabel")),
                         inside_main=bool(context.get("insideMain")),
+                        inside_dialog=bool(context.get("insideDialog")),
                         ancestor_summary=tuple(
                             self._safe_text(item)
                             for item in _string_list(context.get("ancestors"))

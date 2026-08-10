@@ -252,6 +252,20 @@ executes them first and resumes generic discovery inside the promoted content
 root when coverage is still incomplete. `exhaustive` preserves the original
 selector-free crawler and remains the default when no guide is supplied.
 
+Repeated-row rules automatically continue through visible `Next`/`More` or
+`rel="next"` pagination controls until the displayed range reaches its total.
+They keep testcase identities across pages, stop on a repeated page signature,
+and enforce `maximum_rows` plus `maximum_pages`. Set `auto_paginate` to `false`
+to disable this, or provide `next_page_target` when a portal's next-page control
+has no meaningful label. The selected API summary row is carried into the
+testcase page so its declared total is not confused with totals from sibling
+APIs.
+
+Both semantic dialogs and visible CSS-style modal containers (`[data-modal]`
+or `.modal`) count as description observations. Labels such as `Test case
+details` are treated as read-only discovery, while actual `Run`, `Play`, or
+trigger controls still require the normal review permission.
+
 The guide is strict JSON and can also be authored manually. A step target may
 use test ID, role plus accessible name, stable ID, title, text, CSS, and a frame
 path. Targets resolve from strong semantic locators to structural CSS fallback

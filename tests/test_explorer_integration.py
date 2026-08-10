@@ -8,9 +8,11 @@ import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from knowledge.builder import PortalKnowledgeBuilder
 from scraper.actions import ActionExecutor, ActionPlanner
 from scraper.artifact_store import ArtifactStore
 from scraper.browser import BrowserLaunchConfig, BrowserManager
@@ -55,6 +57,11 @@ class _ExplorerFixtureHandler(BaseHTTPRequestHandler):
             self._send_html(_GUIDED_ENTRY_HTML)
         elif path == "/spa-guided":
             self._send_html(_SPA_GUIDED_HTML)
+        elif path == "/guided-pagination-entry":
+            self._send_html(_GUIDED_PAGINATION_ENTRY_HTML)
+        elif path == "/guided-paginated":
+            page = int(parse_qs(urlsplit(self.path).query).get("page", ["1"])[0])
+            self._send_html(_guided_paginated_html(page))
         elif path == "/frame":
             self._send_html(_FRAME_HTML)
         elif path == "/popup":
@@ -244,6 +251,75 @@ _SPA_GUIDED_HTML = """<!doctype html>
 </body>
 </html>
 """
+
+
+_GUIDED_PAGINATION_ENTRY_HTML = """<!doctype html>
+<html>
+<head><title>Paginated guide entry</title></head>
+<body><main>
+  <table>
+    <thead><tr><th>API Name</th><th>Total TCs</th><th>Test</th></tr></thead>
+    <tbody>
+      <tr><td>Payments</td><td>12</td><td><a data-testid="open-paginated" href="/guided-paginated?page=1">Test</a></td></tr>
+      <tr><td>Refunds</td><td>9</td><td><a href="/unused">Test</a></td></tr>
+    </tbody>
+  </table>
+</main></body>
+</html>
+"""
+
+
+def _guided_paginated_html(page: int) -> str:
+    start = 1 if page <= 1 else 11
+    end = 10 if page <= 1 else 12
+    rows = "".join(
+        f"""<tr><td>{index}</td><td>TC_PAGE_{index:02d}</td><td>Payments</td><td>pending</td>
+        <td><button data-case="TC_PAGE_{index:02d}" title="Test case details">i</button></td></tr>"""
+        for index in range(start, end + 1)
+    )
+    pager = (
+        '<a href="/guided-paginated?page=2" rel="next" data-page="2">Next</a>'
+        if page <= 1
+        else '<a href="/guided-paginated?page=1" rel="prev">Previous</a>'
+    )
+    return f"""<!doctype html>
+<html>
+<head><title>Paginated visual-modal fixture</title>
+<style>
+  .hidden {{ display: none; }}
+  .modal-layer {{ position: fixed; inset: 0; background: rgba(0,0,0,.4); }}
+  .modal {{ width: 500px; margin: 50px auto; padding: 20px; background: white; }}
+</style></head>
+<body><main>
+  <table>
+    <thead><tr><th>#</th><th>TC ID</th><th>API Name</th><th>Status</th><th>Info</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <div class="showing">Showing {start} to {end} of 12 entries</div>
+  <nav>{pager}</nav>
+  <div data-modal class="modal-layer hidden">
+    <section class="modal">
+      <header><span class="modal-title">Test Case Details</span><button class="close">×</button></header>
+      <div class="modal-body"></div>
+    </section>
+  </div>
+</main>
+<script>
+  const layer = document.querySelector('[data-modal]');
+  const body = document.querySelector('.modal-body');
+  for (const button of document.querySelectorAll('button[data-case]')) {{
+    button.addEventListener('click', () => {{
+      const caseId = button.dataset.case;
+      body.textContent = `${{caseId}}: validates a paginated CSS-modal payment flow`;
+      layer.classList.remove('hidden');
+    }});
+  }}
+  document.querySelector('button.close').addEventListener('click', () => {{
+    layer.classList.add('hidden');
+    body.textContent = '';
+  }});
+</script>
+</body></html>"""
 
 
 @pytest.fixture
@@ -807,3 +883,147 @@ async def test_parallel_workers_partition_guided_testcase_rows(
         "URL drift falls back" in limitation
         for limitation in result.coverage.limitations
     )
+
+
+@pytest.mark.skipif(
+    not RUN_BROWSER_TESTS,
+    reason="set CZ_RUN_BROWSER_TESTS=1 to run real Chromium verification",
+)
+@pytest.mark.asyncio
+async def test_guided_parallel_pagination_and_visual_modals_complete_context(
+    tmp_path: Path,
+    explorer_portal: str,
+) -> None:
+    entry_url = f"{explorer_portal}/guided-pagination-entry"
+    run = ScrapeRun(
+        run_id="guided-pagination-run",
+        root_url=entry_url,
+        allowed_origins=(explorer_portal,),
+        limits=CrawlLimits(
+            maximum_depth=5,
+            maximum_states=60,
+            maximum_actions=40,
+            maximum_runtime_seconds=60,
+        ),
+        capture_policy=CapturePolicy(
+            capture_dom=False,
+            capture_screenshots=False,
+            capture_accessibility_tree=False,
+            capture_trace=False,
+            capture_har=False,
+        ),
+    )
+    store = ArtifactStore.create(tmp_path / "crawls", run)
+    managers = tuple(
+        BrowserManager(
+            store,
+            BrowserLaunchConfig(
+                headless=True,
+                viewport_width=1280,
+                viewport_height=720,
+            ),
+        )
+        for _ in range(2)
+    )
+    guide = CrawlGuide(
+        steps=(
+            GuideStep(
+                name="open_paginated_testcases",
+                target=GuideTarget(
+                    test_id="open-paginated",
+                    test_id_attribute="data-testid",
+                ),
+            ),
+        ),
+        repeat_rules=(
+            GuideRepeatRule(
+                name="capture_paginated_descriptions",
+                target=GuideTarget(
+                    tag="button",
+                    role="button",
+                    title="Test case details",
+                ),
+                close_target=GuideTarget(
+                    tag="button",
+                    role="button",
+                    text="×",
+                ),
+            ),
+        ),
+        root_scope_selector="main",
+    )
+
+    try:
+        primary_page = await managers[0].start()
+        await managers[0].navigate(entry_url)
+        secondary_page = await managers[1].start()
+        extractors = tuple(
+            PageStateExtractor(
+                store,
+                manager.recorder,
+                SnapshotConfig(
+                    quiet_window_ms=100,
+                    quiet_timeout_ms=2_000,
+                    full_page_screenshot=False,
+                ),
+            )
+            for manager in managers
+        )
+        result = await StateGraphExplorer(
+            store,
+            managers[0].recorder,
+            extractors[0],
+            ActionPlanner(store),
+            ActionExecutor(store, managers[0].recorder, extractors[0]),
+            ExplorerConfig(
+                completion_goal=CrawlCompletionGoal.TESTCASE_CONTEXT,
+                testcase_context_stability_observations=2,
+                strategy=CrawlStrategy.GUIDED,
+                worker_count=2,
+                parallel_session_mode=ParallelSessionMode.PROBE,
+            ),
+            guide=guide,
+            additional_workers=(
+                ExplorationWorker(
+                    worker_id="worker-2",
+                    page=secondary_page,
+                    recorder=managers[1].recorder,
+                    extractor=extractors[1],
+                    executor=ActionExecutor(
+                        store,
+                        managers[1].recorder,
+                        extractors[1],
+                    ),
+                ),
+            ),
+        ).explore(primary_page)
+    finally:
+        for manager in reversed(managers):
+            await manager.stop()
+
+    context = result.coverage.testcase_context
+    actions = tuple(store.iter_records(ActionCandidate))
+    knowledge = PortalKnowledgeBuilder(store).build()
+
+    assert context is not None
+    assert result.completion_reason == "testcase context complete"
+    assert result.coverage.configured_goal_complete is True
+    assert context.declared_test_cases == 12
+    assert context.test_cases_discovered == 12
+    assert context.descriptions_captured == 12
+    assert context.stable_for_early_stop is True
+    assert result.coverage.actions_succeeded == 26
+    assert result.coverage.actions_failed == 0
+    assert result.coverage.actions_skipped == 0
+    assert result.coverage.modals_discovered >= 12
+    assert not any(
+        action.policy_rule == "semantic.review.test_execution" for action in actions
+    )
+    assert any(
+        "followed 1 pagination transition" in limitation
+        for limitation in result.coverage.limitations
+    )
+    assert knowledge.coverage.declared_test_cases == 12
+    assert knowledge.coverage.test_cases_normalized == 12
+    assert knowledge.coverage.descriptions_captured == 12
+    assert knowledge.coverage.testcase_context_complete is True

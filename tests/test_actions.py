@@ -215,6 +215,41 @@ async def test_planner_can_be_constrained_to_guide_selected_elements(
 
 
 @pytest.mark.asyncio
+async def test_testcase_detail_observation_is_safe_but_execution_stays_reviewed(
+    tmp_path: Path,
+) -> None:
+    run = ScrapeRun(
+        run_id="guided-observation-run",
+        root_url="https://portal.test/start",
+        allowed_origins=("https://portal.test",),
+    )
+    store = ArtifactStore.create(tmp_path / "crawls", run)
+    capture = _capture(
+        store,
+        (
+            _element("details", name="Test case details"),
+            _element("run", name="Run test"),
+            _element("delete", name="Delete account"),
+        ),
+    )
+
+    planned = await ActionPlanner(store).plan(
+        capture,
+        element_ids={"details", "run", "delete"},
+        action_kinds={ActionKind.CLICK},
+    )
+    by_element = {item.element.element_id: item.candidate for item in planned}
+
+    assert by_element["details"].risk == ActionRisk.SAFE
+    assert by_element["details"].status == ActionStatus.PENDING
+    assert by_element["details"].policy_rule == "interaction.discovery_safe"
+    assert by_element["run"].risk == ActionRisk.REVIEW_REQUIRED
+    assert by_element["run"].status == ActionStatus.SKIPPED
+    assert by_element["delete"].risk == ActionRisk.BLOCKED
+    assert by_element["delete"].status == ActionStatus.SKIPPED
+
+
+@pytest.mark.asyncio
 async def test_redacted_external_href_still_enforces_origin_policy(
     tmp_path: Path,
 ) -> None:

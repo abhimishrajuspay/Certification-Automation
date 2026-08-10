@@ -63,6 +63,7 @@ def _element(
     visible: bool = True,
     row_label: str | None = None,
     ancestors: tuple[str, ...] = (),
+    inside_dialog: bool = False,
 ) -> ElementSnapshot:
     return ElementSnapshot(
         element_id=element_id,
@@ -79,6 +80,7 @@ def _element(
         parent_css_path=parent_css_path,
         context=ElementContext(
             row_label=row_label,
+            inside_dialog=inside_dialog,
             ancestor_summary=ancestors,
         ),
     )
@@ -518,6 +520,144 @@ def test_incremental_completion_tracker_matches_normalized_context_gate(
     assert stable.declared_test_cases == knowledge.coverage.declared_test_cases
     assert stable.test_cases_discovered == knowledge.coverage.test_cases_normalized
     assert stable.descriptions_captured == knowledge.coverage.descriptions_captured
+
+
+def test_tracker_recognizes_visual_modal_and_pagination_total(tmp_path: Path) -> None:
+    run = ScrapeRun(
+        run_id="visual-modal-run",
+        root_url="https://portal.example.test/cases?page=1",
+        allowed_origins=("https://portal.example.test",),
+    )
+    store = ArtifactStore.create(tmp_path / "visual-crawls", run)
+    headers = _headers(
+        CASE_TABLE,
+        ("#", "TC ID", "API Name", "Status"),
+        "visual-case",
+    )
+    cells = _cells(
+        CASE_TABLE,
+        1,
+        ("1", "TC_VISUAL_01", "Payments", "pending"),
+        "visual-row",
+    )
+    controls = _case_controls(1, "TC_VISUAL_01")
+    showing = _element(
+        "showing-total",
+        tag="div",
+        text="Showing 1 to 1 of 1 entries",
+        parent_css_path=ROOT,
+    )
+    base_elements = tuple([*headers, *cells, *controls, showing])
+    base = _state(
+        store,
+        state_id="visual-base",
+        sequence=0,
+        url=run.root_url,
+        elements=base_elements,
+    )
+    visual_modal_elements = (
+        _element(
+            "visual-modal",
+            tag="section",
+            text="TC_VISUAL_01: validates a CSS modal flow",
+            parent_css_path=ROOT,
+            inside_dialog=True,
+        ),
+    )
+    first_modal = _state(
+        store,
+        state_id="visual-modal-1",
+        sequence=1,
+        url=run.root_url,
+        elements=visual_modal_elements,
+        modal_count=1,
+    )
+    second_modal = _state(
+        store,
+        state_id="visual-modal-2",
+        sequence=2,
+        url=run.root_url,
+        elements=visual_modal_elements,
+        modal_count=1,
+    )
+    tracker = ContextTracker(required_stable_observations=2)
+
+    initial = tracker.observe(
+        CapturedState(base, base_elements, cast(AppendReceipt, object()))
+    )
+    first = tracker.observe(
+        CapturedState(
+            first_modal,
+            visual_modal_elements,
+            cast(AppendReceipt, object()),
+        )
+    )
+    stable = tracker.observe(
+        CapturedState(
+            second_modal,
+            visual_modal_elements,
+            cast(AppendReceipt, object()),
+        )
+    )
+
+    assert initial.declared_test_cases == 1
+    assert initial.test_cases_discovered == 1
+    assert first.descriptions_captured == 1
+    assert first.context_complete is True
+    assert stable.stable_for_early_stop is True
+
+
+def test_tracker_carries_only_the_selected_summary_row_total(tmp_path: Path) -> None:
+    run = ScrapeRun(
+        run_id="selected-total-run",
+        root_url="https://portal.example.test/apis",
+        allowed_origins=("https://portal.example.test",),
+    )
+    store = ArtifactStore.create(tmp_path / "selected-crawls", run)
+    headers = _headers(
+        SUMMARY_TABLE,
+        ("API Name", "Total TCs", "Test"),
+        "selected-summary",
+    )
+    first = _cells(
+        SUMMARY_TABLE,
+        1,
+        ("Payments", "12", "▶"),
+        "selected-first",
+    )
+    second = _cells(
+        SUMMARY_TABLE,
+        2,
+        ("Refunds", "9", "▶"),
+        "selected-second",
+    )
+    first_row = f"{SUMMARY_TABLE} > tbody > tr:nth-of-type(1)"
+    control = _element(
+        "open-payments",
+        tag="a",
+        role="link",
+        text="▶",
+        accessible_name="Test",
+        parent_css_path=f"{first_row} > td:nth-of-type(3)",
+        interactive=True,
+        row_label="Payments",
+    )
+    elements = tuple([*headers, *first, control, *second])
+    state = _state(
+        store,
+        state_id="selected-summary-state",
+        sequence=0,
+        url=run.root_url,
+        elements=elements,
+    )
+    tracker = ContextTracker()
+
+    coverage = tracker.observe_selected_total(
+        CapturedState(state, elements, cast(AppendReceipt, object())),
+        control,
+    )
+
+    assert coverage.declared_test_cases == 12
 
 
 def test_completed_testcase_goal_is_a_normalizable_non_frontier_handoff(

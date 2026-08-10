@@ -234,6 +234,13 @@ class PortalKnowledgeBuilder:
         declared_total, declared_limitations = self._declared_testcase_total(
             normalized_tables
         )
+        if (
+            source_coverage is not None
+            and source_coverage.completion_goal == CrawlCompletionGoal.TESTCASE_CONTEXT
+            and source_coverage.testcase_context is not None
+            and source_coverage.testcase_context.declared_test_cases is not None
+        ):
+            declared_total = source_coverage.testcase_context.declared_test_cases
         routes = self._routes(states)
         network = self._network() if self.config.include_network else ()
 
@@ -802,6 +809,8 @@ def _captured_value(value: Optional[str], safe_value: Optional[str]) -> str:
 
 
 def _inside_dialog(element: ElementSnapshot) -> bool:
+    if element.context.inside_dialog:
+        return True
     if (element.role or "").lower() in {"alertdialog", "dialog"}:
         return True
     return any(

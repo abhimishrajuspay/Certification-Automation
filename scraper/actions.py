@@ -95,6 +95,16 @@ class ActionPolicyConfig:
         "test",
         "trigger",
     )
+    observation_keywords: tuple[str, ...] = (
+        "description",
+        "details",
+        "info",
+        "information",
+        "inspect",
+        "log",
+        "logs",
+        "view",
+    )
     allow_hidden_actions: bool = False
     allow_disabled_actions: bool = False
     include_hover_actions: bool = True
@@ -394,12 +404,17 @@ class ActionPlanner:
             description,
             self.config.execution_control_keywords,
         )
+        observation_control = _matching_keyword(
+            description,
+            self.config.observation_keywords,
+        )
         role = (element.role or "").lower()
         if (
             kind == ActionKind.CLICK
             and href is None
             and (element.tag in {"button", "input"} or role == "button")
             and execution_control
+            and not observation_control
         ):
             return (
                 ActionRisk.REVIEW_REQUIRED,
