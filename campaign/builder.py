@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from campaign.models import (
     CAMPAIGN_PROMPT_VERSION,
     LEGACY_CAMPAIGN_PROMPT_VERSION,
+    PREVIOUS_CAMPAIGN_PROMPT_VERSION,
     CampaignAction,
     CampaignAgentResponse,
     CampaignAssessment,
@@ -51,7 +52,7 @@ testcases and evidence on demand instead of asking for the entire grounding file
 Choose exactly one action per turn:
 - list_test_cases: page through one semantic API group.
 - read_test_cases: read full portal context for a bounded set of IDs.
-- read_evidence: read one cited grounding/search snippet.
+- read_evidence: read one or a bounded required batch of cited snippets.
 - search_repository and read_repository_file: inspect real code.
 - search_mcp: retrieve missing requirements through an advertised read-only tool.
 - record_assessments: persist bounded support decisions; they need not wait for final.
@@ -123,6 +124,7 @@ class CampaignBuildConfig:
     maximum_change_actions: int = 12
     maximum_no_progress_turns: int = 3
     maximum_assessment_evidence_characters: int = 20_000
+    maximum_evidence_snippets_per_batch: int = 6
 
     def __post_init__(self) -> None:
         if (
@@ -142,6 +144,7 @@ class CampaignBuildConfig:
                 self.maximum_change_actions,
                 self.maximum_no_progress_turns,
                 self.maximum_assessment_evidence_characters,
+                self.maximum_evidence_snippets_per_batch,
             )
             <= 0
         ):
@@ -163,6 +166,7 @@ class _CampaignDirective:
     phase: CampaignPhase
     allowed_actions: tuple[CampaignAction, ...]
     target_test_case_ids: tuple[str, ...] = ()
+    target_snippet_ids: tuple[str, ...] = ()
     group_id: Optional[str] = None
     required_action: Optional[CampaignAction] = None
     remaining_discovery_actions: int = 0
@@ -445,22 +449,28 @@ class CertificationCampaignAgent:
                 )
 
             if response.action == CampaignAction.READ_EVIDENCE:
-                assert response.snippet_id is not None
-                if response.snippet_id not in self._candidate_snippet_ids:
-                    raise ValueError(
-                        "evidence was not returned for a read testcase/search"
-                    )
-                snippet = self._catalog.get(response.snippet_id)
-                if snippet is None:
-                    raise ValueError("evidence snippet does not exist")
-                self._read_snippet_ids.add(response.snippet_id)
-                return (
-                    _json_text(
-                        _snippet_payload(
-                            snippet, self.config.maximum_evidence_characters
+                snippet_ids = response.snippet_ids or (response.snippet_id,)
+                if len(snippet_ids) > self.config.maximum_evidence_snippets_per_batch:
+                    raise ValueError("read_evidence exceeds its bounded batch size")
+                snippets: list[GroundingSnippet] = []
+                for snippet_id in snippet_ids:
+                    assert snippet_id is not None
+                    if snippet_id not in self._candidate_snippet_ids:
+                        raise ValueError(
+                            "evidence was not returned for a read testcase/search"
                         )
-                    ),
-                    (snippet.snippet_id,),
+                    snippet = self._catalog.get(snippet_id)
+                    if snippet is None:
+                        raise ValueError("evidence snippet does not exist")
+                    snippets.append(snippet)
+                self._read_snippet_ids.update(item.snippet_id for item in snippets)
+                payloads = [
+                    _snippet_payload(item, self.config.maximum_evidence_characters)
+                    for item in snippets
+                ]
+                return (
+                    _json_text(payloads[0] if len(payloads) == 1 else payloads),
+                    tuple(item.snippet_id for item in snippets),
                     None,
                 )
 
@@ -662,6 +672,22 @@ class CertificationCampaignAgent:
                     required_action=CampaignAction.READ_TEST_CASES,
                 )
 
+            evidence_selection = self._evidence_selection(target)
+            unresolved_evidence = tuple(
+                item
+                for item in evidence_selection
+                if item not in self._read_snippet_ids
+            )
+            if unresolved_evidence:
+                return _CampaignDirective(
+                    phase=CampaignPhase.RESOLVE_EVIDENCE,
+                    allowed_actions=(CampaignAction.READ_EVIDENCE,),
+                    target_test_case_ids=target,
+                    target_snippet_ids=unresolved_evidence,
+                    group_id=group.group_id,
+                    required_action=CampaignAction.READ_EVIDENCE,
+                )
+
             discovery_actions = self._discovery_actions_since(
                 CampaignAction.RECORD_ASSESSMENTS
             )
@@ -672,7 +698,10 @@ class CertificationCampaignAgent:
                 0,
                 self.config.maximum_discovery_actions_per_group - discovery_actions,
             )
-            if group_has_assessment or remaining_budget == 0:
+            evidence_resolved = bool(evidence_selection) and all(
+                item in self._read_snippet_ids for item in evidence_selection
+            )
+            if evidence_resolved or group_has_assessment or remaining_budget == 0:
                 return _CampaignDirective(
                     phase=CampaignPhase.ASSESS,
                     allowed_actions=(CampaignAction.RECORD_ASSESSMENTS,),
@@ -738,6 +767,64 @@ class CertificationCampaignAgent:
             required_action=CampaignAction.FINAL,
         )
 
+    def _evidence_selection(
+        self,
+        target_test_case_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        dynamic_candidates = tuple(
+            item
+            for item in self._dynamic.values()
+            if not _generated_repository_title(item.title)
+        )
+        ranked_by_case: list[list[GroundingSnippet]] = []
+        for case_id in target_test_case_ids:
+            case = self.cases[case_id]
+            case_text = " ".join(
+                (
+                    case.retrieval_query,
+                    case.context.description or "",
+                    *(item.value for item in case.context.fields),
+                )
+            )
+            ranked = sorted(
+                dynamic_candidates,
+                key=lambda item: (
+                    _evidence_rank(case_text, item),
+                    item.snippet_id,
+                ),
+                reverse=True,
+            )
+            ranked_by_case.append(
+                [item for item in ranked if _evidence_has_overlap(case_text, item)]
+            )
+
+        selected: list[GroundingSnippet] = []
+        while len(selected) < self.config.maximum_evidence_snippets_per_batch:
+            progressed = False
+            for candidates in ranked_by_case:
+                candidate = next(
+                    (
+                        item
+                        for item in candidates
+                        if item.snippet_id
+                        not in {selected_item.snippet_id for selected_item in selected}
+                        and not any(
+                            _overlapping_repository_snippets(item, selected_item)
+                            for selected_item in selected
+                        )
+                    ),
+                    None,
+                )
+                if candidate is None:
+                    continue
+                selected.append(candidate)
+                progressed = True
+                if len(selected) >= self.config.maximum_evidence_snippets_per_batch:
+                    break
+            if not progressed:
+                break
+        return tuple(item.snippet_id for item in selected)
+
     def _discovery_actions_since(self, boundary: CampaignAction) -> int:
         boundary_turn = 0
         for observation in reversed(self._observations):
@@ -777,6 +864,16 @@ class CertificationCampaignAgent:
                 return (
                     "read_test_cases must read exactly the required target IDs: "
                     + ", ".join(directive.target_test_case_ids)
+                )
+        if (
+            directive.phase == CampaignPhase.RESOLVE_EVIDENCE
+            and response.action == CampaignAction.READ_EVIDENCE
+        ):
+            actual = response.snippet_ids or (response.snippet_id,)
+            if actual != directive.target_snippet_ids:
+                return (
+                    "read_evidence must read exactly the required snippet IDs: "
+                    + ", ".join(directive.target_snippet_ids)
                 )
         if response.action == CampaignAction.RECORD_ASSESSMENTS:
             actual = tuple(item.test_case_id for item in response.assessments or ())
@@ -886,12 +983,28 @@ class CertificationCampaignAgent:
     def _plan(self, conclusion: CampaignConclusion) -> CampaignPlan:
         assessments = tuple(self._assessments[item] for item in self.selected_ids)
         changes = self.workspace.staged_changes
+        support_counts = {
+            status: sum(item.status == status for item in assessments)
+            for status in CaseSupportStatus
+        }
+        summary = (
+            f"Assessed {len(assessments)} testcases: "
+            f"{support_counts[CaseSupportStatus.SUPPORTED_AS_IS]} supported_as_is, "
+            f"{support_counts[CaseSupportStatus.SUPPORTED_AFTER_CHANGE]} "
+            "supported_after_change, "
+            f"{support_counts[CaseSupportStatus.NEEDS_REVIEW]} needs_review, and "
+            f"{support_counts[CaseSupportStatus.UNSUPPORTED_MISSING_REQUIREMENT]} "
+            "unsupported_missing_requirement."
+        )
+        if support_counts[CaseSupportStatus.NEEDS_REVIEW]:
+            summary += " Unresolved cases require evidence review before execution."
+        normalized_conclusion = conclusion.model_copy(update={"summary": summary})
         proposal = (
             RemediationProposal(
-                summary=conclusion.summary,
+                summary=normalized_conclusion.summary,
                 changes=changes,
-                risks=conclusion.risks,
-                verification_notes=conclusion.verification_notes,
+                risks=normalized_conclusion.risks,
+                verification_notes=normalized_conclusion.verification_notes,
             )
             if changes
             else None
@@ -918,7 +1031,7 @@ class CertificationCampaignAgent:
             prompt_sha256=hashlib.sha256(
                 CAMPAIGN_SYSTEM_PROMPT.encode("utf-8")
             ).hexdigest(),
-            conclusion=conclusion,
+            conclusion=normalized_conclusion,
             assessments=assessments,
             retrieved_snippets=tuple(
                 self._dynamic[item] for item in sorted(self._dynamic)
@@ -977,6 +1090,12 @@ class CertificationCampaignAgent:
             self.config,
             self.llm,
         )
+        previous_expected = _previous_campaign_configuration_sha256(
+            self.objective,
+            self.selected_ids,
+            self.config,
+            self.llm,
+        )
         legacy_expected = _legacy_campaign_configuration_sha256(
             self.objective,
             self.selected_ids,
@@ -989,12 +1108,18 @@ class CertificationCampaignAgent:
             raise CampaignBuildError("campaign checkpoint grounding differs")
         if checkpoint.repository_id != self.workspace.repository_id:
             raise CampaignBuildError("repository changed since campaign checkpoint")
-        if checkpoint.configuration_sha256 not in {expected, legacy_expected}:
+        compatible = {
+            expected: CAMPAIGN_PROMPT_VERSION,
+            previous_expected: PREVIOUS_CAMPAIGN_PROMPT_VERSION,
+            legacy_expected: LEGACY_CAMPAIGN_PROMPT_VERSION,
+        }
+        if checkpoint.configuration_sha256 not in compatible:
             raise CampaignBuildError("campaign checkpoint configuration differs")
-        if checkpoint.configuration_sha256 == legacy_expected:
+        checkpoint_version = compatible[checkpoint.configuration_sha256]
+        if checkpoint_version != CAMPAIGN_PROMPT_VERSION:
             LOGGER.info(
                 "campaign checkpoint migrated from prompt_version=%s",
-                LEGACY_CAMPAIGN_PROMPT_VERSION,
+                checkpoint_version,
             )
         if checkpoint.selected_test_case_ids != self.selected_ids:
             raise CampaignBuildError("campaign checkpoint testcase selection differs")
@@ -1012,6 +1137,7 @@ class CertificationCampaignAgent:
             (item.snippet_id, item) for item in checkpoint.retrieved_snippets
         )
         self._catalog.update(self._dynamic)
+        self._candidate_snippet_ids.update(self._dynamic)
         self._candidate_snippet_ids.update(checkpoint.read_evidence_snippet_ids)
         last_read_errors: dict[str, Optional[str]] = {}
         for observation in checkpoint.observations:
@@ -1076,6 +1202,11 @@ class CertificationCampaignAgent:
                     else None
                 ),
                 "target_test_case_ids": list(directive.target_test_case_ids),
+                "target_snippet_ids": list(directive.target_snippet_ids),
+                "target_snippets": [
+                    _snippet_metadata(self._catalog[item])
+                    for item in directive.target_snippet_ids
+                ],
                 "group_id": directive.group_id,
                 "remaining_discovery_actions": (directive.remaining_discovery_actions),
                 "no_progress_turns": self._no_progress_turns,
@@ -1119,7 +1250,7 @@ class CertificationCampaignAgent:
         if directive.phase == CampaignPhase.ASSESS:
             context["assessment_context"] = self._assessment_context(directive)
         elif directive.phase == CampaignPhase.PLAN_CHANGES:
-            evidence = self._bounded_evidence_context()
+            evidence = self._bounded_evidence_context(directive.target_test_case_ids)
             context["change_context"] = {
                 "target_assessments": [
                     self._assessments[item].model_dump(mode="json")
@@ -1170,6 +1301,11 @@ class CertificationCampaignAgent:
         targets = ", ".join(directive.target_test_case_ids)
         if directive.phase == CampaignPhase.READ_CASES:
             return f"read exactly these testcase IDs now: {targets}"
+        if directive.phase == CampaignPhase.RESOLVE_EVIDENCE:
+            return (
+                "read exactly the required target_snippet_ids in one "
+                "read_evidence action now"
+            )
         if directive.phase == CampaignPhase.ASSESS:
             return (
                 "record conservative assessments for exactly these IDs in one "
@@ -1197,7 +1333,7 @@ class CertificationCampaignAgent:
         self,
         directive: _CampaignDirective,
     ) -> dict[str, object]:
-        evidence = self._bounded_evidence_context()
+        evidence = self._bounded_evidence_context(directive.target_test_case_ids)
         return {
             "test_cases": [
                 self._bounded_assessment_case(self.cases[item])
@@ -1211,10 +1347,30 @@ class CertificationCampaignAgent:
             ),
         }
 
-    def _bounded_evidence_context(self) -> dict[str, object]:
+    def _bounded_evidence_context(
+        self,
+        target_test_case_ids: tuple[str, ...],
+    ) -> dict[str, object]:
         repository_evidence: list[dict[str, object]] = []
         read_evidence: list[dict[str, object]] = []
         remaining = self.config.maximum_assessment_evidence_characters
+        target_terms = _search_terms(
+            " ".join(self.cases[item].retrieval_query for item in target_test_case_ids)
+        )
+        prioritized_snippets = sorted(
+            (self._catalog[item] for item in self._read_snippet_ids),
+            key=lambda item: (
+                -len(target_terms & _search_terms(f"{item.title} {item.content}")),
+                -item.relevance_score,
+                item.snippet_id,
+            ),
+        )
+        for snippet in prioritized_snippets:
+            if remaining <= 0:
+                break
+            payload = _snippet_payload(snippet, min(remaining, 6_000))
+            read_evidence.append(payload)
+            remaining -= len(str(payload.get("content", "")))
         for descriptor in self._repository_reads.values():
             content, digest = self.workspace.inspect_file(descriptor.path)
             if digest != descriptor.sha256:
@@ -1237,13 +1393,6 @@ class CertificationCampaignAgent:
                 }
             )
             remaining -= len(selected)
-        for snippet_id in sorted(self._read_snippet_ids):
-            if remaining <= 0:
-                break
-            snippet = self._catalog[snippet_id]
-            payload = _snippet_payload(snippet, min(remaining, 6_000))
-            read_evidence.append(payload)
-            remaining -= len(str(payload.get("content", "")))
         return {
             "repository_evidence": repository_evidence,
             "read_evidence": read_evidence,
@@ -1434,6 +1583,48 @@ def _legacy_campaign_configuration_sha256(
     ).hexdigest()
 
 
+def _previous_campaign_configuration_sha256(
+    objective: str,
+    selected_ids: tuple[str, ...],
+    config: CampaignBuildConfig,
+    llm: SynthesisLLM,
+) -> str:
+    previous_config = {
+        name: getattr(config, name)
+        for name in (
+            "maximum_turns",
+            "maximum_prompt_characters",
+            "maximum_testcases_per_read",
+            "maximum_assessments_per_action",
+            "repository_search_results",
+            "mcp_search_results",
+            "maximum_evidence_characters",
+            "maximum_repository_file_characters",
+            "recent_tool_results",
+            "maximum_recent_result_characters",
+            "assessment_batch_size",
+            "maximum_discovery_actions_per_group",
+            "maximum_change_actions",
+            "maximum_no_progress_turns",
+            "maximum_assessment_evidence_characters",
+        )
+    }
+    return hashlib.sha256(
+        _json_text(
+            {
+                "prompt_version": PREVIOUS_CAMPAIGN_PROMPT_VERSION,
+                "objective": objective,
+                "selected_test_case_ids": selected_ids,
+                "config": previous_config,
+                "endpoint": llm.config.endpoint,
+                "model": llm.config.model,
+                "response_format": llm.config.response_format,
+                "maximum_output_tokens": llm.config.maximum_output_tokens,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _call_record(
     turn: int,
     action: CampaignAction,
@@ -1458,6 +1649,8 @@ def _request_label(response: CampaignAgentResponse) -> str:
         return response.path
     if response.snippet_id is not None:
         return response.snippet_id
+    if response.snippet_ids is not None:
+        return ",".join(response.snippet_ids)
     if response.test_case_ids is not None:
         return ",".join(response.test_case_ids)
     if response.group_id is not None:
@@ -1488,7 +1681,8 @@ def _action_key(response: CampaignAgentResponse) -> str:
         tool = response.tool_name or "repository"
         return f"{prefix}:{tool}:{query}"
     if response.action == CampaignAction.READ_EVIDENCE:
-        return f"{prefix}:{response.snippet_id}"
+        identifiers = response.snippet_ids or (response.snippet_id,)
+        return f"{prefix}:{','.join(item for item in identifiers if item is not None)}"
     if response.action == CampaignAction.LIST_TEST_CASES:
         return f"{prefix}:{response.group_id}:{response.offset or 0}"
     if response.test_case_ids is not None:
@@ -1553,6 +1747,91 @@ def _json_text(value: object) -> str:
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,
+    )
+
+
+def _search_terms(value: str) -> set[str]:
+    camel_split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+    return {
+        item
+        for item in re.findall(r"[a-z0-9]+", camel_split.casefold())
+        if len(item) > 1
+        and item
+        not in {
+            "api",
+            "case",
+            "code",
+            "customer",
+            "merchant",
+            "request",
+            "response",
+            "sdk",
+            "test",
+            "uat",
+        }
+    }
+
+
+def _endpoint_identifier_terms(value: str) -> set[str]:
+    paths = re.findall(r"/api(?:/[A-Za-z0-9_{}-]+)+", value)
+    return {
+        segment.casefold().strip("{}")
+        for path in paths
+        for segment in path.split("/")
+        if len(segment.strip("{}")) > 2 and segment.casefold() != "api"
+    }
+
+
+def _evidence_rank(
+    case_text: str,
+    snippet: GroundingSnippet,
+) -> tuple[int, int, int, int]:
+    evidence_text = f"{snippet.title} {snippet.content}"
+    raw_evidence_terms = set(re.findall(r"[a-z0-9]+", evidence_text.casefold()))
+    endpoint_matches = len(_endpoint_identifier_terms(case_text) & raw_evidence_terms)
+    repository_path = snippet.repository.path if snippet.repository is not None else ""
+    code_source = int(
+        bool(
+            re.search(
+                r"\.(?:c|cc|cpp|cs|go|hs|java|js|kt|php|py|rb|rs|scala|ts|tsx)$",
+                repository_path.casefold(),
+            )
+        )
+    )
+    lexical_matches = len(_search_terms(case_text) & _search_terms(evidence_text))
+    return endpoint_matches, code_source, lexical_matches, snippet.relevance_score
+
+
+def _evidence_has_overlap(case_text: str, snippet: GroundingSnippet) -> bool:
+    endpoint_matches, _, lexical_matches, _ = _evidence_rank(case_text, snippet)
+    return bool(endpoint_matches or lexical_matches)
+
+
+def _overlapping_repository_snippets(
+    first: GroundingSnippet,
+    second: GroundingSnippet,
+) -> bool:
+    first_citation = first.repository
+    second_citation = second.repository
+    if first_citation is None or second_citation is None:
+        return False
+    return (
+        first_citation.path == second_citation.path
+        and first_citation.line_start <= second_citation.line_end
+        and second_citation.line_start <= first_citation.line_end
+    )
+
+
+def _generated_repository_title(value: str) -> bool:
+    normalized = value.casefold().replace("\\", "/")
+    return any(
+        marker in normalized
+        for marker in (
+            "/dist-newstyle/",
+            "dist-newstyle/",
+            "/.stack-work/",
+            ".stack-work/",
+        )
     )
 
 

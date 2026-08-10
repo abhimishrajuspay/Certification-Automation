@@ -17,7 +17,8 @@ from synthesis.models import TokenUsage
 
 
 CAMPAIGN_SCHEMA_VERSION = "1.0"
-CAMPAIGN_PROMPT_VERSION = "1.1"
+CAMPAIGN_PROMPT_VERSION = "1.2"
+PREVIOUS_CAMPAIGN_PROMPT_VERSION = "1.1"
 LEGACY_CAMPAIGN_PROMPT_VERSION = "1.0"
 
 
@@ -51,6 +52,7 @@ class CampaignAction(str, Enum):
 
 class CampaignPhase(str, Enum):
     READ_CASES = "read_cases"
+    RESOLVE_EVIDENCE = "resolve_evidence"
     DISCOVER = "discover"
     ASSESS = "assess"
     PLAN_CHANGES = "plan_changes"
@@ -127,6 +129,7 @@ class CampaignAgentResponse(CampaignModel):
     line_end: Optional[int] = Field(default=None, ge=1)
     test_case_ids: Optional[tuple[str, ...]] = None
     snippet_id: Optional[str] = None
+    snippet_ids: Optional[tuple[str, ...]] = None
     query: Optional[str] = None
     path: Optional[str] = None
     tool_name: Optional[str] = None
@@ -136,6 +139,10 @@ class CampaignAgentResponse(CampaignModel):
 
     @model_validator(mode="after")
     def validate_action_payload(self) -> "CampaignAgentResponse":
+        if self.snippet_ids is not None and len(self.snippet_ids) != len(
+            set(self.snippet_ids)
+        ):
+            raise ValueError("evidence snippet IDs must be unique")
         if (self.line_start is None) != (self.line_end is None):
             raise ValueError(
                 "repository line_start and line_end must be supplied together"
@@ -149,7 +156,9 @@ class CampaignAgentResponse(CampaignModel):
         valid = {
             CampaignAction.LIST_TEST_CASES: self.group_id is not None,
             CampaignAction.READ_TEST_CASES: bool(self.test_case_ids),
-            CampaignAction.READ_EVIDENCE: self.snippet_id is not None,
+            CampaignAction.READ_EVIDENCE: (
+                (self.snippet_id is not None) != bool(self.snippet_ids)
+            ),
             CampaignAction.SEARCH_REPOSITORY: self.query is not None,
             CampaignAction.READ_REPOSITORY_FILE: self.path is not None,
             CampaignAction.SEARCH_MCP: (
@@ -171,6 +180,7 @@ class CampaignAgentResponse(CampaignModel):
             },
             CampaignAction.READ_EVIDENCE: {
                 "snippet_id",
+                "snippet_ids",
                 "group_id",
                 "test_case_ids",
             },
@@ -216,6 +226,7 @@ class CampaignAgentResponse(CampaignModel):
                 "line_end",
                 "test_case_ids",
                 "snippet_id",
+                "snippet_ids",
                 "query",
                 "path",
                 "tool_name",
@@ -345,16 +356,24 @@ class CampaignPlan(CampaignModel):
             raise ValueError(
                 "supported_after_change assessments require a cited file change"
             )
-        expected = campaign_plan_id(
-            source_run_id=self.source_run_id,
-            source_grounding_sha256=self.source_grounding_sha256,
-            repository_id=self.repository_id,
-            objective=self.objective,
-            selected_test_case_ids=self.selected_test_case_ids,
-            assessments=self.assessments,
-            proposal=self.proposal,
-        )
-        if self.plan_id != expected:
+        immutable = {
+            "source_run_id": self.source_run_id,
+            "source_grounding_sha256": self.source_grounding_sha256,
+            "repository_id": self.repository_id,
+            "objective": self.objective,
+            "selected_test_case_ids": self.selected_test_case_ids,
+            "assessments": self.assessments,
+            "proposal": self.proposal,
+        }
+        compatible_ids = {
+            campaign_plan_id(**immutable, prompt_version=version)
+            for version in (
+                CAMPAIGN_PROMPT_VERSION,
+                PREVIOUS_CAMPAIGN_PROMPT_VERSION,
+                LEGACY_CAMPAIGN_PROMPT_VERSION,
+            )
+        }
+        if self.plan_id not in compatible_ids:
             raise ValueError("plan_id does not match the immutable campaign result")
         return self
 
@@ -436,10 +455,11 @@ def campaign_plan_id(
     selected_test_case_ids: tuple[str, ...],
     assessments: tuple[CampaignAssessment, ...],
     proposal: Optional[RemediationProposal],
+    prompt_version: str = CAMPAIGN_PROMPT_VERSION,
 ) -> str:
     return _hash_json(
         {
-            "prompt_version": CAMPAIGN_PROMPT_VERSION,
+            "prompt_version": prompt_version,
             "source_run_id": source_run_id,
             "source_grounding_sha256": source_grounding_sha256,
             "repository_id": repository_id,
@@ -465,6 +485,7 @@ def _hash_json(value: object) -> str:
 __all__ = [
     "CAMPAIGN_PROMPT_VERSION",
     "LEGACY_CAMPAIGN_PROMPT_VERSION",
+    "PREVIOUS_CAMPAIGN_PROMPT_VERSION",
     "CAMPAIGN_SCHEMA_VERSION",
     "CampaignAction",
     "CampaignAgentResponse",

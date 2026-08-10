@@ -30,8 +30,12 @@ from campaign.io import (
     load_plan,
     save_checkpoint,
 )
-from campaign.models import CaseSupportStatus
-from campaign.models import CampaignAssessment
+from campaign.models import (
+    CampaignAssessment,
+    CampaignCheckpoint,
+    CampaignPlan,
+    CaseSupportStatus,
+)
 from campaign.workspace import CampaignWorkspace
 from grounding.mcp import DEFAULT_READ_ONLY_TOOLS, MCPClient, MCPClientConfig
 from grounding.models import GroundedTestCase
@@ -94,6 +98,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--maximum-turns", type=int, default=160)
     plan.add_argument("--assessment-batch-size", type=int, default=6)
     plan.add_argument(
+        "--maximum-evidence-snippets-per-batch",
+        type=int,
+        default=6,
+    )
+    plan.add_argument(
         "--maximum-discovery-actions-per-group",
         type=int,
         default=12,
@@ -106,6 +115,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--retry-backoff-seconds", type=float, default=15.0)
     plan.add_argument("--output-root", type=Path, default=Path("artifacts/campaign"))
     plan.add_argument("--resume", action="store_true")
+    plan.add_argument(
+        "--reassess-needs-review",
+        action="store_true",
+        help=("with --resume, reopen needs_review cases and resolve retained evidence"),
+    )
     plan.add_argument("--overwrite", action="store_true")
     plan.add_argument("--skip-source-manifest-check", action="store_true")
 
@@ -159,16 +173,6 @@ def _inspect(args: argparse.Namespace) -> int:
 
 
 async def _plan(args: argparse.Namespace) -> int:
-    if not args.litellm_url:
-        raise ValueError("LiteLLM URL is required")
-    if not args.model:
-        raise ValueError("LiteLLM model is required")
-    api_key_value = None if args.no_api_key else os.environ.get(args.api_key_env)
-    if not args.no_api_key and not api_key_value:
-        raise ValueError(
-            f"LiteLLM API key environment variable {args.api_key_env!r} is not set"
-        )
-
     loaded = load_grounding(
         args.grounding,
         verify_manifest=not args.skip_source_manifest_check,
@@ -183,12 +187,60 @@ async def _plan(args: argparse.Namespace) -> int:
     plan_path = output_directory / "plan.json"
     matrix_path = output_directory / "support_matrix.jsonl"
     progress_path = output_directory / "progress.log"
+    if args.reassess_needs_review and not args.resume:
+        raise ValueError("--reassess-needs-review requires --resume")
+    if args.resume and plan_path.is_file() and not args.reassess_needs_review:
+        existing = load_plan(plan_path)
+        current_repository_id = CampaignWorkspace(args.repo_path).repository_id
+        if (
+            existing.source_run_id != loaded.grounding.source_run_id
+            or existing.source_grounding_sha256 != loaded.sha256
+            or existing.repository_id != current_repository_id
+            or existing.objective != args.objective.strip()
+            or existing.selected_test_case_ids != selected_ids
+        ):
+            raise CampaignIOError(
+                "existing campaign plan differs from the requested campaign"
+            )
+        print(
+            json.dumps(
+                _planned_payload(
+                    existing,
+                    plan_path=plan_path,
+                    matrix_path=matrix_path,
+                    checkpoint_path=checkpoint_path,
+                    progress_path=progress_path,
+                    reused_existing=True,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if not args.litellm_url:
+        raise ValueError("LiteLLM URL is required")
+    if not args.model:
+        raise ValueError("LiteLLM model is required")
+    api_key_value = None if args.no_api_key else os.environ.get(args.api_key_env)
+    if not args.no_api_key and not api_key_value:
+        raise ValueError(
+            f"LiteLLM API key environment variable {args.api_key_env!r} is not set"
+        )
     initial = load_checkpoint(checkpoint_path) if args.resume else None
     archived_attempt = (
-        archive_checkpoint_attempt(checkpoint_path, progress_path)
+        archive_checkpoint_attempt(checkpoint_path, progress_path, plan_path)
         if initial is not None
         else None
     )
+    if args.reassess_needs_review:
+        assert initial is not None
+        if not plan_path.is_file():
+            raise CampaignIOError(
+                "--reassess-needs-review requires a completed campaign plan"
+            )
+        initial = _reopen_needs_review(initial, source_plan=load_plan(plan_path))
+        save_checkpoint(initial, checkpoint_path)
     _configure_logging(progress_path)
     if archived_attempt is not None:
         LOGGER.info("campaign attempt archived path=%s", archived_attempt)
@@ -231,6 +283,9 @@ async def _plan(args: argparse.Namespace) -> int:
         config=CampaignBuildConfig(
             maximum_turns=args.maximum_turns,
             assessment_batch_size=args.assessment_batch_size,
+            maximum_evidence_snippets_per_batch=(
+                args.maximum_evidence_snippets_per_batch
+            ),
             maximum_discovery_actions_per_group=(
                 args.maximum_discovery_actions_per_group
             ),
@@ -248,25 +303,16 @@ async def _plan(args: argparse.Namespace) -> int:
         matrix_path,
         overwrite=args.overwrite or args.resume,
     )
-    counts = _status_counts(result.assessments)
     print(
         json.dumps(
-            {
-                "status": "planned",
-                "source_run_id": result.source_run_id,
-                "plan_id": result.plan_id,
-                "test_cases": len(result.assessments),
-                "semantic_groups": len(result.groups),
-                "support": counts,
-                "file_changes": len(result.proposal.changes) if result.proposal else 0,
-                "approval_required": result.approval_required,
-                "agent_turns": len(result.calls),
-                "tool_calls": len(result.observations),
-                "plan_path": str(plan_path.resolve()),
-                "support_matrix": str(matrix_path.resolve()),
-                "checkpoint": str(checkpoint_path.resolve()),
-                "progress_log": str(progress_path.resolve()),
-            },
+            _planned_payload(
+                result,
+                plan_path=plan_path,
+                matrix_path=matrix_path,
+                checkpoint_path=checkpoint_path,
+                progress_path=progress_path,
+                reused_existing=False,
+            ),
             indent=2,
             sort_keys=True,
         )
@@ -279,8 +325,17 @@ def _status(args: argparse.Namespace) -> int:
     assert directory is not None
     plan_path = directory / "plan.json"
     checkpoint_path = directory / "checkpoint.json"
-    if plan_path.is_file():
-        plan = load_plan(plan_path)
+    plan = load_plan(plan_path) if plan_path.is_file() else None
+    checkpoint = load_checkpoint(checkpoint_path) if checkpoint_path.is_file() else None
+    reassessment_active = (
+        plan is not None
+        and checkpoint is not None
+        and (
+            len(checkpoint.calls) > len(plan.calls)
+            or len(checkpoint.assessments) < len(plan.assessments)
+        )
+    )
+    if plan is not None and not reassessment_active:
         payload = {
             "status": "planned",
             "source_run_id": plan.source_run_id,
@@ -293,8 +348,7 @@ def _status(args: argparse.Namespace) -> int:
             "agent_turns": len(plan.calls),
             "tool_calls": len(plan.observations),
         }
-    elif checkpoint_path.is_file():
-        checkpoint = load_checkpoint(checkpoint_path)
+    elif checkpoint is not None:
         payload = {
             "status": "checkpointed",
             "source_run_id": checkpoint.source_run_id,
@@ -307,7 +361,14 @@ def _status(args: argparse.Namespace) -> int:
             "phase": (
                 checkpoint.phase.value
                 if checkpoint.phase is not None
-                else "legacy_recovery"
+                else (
+                    "reassessment_pending"
+                    if any(
+                        item.startswith("reopened needs_review cases")
+                        for item in checkpoint.errors
+                    )
+                    else "legacy_recovery"
+                )
             ),
             "no_progress_turns": checkpoint.no_progress_turns,
             "agent_turns": len(checkpoint.calls),
@@ -390,6 +451,71 @@ def _status_counts(
     return {
         status.value: sum(item.status == status for item in assessments)
         for status in CaseSupportStatus
+    }
+
+
+def _reopen_needs_review(
+    checkpoint: CampaignCheckpoint,
+    *,
+    source_plan: CampaignPlan | None = None,
+) -> CampaignCheckpoint:
+    source_assessments = (
+        source_plan.assessments if source_plan is not None else checkpoint.assessments
+    )
+    reopened = tuple(
+        item.test_case_id
+        for item in source_assessments
+        if item.status == CaseSupportStatus.NEEDS_REVIEW
+    )
+    if not reopened:
+        raise CampaignIOError("campaign has no needs_review cases to reassess")
+    reopened_set = set(reopened)
+    retained = tuple(
+        item for item in checkpoint.assessments if item.test_case_id not in reopened_set
+    )
+    audit_message = (
+        "reopened needs_review cases for retained-evidence reassessment: "
+        + ", ".join(reopened)
+    )
+    return checkpoint.model_copy(
+        update={
+            "phase": None,
+            "no_progress_turns": 0,
+            "assessments": retained,
+            "errors": (
+                checkpoint.errors
+                if audit_message in checkpoint.errors
+                else (*checkpoint.errors, audit_message)
+            ),
+        }
+    )
+
+
+def _planned_payload(
+    plan: CampaignPlan,
+    *,
+    plan_path: Path,
+    matrix_path: Path,
+    checkpoint_path: Path,
+    progress_path: Path,
+    reused_existing: bool,
+) -> dict[str, object]:
+    return {
+        "status": "planned",
+        "reused_existing": reused_existing,
+        "source_run_id": plan.source_run_id,
+        "plan_id": plan.plan_id,
+        "test_cases": len(plan.assessments),
+        "semantic_groups": len(plan.groups),
+        "support": _status_counts(plan.assessments),
+        "file_changes": len(plan.proposal.changes) if plan.proposal else 0,
+        "approval_required": plan.approval_required,
+        "agent_turns": len(plan.calls),
+        "tool_calls": len(plan.observations),
+        "plan_path": str(plan_path.resolve()),
+        "support_matrix": str(matrix_path.resolve()),
+        "checkpoint": str(checkpoint_path.resolve()),
+        "progress_log": str(progress_path.resolve()),
     }
 
 

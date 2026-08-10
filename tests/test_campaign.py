@@ -17,6 +17,7 @@ from campaign.builder import (
     _legacy_campaign_configuration_sha256,
     campaign_groups,
 )
+from campaign.cli import _reopen_needs_review
 from campaign.io import archive_checkpoint_attempt
 from campaign.models import (
     CampaignAction,
@@ -172,21 +173,28 @@ class _CampaignLLM:
     ) -> LiteLLMCompletion:
         del system_prompt, response_model, schema_name
         self.prompts.append(user_prompt)
-        turn = len(self.prompts)
-        if turn == 1:
+        context = json.loads(user_prompt.split("INPUT_CONTEXT=", 1)[1])
+        phase = context["control"]["phase"]
+        if phase == CampaignPhase.READ_CASES.value:
             response = CampaignAgentResponse(
                 action=CampaignAction.READ_TEST_CASES,
                 rationale="Read the related API group in one bounded request",
                 group_id=self.group_id,
                 test_case_ids=("TC_01", "TC_02"),
             )
-        elif turn == 2:
+        elif phase == CampaignPhase.RESOLVE_EVIDENCE.value:
+            response = CampaignAgentResponse(
+                action=CampaignAction.READ_EVIDENCE,
+                rationale="Read the retained repository evidence",
+                snippet_ids=tuple(context["control"]["target_snippet_ids"]),
+            )
+        elif phase == CampaignPhase.DISCOVER.value and len(self.prompts) == 2:
             response = CampaignAgentResponse(
                 action=CampaignAction.READ_EVIDENCE,
                 rationale="Read the shared API requirement",
                 snippet_id=self.snippet_id,
             )
-        elif turn == 3:
+        elif phase == CampaignPhase.DISCOVER.value:
             response = CampaignAgentResponse(
                 action=CampaignAction.SEARCH_REPOSITORY,
                 query="bill_fetch",
@@ -194,13 +202,7 @@ class _CampaignLLM:
                 group_id=self.group_id,
                 test_case_ids=("TC_01", "TC_02"),
             )
-        elif turn == 4:
-            response = CampaignAgentResponse(
-                action=CampaignAction.READ_REPOSITORY_FILE,
-                rationale="Inspect the existing implementation before replacement",
-                path="service.py",
-            )
-        elif turn == 5:
+        elif phase == CampaignPhase.ASSESS.value:
             response = CampaignAgentResponse(
                 action=CampaignAction.RECORD_ASSESSMENTS,
                 rationale="Both cases share the same missing handler capability",
@@ -211,14 +213,22 @@ class _CampaignLLM:
                         rationale="The route is documented but the handler is incomplete",
                         required_capabilities=("bill fetch handler",),
                         missing_capabilities=("implemented response",),
-                        repository_paths=("service.py",),
                         portal_evidence_state_ids=(f"state-{index}",),
                         evidence_snippet_ids=(self.snippet_id,),
                     )
                     for index in (1, 2)
                 ),
             )
-        elif turn == 6:
+        elif (
+            phase == CampaignPhase.PLAN_CHANGES.value
+            and "service.py" not in context["progress"]["read_repository_paths"]
+        ):
+            response = CampaignAgentResponse(
+                action=CampaignAction.READ_REPOSITORY_FILE,
+                rationale="Inspect the existing implementation before replacement",
+                path="service.py",
+            )
+        elif phase == CampaignPhase.PLAN_CHANGES.value:
             response = CampaignAgentResponse(
                 action=CampaignAction.STAGE_FILE,
                 rationale="Implement the shared capability once for both cases",
@@ -232,7 +242,7 @@ class _CampaignLLM:
                     evidence_snippet_ids=(self.snippet_id,),
                 ),
             )
-        else:
+        elif phase == CampaignPhase.FINALIZE.value:
             response = CampaignAgentResponse(
                 action=CampaignAction.FINAL,
                 rationale="Every case is assessed and the shared change is staged",
@@ -241,6 +251,8 @@ class _CampaignLLM:
                     verification_notes=("Run the focused service tests",),
                 ),
             )
+        else:
+            raise AssertionError(f"unexpected campaign phase: {phase}")
         payload = response.model_dump_json()
         return LiteLLMCompletion(
             content=payload,
@@ -312,7 +324,8 @@ async def test_campaign_reads_lazily_and_builds_one_shared_change(
     assert len(plan.proposal.changes) == 1
     assert plan.proposal.changes[0].test_case_ids == ("TC_01", "TC_02")
     assert plan.approval_required is True
-    assert len(checkpoints) == 7
+    assert "2 supported_after_change" in plan.conclusion.summary
+    assert len(checkpoints) == 8
     assert checkpoints[-1].assessments == plan.assessments
     assert "validates the bill fetch API" not in llm.prompts[0]
     assert "POST /bill/fetch" not in llm.prompts[0]
@@ -347,11 +360,11 @@ async def test_campaign_forces_assessment_after_bounded_discovery(
             ),
             CampaignAgentResponse(
                 action=CampaignAction.SEARCH_REPOSITORY,
-                query="bill fetch handler",
+                query="definitely absent alpha",
             ),
             CampaignAgentResponse(
                 action=CampaignAction.SEARCH_REPOSITORY,
-                query="bill fetch response code",
+                query="definitely absent beta",
             ),
             CampaignAgentResponse(
                 action=CampaignAction.RECORD_ASSESSMENTS,
@@ -377,6 +390,61 @@ async def test_campaign_forces_assessment_after_bounded_discovery(
     assert '"phase":"assess"' in llm.prompts[3]
     assert '"required_action":"record_assessments"' in llm.prompts[3]
     assert len(plan.calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_assessment_context_prioritizes_read_snippets_over_large_files(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "large.txt").write_text("x" * 25_000)
+    grounding = _grounding()
+    group = campaign_groups(grounding.test_cases)[0]
+    agent = CertificationCampaignAgent(
+        grounding=grounding,
+        grounding_sha256="d" * 64,
+        workspace=CampaignWorkspace(repository),
+        llm=_CampaignLLM(
+            "x" * 25_000,
+            grounding.snippets[0].snippet_id,
+            group.group_id,
+        ),
+        objective="Assess support",
+    )
+    _, _, cases_error = await agent._execute_tool(
+        CampaignAgentResponse(
+            action=CampaignAction.READ_TEST_CASES,
+            test_case_ids=("TC_01", "TC_02"),
+        )
+    )
+    _, _, evidence_error = await agent._execute_tool(
+        CampaignAgentResponse(
+            action=CampaignAction.READ_EVIDENCE,
+            snippet_id=grounding.snippets[0].snippet_id,
+        )
+    )
+    _, _, repository_error = await agent._execute_tool(
+        CampaignAgentResponse(
+            action=CampaignAction.READ_REPOSITORY_FILE,
+            path="large.txt",
+        )
+    )
+
+    context = agent._bounded_evidence_context(("TC_01", "TC_02"))
+
+    assert cases_error is None
+    assert evidence_error is None
+    assert repository_error is None
+    assert context["read_evidence"][0]["snippet_id"] == grounding.snippets[0].snippet_id
+    assert (
+        sum(
+            len(item["content"])
+            for label in ("read_evidence", "repository_evidence")
+            for item in context[label]
+        )
+        <= agent.config.maximum_assessment_evidence_characters
+    )
 
 
 @pytest.mark.asyncio
@@ -553,15 +621,18 @@ def test_campaign_resume_archive_is_content_addressed_and_idempotent(
 ) -> None:
     checkpoint = tmp_path / "checkpoint.json"
     progress = tmp_path / "progress.log"
+    plan = tmp_path / "plan.json"
     checkpoint.write_text('{"saved":true}\n')
     progress.write_text("one completed turn\n")
+    plan.write_text('{"planned":true}\n')
 
-    first = archive_checkpoint_attempt(checkpoint, progress)
-    second = archive_checkpoint_attempt(checkpoint, progress)
+    first = archive_checkpoint_attempt(checkpoint, progress, plan)
+    second = archive_checkpoint_attempt(checkpoint, progress, plan)
 
     assert first == second
     assert (first / "checkpoint.json").read_bytes() == checkpoint.read_bytes()
     assert (first / "progress.log").read_bytes() == progress.read_bytes()
+    assert (first / "plan.json").read_bytes() == plan.read_bytes()
 
 
 @pytest.mark.asyncio
@@ -619,6 +690,75 @@ def test_campaign_action_contract_rejects_mixed_tool_payloads() -> None:
             query="bill fetch handler",
             path="service.py",
         )
+
+
+def test_read_evidence_accepts_one_bounded_batch_and_rejects_ambiguity() -> None:
+    first = "a" * 64
+    second = "b" * 64
+    response = CampaignAgentResponse(
+        action=CampaignAction.READ_EVIDENCE,
+        snippet_ids=(first, second),
+    )
+
+    assert response.snippet_ids == (first, second)
+
+    with pytest.raises(ValueError, match="lacks its required payload"):
+        CampaignAgentResponse(
+            action=CampaignAction.READ_EVIDENCE,
+            snippet_id=first,
+            snippet_ids=(second,),
+        )
+    with pytest.raises(ValueError, match="must be unique"):
+        CampaignAgentResponse(
+            action=CampaignAction.READ_EVIDENCE,
+            snippet_ids=(first, first),
+        )
+
+
+def test_reassessment_reopens_only_needs_review_cases() -> None:
+    assessments = (
+        CampaignAssessment(
+            test_case_id="TC_01",
+            status=CaseSupportStatus.NEEDS_REVIEW,
+            rationale="More repository evidence is required",
+            required_capabilities=("bill fetch handler",),
+        ),
+        CampaignAssessment(
+            test_case_id="TC_02",
+            status=CaseSupportStatus.SUPPORTED_AS_IS,
+            rationale="The existing handler supports this case",
+            required_capabilities=("bill fetch handler",),
+        ),
+    )
+    checkpoint = CampaignCheckpoint(
+        source_run_id="fixture-run",
+        source_grounding_sha256="c" * 64,
+        repository_id="a" * 64,
+        configuration_sha256="d" * 64,
+        model="fixture-model",
+        objective="Assess support",
+        updated_at="2026-08-10T00:00:00Z",
+        selected_test_case_ids=("TC_01", "TC_02"),
+        phase=CampaignPhase.FINALIZE,
+        no_progress_turns=2,
+        read_test_case_ids=("TC_01", "TC_02"),
+        assessments=assessments,
+    )
+
+    reopened = _reopen_needs_review(checkpoint)
+
+    assert tuple(item.test_case_id for item in reopened.assessments) == ("TC_02",)
+    assert reopened.phase is None
+    assert reopened.no_progress_turns == 0
+    assert reopened.read_test_case_ids == checkpoint.read_test_case_ids
+    assert "TC_01" in reopened.errors[-1]
+
+    resumed = _reopen_needs_review(
+        reopened,
+        source_plan=CampaignPlan.model_construct(assessments=assessments),
+    )
+    assert resumed.assessments == reopened.assessments
+    assert resumed.errors == reopened.errors
 
 
 def test_read_testcases_accepts_optional_group_context() -> None:
@@ -702,3 +842,13 @@ def test_complete_supported_campaign_needs_no_repository_approval() -> None:
 
     assert plan.proposal is None
     assert plan.approval_required is False
+
+    previous_payload = plan.model_dump(mode="json")
+    previous_payload["plan_id"] = campaign_plan_id(
+        **identifiers,
+        prompt_version="1.1",
+    )
+    assert (
+        CampaignPlan.model_validate(previous_payload).plan_id
+        == previous_payload["plan_id"]
+    )

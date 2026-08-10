@@ -77,6 +77,7 @@ def load_checkpoint(path: Path) -> CampaignCheckpoint:
 def archive_checkpoint_attempt(
     checkpoint_path: Path,
     progress_path: Path,
+    plan_path: Path | None = None,
 ) -> Path:
     """Archive one resumable attempt exactly once using its content digest."""
 
@@ -93,6 +94,11 @@ def archive_checkpoint_attempt(
     archived_progress = destination / "progress.log"
     if progress.is_file() and not archived_progress.exists():
         _atomic_write(archived_progress, progress.read_bytes())
+    if plan_path is not None:
+        plan = plan_path.expanduser().resolve()
+        archived_plan = destination / "plan.json"
+        if plan.is_file() and not archived_plan.exists():
+            _atomic_write(archived_plan, plan.read_bytes())
     return destination
 
 

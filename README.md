@@ -499,8 +499,10 @@ python -m campaign plan \
   --mcp-tool search_docs \
   --response-format json_object \
   --maximum-output-tokens 20000 \
-  --timeout-seconds 600 \
+  --timeout-seconds 180 \
+  --maximum-transport-attempts 2 \
   --assessment-batch-size 6 \
+  --maximum-evidence-snippets-per-batch 6 \
   --maximum-discovery-actions-per-group 12 \
   --maximum-change-actions 12 \
   --maximum-no-progress-turns 3
@@ -529,16 +531,41 @@ Monitor or resume without guessing whether the process is alive:
 python -m campaign status --run-id "$RUN_ID"
 tail -f "artifacts/campaign/$RUN_ID/progress.log"
 
-# Re-run the same plan command with this additional flag after interruption:
+# Re-run the same plan command with this flag after interruption:
 #   --resume
 ```
 
 `--resume` first stores the exact prior checkpoint and progress log under
 `artifacts/campaign/<run-id>/history/<digest>/`. Checkpoints created by prompt
-version 1.0 are migrated safely: completed testcase/repository evidence is
-retained, while an evidence-saturated legacy loop resumes directly at the
-assessment gate. `campaign status` reports `checkpointed`; it does not claim a
-process is alive merely because a checkpoint exists.
+versions 1.0 and 1.1 are migrated safely. If `plan.json` already exists, plain
+`--resume` validates and returns that immutable plan without calling the model
+or MCP again.
+
+To deliberately replace only conservative `needs_review` decisions, rerun the
+same command with both flags:
+
+```bash
+python -m campaign plan \
+  --grounding "artifacts/grounding/$RUN_ID" \
+  --repo-path "$REPO_PATH" \
+  --objective "Assess every testcase, implement missing shared capabilities, add required configuration/APIs and focused tests" \
+  --mcp-tool search_docs \
+  --response-format json_object \
+  --maximum-output-tokens 20000 \
+  --timeout-seconds 180 \
+  --maximum-transport-attempts 2 \
+  --assessment-batch-size 6 \
+  --maximum-evidence-snippets-per-batch 6 \
+  --reassess-needs-review \
+  --resume
+```
+
+Reassessment preserves prior searches and repository reads, reopens only
+`needs_review` rows, and forces the model to read a bounded relevant evidence
+batch before each support decision. The reopened checkpoint is saved before the
+first model call, so a transport interruption remains resumable. `campaign
+status` reports `checkpointed`; it does not claim a process is alive merely
+because a checkpoint exists.
 
 The completed package contains `plan.json`, a one-row-per-case
 `support_matrix.jsonl`, `checkpoint.json`, and `progress.log`. Each testcase is
