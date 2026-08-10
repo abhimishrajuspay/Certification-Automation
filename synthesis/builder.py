@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,6 +35,9 @@ from synthesis.models import (
     TestCaseExecutionSpec,
     synthesis_call_id,
 )
+
+
+LOGGER = logging.getLogger("cz.synthesis.builder")
 
 
 SYSTEM_PROMPT = """You are a constrained API-test specification compiler.
@@ -198,13 +203,53 @@ class SynthesisBuilder:
             maximum_cases=self.config.maximum_cases_per_batch,
         )
         semaphore = asyncio.Semaphore(self.config.concurrency)
+        LOGGER.info(
+            "synthesis build planned testcases=%d already_completed=%d batches=%d "
+            "concurrency=%d",
+            len(self.grounding.test_cases),
+            len(completed),
+            len(batches),
+            self.config.concurrency,
+        )
 
         async def run(batch: _SynthesisBatch) -> _BatchOutcome:
+            batch_name = batch.batch_id[:12]
+            test_case_ids = tuple(case.context.test_case_id for case in batch.cases)
+            LOGGER.info(
+                "batch queued batch=%s testcases=%d testcase_ids=%s",
+                batch_name,
+                len(batch.cases),
+                ",".join(test_case_ids),
+            )
             async with semaphore:
-                return await self._run_batch(batch)
+                started_at = time.monotonic()
+                LOGGER.info(
+                    "batch started batch=%s testcases=%d",
+                    batch_name,
+                    len(batch.cases),
+                )
+                outcome = await self._run_batch(batch)
+                elapsed = time.monotonic() - started_at
+                if outcome.error:
+                    LOGGER.error(
+                        "batch failed batch=%s elapsed_seconds=%.1f error=%s",
+                        batch_name,
+                        elapsed,
+                        outcome.error,
+                    )
+                else:
+                    LOGGER.info(
+                        "batch completed batch=%s elapsed_seconds=%.1f "
+                        "specifications=%d model_responses=%d",
+                        batch_name,
+                        elapsed,
+                        len(outcome.specifications),
+                        len(outcome.calls),
+                    )
+                return outcome
 
         tasks = [asyncio.create_task(run(batch)) for batch in batches]
-        for task in asyncio.as_completed(tasks):
+        for completed_batches, task in enumerate(asyncio.as_completed(tasks), start=1):
             outcome = await task
             all_calls.extend(outcome.calls)
             for spec in outcome.specifications:
@@ -217,6 +262,16 @@ class SynthesisBuilder:
                     tuple(_ordered_calls(all_calls)),
                     tuple(sorted(set(errors))),
                 )
+            LOGGER.info(
+                "build progress batches_finished=%d/%d testcases_synthesized=%d/%d "
+                "model_responses=%d errors=%d",
+                completed_batches,
+                len(batches),
+                len(completed),
+                len(self.grounding.test_cases),
+                len(all_calls),
+                len(errors),
+            )
 
         specifications = self._ordered_specs(completed)
         ordered_calls = tuple(_ordered_calls(all_calls))
@@ -301,6 +356,13 @@ class SynthesisBuilder:
         validation_feedback: Optional[str] = None
         for attempt in range(1, self.config.maximum_validation_attempts + 1):
             user_prompt = self._user_prompt(batch, validation_feedback)
+            LOGGER.info(
+                "batch validation attempt batch=%s attempt=%d/%d prompt_characters=%d",
+                batch.batch_id[:12],
+                attempt,
+                self.config.maximum_validation_attempts,
+                len(user_prompt),
+            )
             if len(user_prompt) > self.config.maximum_prompt_characters:
                 return _BatchOutcome(
                     batch=batch,
@@ -334,6 +396,13 @@ class SynthesisBuilder:
                 self._validate_response(batch, parsed)
             except (ValidationError, ValueError) as exc:
                 validation_feedback = _safe_validation_error(exc)
+                LOGGER.warning(
+                    "model response validation failed batch=%s attempt=%d/%d error=%s",
+                    batch.batch_id[:12],
+                    attempt,
+                    self.config.maximum_validation_attempts,
+                    validation_feedback,
+                )
                 calls.append(
                     SynthesisCallRecord(
                         call_id=synthesis_call_id(

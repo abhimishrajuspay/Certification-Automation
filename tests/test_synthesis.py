@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Type
 
@@ -27,7 +29,7 @@ from synthesis.builder import (
     SynthesisBuilder,
     load_grounding,
 )
-from synthesis.cli import main as synthesis_main
+from synthesis.cli import _configure_progress_logging, main as synthesis_main
 from synthesis.client import (
     LiteLLMClient,
     LiteLLMCompletion,
@@ -278,6 +280,26 @@ class _FakeTransport:
         )
 
 
+class _SlowTransport(_FakeTransport):
+    async def post_json(
+        self,
+        endpoint: str,
+        payload: bytes,
+        *,
+        api_key: SecretStr | None,
+        timeout_seconds: float,
+        maximum_response_bytes: int,
+    ) -> LiteLLMTransportResponse:
+        await asyncio.sleep(0.03)
+        return await super().post_json(
+            endpoint,
+            payload,
+            api_key=api_key,
+            timeout_seconds=timeout_seconds,
+            maximum_response_bytes=maximum_response_bytes,
+        )
+
+
 def test_request_models_reject_unsafe_or_invalid_ready_specs() -> None:
     with pytest.raises(ValidationError, match="environment placeholder"):
         HTTPRequestSpec(
@@ -329,6 +351,26 @@ async def test_builder_validates_citations_retries_and_exports(tmp_path: Path) -
     for item in exported.manifest.files:
         data = (exported.output_directory / item.name).read_bytes()
         assert hashlib.sha256(data).hexdigest() == item.sha256
+
+
+@pytest.mark.asyncio
+async def test_builder_logs_batch_progress_without_prompt_content(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="cz.synthesis.builder")
+
+    await SynthesisBuilder(
+        _grounding(),
+        "d" * 64,
+        _FakeLLM(),
+        config=SynthesisBuildConfig(maximum_cases_per_batch=2, concurrency=1),
+    ).build()
+
+    assert "batch queued" in caplog.text
+    assert "batch started" in caplog.text
+    assert "batch completed" in caplog.text
+    assert "build progress batches_finished=1/1" in caplog.text
+    assert "INPUT_CONTEXT" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -411,6 +453,58 @@ async def test_litellm_client_uses_structured_response_without_key_in_payload() 
     assert normalize_litellm_endpoint("https://llm.example.test") == (
         "https://llm.example.test/v1/chat/completions"
     )
+
+
+@pytest.mark.asyncio
+async def test_litellm_client_logs_safe_waiting_heartbeats(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="cz.synthesis.transport")
+    client = LiteLLMClient(
+        LiteLLMConfig(
+            endpoint="https://llm.example.test/v1",
+            model="fixture-model",
+            api_key=SecretStr("top-secret"),
+            progress_heartbeat_seconds=0.01,
+        ),
+        transport=_SlowTransport(),
+    )
+
+    await client.complete(
+        system_prompt="private-system-prompt",
+        user_prompt="private-user-prompt",
+        response_model=SynthesisBatchResponse,
+        schema_name="test_schema",
+    )
+
+    assert "model request started" in caplog.text
+    assert "model request waiting" in caplog.text
+    assert "model response received" in caplog.text
+    assert "top-secret" not in caplog.text
+    assert "private-system-prompt" not in caplog.text
+    assert "private-user-prompt" not in caplog.text
+
+
+def test_progress_logger_writes_run_local_file(tmp_path: Path) -> None:
+    progress_path = tmp_path / "progress.log"
+    logger = logging.getLogger("cz.synthesis")
+    try:
+        _configure_progress_logging(progress_path, quiet=True, append=False)
+        logging.getLogger("cz.synthesis.builder").info(
+            "batch completed batch=abc123 elapsed_seconds=1.0"
+        )
+        for handler in logger.handlers:
+            handler.flush()
+
+        content = progress_path.read_text()
+        assert "batch completed batch=abc123" in content
+        assert "INFO" in content
+    finally:
+        for handler in logger.handlers:
+            handler.close()
+        logger.handlers.clear()
+        logger.propagate = True
+        logger.setLevel(logging.NOTSET)
 
 
 @pytest.mark.asyncio

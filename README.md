@@ -472,8 +472,23 @@ export CZ_LITELLM_MODEL="your-proxy-model-name"
 python -m synthesis \
   --run-id portal-baseline \
   --maximum-cases-per-batch 8 \
-  --concurrency 2
+  --concurrency 2 \
+  --progress-interval-seconds 15
 ```
+
+Synthesis prints safe progress to stderr and writes the same events to
+`artifacts/synthesis/<run-id>/progress.log`. It reports queued/active/completed
+batches, periodic heartbeats while an HTTP request is waiting, retry delays,
+validation failures, token usage, and checkpoint counts. It never logs API
+keys, prompts, model response bodies, or testcase payload contents. Follow a
+running job from another terminal with:
+
+```bash
+tail -f "artifacts/synthesis/$RUN_ID/progress.log"
+```
+
+Use `--log-file <path>` to choose another file or `--quiet` to suppress the
+stderr copy while retaining the file log.
 
 Use `--no-api-key` only for a trusted proxy that authenticates outside the
 request. If the selected model cannot accept JSON Schema response formatting,

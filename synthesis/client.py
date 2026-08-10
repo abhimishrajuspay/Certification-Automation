@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import time
 from dataclasses import dataclass
 from typing import Optional, Protocol, Type
 from urllib.error import HTTPError, URLError
@@ -14,6 +16,9 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 from pydantic import BaseModel, SecretStr
 
 from synthesis.models import TokenUsage
+
+
+LOGGER = logging.getLogger("cz.synthesis.transport")
 
 
 class LiteLLMError(RuntimeError):
@@ -45,6 +50,7 @@ class LiteLLMConfig:
     retry_backoff_seconds: float = 1.0
     maximum_output_tokens: int = 16_000
     response_format: str = "json_schema"
+    progress_heartbeat_seconds: float = 15.0
 
     def __post_init__(self) -> None:
         normalized = normalize_litellm_endpoint(self.endpoint)
@@ -59,6 +65,7 @@ class LiteLLMConfig:
             or self.maximum_transport_attempts <= 0
             or self.retry_backoff_seconds < 0
             or self.maximum_output_tokens <= 0
+            or self.progress_heartbeat_seconds <= 0
         ):
             raise ValueError("LiteLLM transport and output limits must be positive")
 
@@ -225,29 +232,129 @@ class LiteLLMClient:
 
         response: Optional[LiteLLMTransportResponse] = None
         for attempt in range(1, self.config.maximum_transport_attempts + 1):
+            started_at = time.monotonic()
+            LOGGER.info(
+                "model request started request=%s attempt=%d/%d model=%s "
+                "timeout_seconds=%.1f max_output_tokens=%d",
+                request_sha256[:12],
+                attempt,
+                self.config.maximum_transport_attempts,
+                self.config.model,
+                self.config.timeout_seconds,
+                self.config.maximum_output_tokens,
+            )
             try:
-                response = await self.transport.post_json(
-                    self.config.endpoint,
+                response = await self._post_with_heartbeat(
                     request_data,
-                    api_key=self.config.api_key,
-                    timeout_seconds=self.config.timeout_seconds,
-                    maximum_response_bytes=self.config.maximum_response_bytes,
+                    request_sha256=request_sha256,
+                    attempt=attempt,
+                    started_at=started_at,
                 )
                 break
-            except LiteLLMRetryableError:
+            except LiteLLMRetryableError as exc:
+                elapsed = time.monotonic() - started_at
                 if attempt >= self.config.maximum_transport_attempts:
+                    LOGGER.error(
+                        "model request failed request=%s attempt=%d/%d "
+                        "elapsed_seconds=%.1f retryable=true error=%s",
+                        request_sha256[:12],
+                        attempt,
+                        self.config.maximum_transport_attempts,
+                        elapsed,
+                        exc,
+                    )
                     raise
-                await asyncio.sleep(self.config.retry_backoff_seconds * attempt)
+                delay = self.config.retry_backoff_seconds * attempt
+                LOGGER.warning(
+                    "model request retrying request=%s attempt=%d/%d "
+                    "elapsed_seconds=%.1f next_attempt_in_seconds=%.1f error=%s",
+                    request_sha256[:12],
+                    attempt,
+                    self.config.maximum_transport_attempts,
+                    elapsed,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+            except LiteLLMError as exc:
+                LOGGER.error(
+                    "model request failed request=%s attempt=%d/%d "
+                    "elapsed_seconds=%.1f retryable=false error=%s",
+                    request_sha256[:12],
+                    attempt,
+                    self.config.maximum_transport_attempts,
+                    time.monotonic() - started_at,
+                    exc,
+                )
+                raise
         if response is None:  # Defensive; retry loop either returns or raises.
             raise LiteLLMTransportError("LiteLLM transport produced no response")
 
-        content = _completion_content(response.payload)
+        try:
+            content = _completion_content(response.payload)
+        except LiteLLMProtocolError as exc:
+            LOGGER.error(
+                "model response rejected request=%s response=%s error=%s",
+                request_sha256[:12],
+                response.response_sha256[:12],
+                exc,
+            )
+            raise
+        usage = _usage(response.payload)
+        LOGGER.info(
+            "model response received request=%s response=%s content_characters=%d "
+            "prompt_tokens=%d completion_tokens=%d total_tokens=%d",
+            request_sha256[:12],
+            response.response_sha256[:12],
+            len(content),
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
+        )
         return LiteLLMCompletion(
             content=content,
             request_sha256=request_sha256,
             response_sha256=response.response_sha256,
-            usage=_usage(response.payload),
+            usage=usage,
         )
+
+    async def _post_with_heartbeat(
+        self,
+        request_data: bytes,
+        *,
+        request_sha256: str,
+        attempt: int,
+        started_at: float,
+    ) -> LiteLLMTransportResponse:
+        task = asyncio.create_task(
+            self.transport.post_json(
+                self.config.endpoint,
+                request_data,
+                api_key=self.config.api_key,
+                timeout_seconds=self.config.timeout_seconds,
+                maximum_response_bytes=self.config.maximum_response_bytes,
+            )
+        )
+        try:
+            while not task.done():
+                done, _ = await asyncio.wait(
+                    {task},
+                    timeout=self.config.progress_heartbeat_seconds,
+                )
+                if not done:
+                    LOGGER.info(
+                        "model request waiting request=%s attempt=%d/%d "
+                        "elapsed_seconds=%.1f",
+                        request_sha256[:12],
+                        attempt,
+                        self.config.maximum_transport_attempts,
+                        time.monotonic() - started_at,
+                    )
+            return await task
+        except BaseException:
+            if not task.done():
+                task.cancel()
+            raise
 
 
 def normalize_litellm_endpoint(value: str) -> str:

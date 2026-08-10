@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
+import sys
+import time
 from typing import Optional, Sequence
 
 from pydantic import SecretStr
@@ -27,6 +30,9 @@ from synthesis.exporter import (
     save_checkpoint,
 )
 from synthesis.models import SynthesisCallRecord, TestCaseExecutionSpec
+
+
+LOGGER = logging.getLogger("cz.synthesis")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -126,6 +132,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="retries for timeouts, rate limits, and server failures",
     )
     parser.add_argument(
+        "--progress-interval-seconds",
+        type=float,
+        default=15.0,
+        help="seconds between safe heartbeat logs while awaiting LiteLLM",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        help=(
+            "safe progress log path (default: "
+            "artifacts/synthesis/<run-id>/progress.log)"
+        ),
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="suppress progress on stderr; progress.log is still written",
+    )
+    parser.add_argument(
         "--output-root",
         type=Path,
         default=Path("artifacts/synthesis"),
@@ -214,6 +239,7 @@ async def _run(args: argparse.Namespace) -> int:
             maximum_transport_attempts=args.maximum_transport_attempts,
             maximum_output_tokens=args.maximum_output_tokens,
             response_format=args.response_format,
+            progress_heartbeat_seconds=args.progress_interval_seconds,
         )
     )
     config = SynthesisBuildConfig(
@@ -241,6 +267,31 @@ async def _run(args: argparse.Namespace) -> int:
                 "--resume or --overwrite explicitly"
             )
 
+    progress_log_path = (
+        args.log_file.expanduser().resolve()
+        if args.log_file is not None
+        else output_directory / "progress.log"
+    )
+    _configure_progress_logging(
+        progress_log_path,
+        quiet=args.quiet,
+        append=args.resume,
+    )
+    LOGGER.info(
+        "synthesis started run_id=%s testcases=%d batches=%d batch_sizes=%s "
+        "model=%s concurrency=%d timeout_seconds=%.1f max_output_tokens=%d "
+        "checkpoint=%s",
+        loaded.grounding.source_run_id,
+        len(loaded.grounding.test_cases),
+        plan.batches,
+        ",".join(str(size) for size in plan.batch_sizes),
+        llm.config.model,
+        config.concurrency,
+        llm.config.timeout_seconds,
+        llm.config.maximum_output_tokens,
+        checkpoint_path,
+    )
+
     initial_specifications = ()
     initial_calls = ()
     if args.resume:
@@ -257,6 +308,12 @@ async def _run(args: argparse.Namespace) -> int:
             raise SynthesisExportError("checkpoint model does not match this command")
         initial_specifications = checkpoint.specifications
         initial_calls = checkpoint.calls
+        LOGGER.info(
+            "checkpoint resumed specifications=%d model_responses=%d errors=%d",
+            len(checkpoint.specifications),
+            len(checkpoint.calls),
+            len(checkpoint.errors),
+        )
     else:
         save_checkpoint(
             checkpoint_path,
@@ -268,13 +325,14 @@ async def _run(args: argparse.Namespace) -> int:
             specifications=(),
             errors=(),
         )
+        LOGGER.info("checkpoint initialized path=%s", checkpoint_path)
 
     def persist_progress(
         specifications: tuple[TestCaseExecutionSpec, ...],
         calls: tuple[SynthesisCallRecord, ...],
         errors: tuple[str, ...],
     ) -> None:
-        save_checkpoint(
+        checkpoint = save_checkpoint(
             checkpoint_path,
             source_run_id=loaded.grounding.source_run_id,
             source_grounding_sha256=loaded.sha256,
@@ -283,6 +341,15 @@ async def _run(args: argparse.Namespace) -> int:
             calls=calls,
             specifications=specifications,
             errors=errors,
+        )
+        LOGGER.info(
+            "checkpoint updated at=%s specifications=%d model_responses=%d "
+            "errors=%d path=%s",
+            checkpoint.updated_at.isoformat(),
+            len(specifications),
+            len(calls),
+            len(errors),
+            checkpoint_path,
         )
 
     package = await SynthesisBuilder(
@@ -301,6 +368,17 @@ async def _run(args: argparse.Namespace) -> int:
         package,
         output_directory,
         overwrite=args.overwrite or args.resume,
+    )
+    LOGGER.info(
+        "synthesis finished synthesized=%d/%d ready=%d needs_review=%d "
+        "blocked=%d failed=%d output=%s",
+        package.coverage.synthesized,
+        package.coverage.test_cases,
+        package.coverage.ready,
+        package.coverage.needs_review,
+        package.coverage.blocked,
+        len(package.coverage.failed_test_case_ids),
+        output.output_directory,
     )
     print(
         json.dumps(
@@ -329,13 +407,52 @@ async def _run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _configure_progress_logging(
+    path: Path,
+    *,
+    quiet: bool,
+    append: bool,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("cz.synthesis")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in logger.handlers:
+        handler.close()
+    logger.handlers.clear()
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)sZ %(levelname)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    formatter.converter = time.gmtime
+    if not quiet:
+        stream_handler = logging.StreamHandler(sys.stderr)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    file_handler = logging.FileHandler(
+        path,
+        mode="a" if append else "w",
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return asyncio.run(_run(args))
     except (SynthesisBuildError, SynthesisExportError, ValueError) as exc:
+        LOGGER.error("synthesis stopped error=%s", exc)
         print(f"cz-synthesize: {exc}")
         return 1
+    except KeyboardInterrupt:
+        LOGGER.warning(
+            "synthesis interrupted; completed checkpoint batches are preserved"
+        )
+        print("cz-synthesize: interrupted; completed checkpoint batches are preserved")
+        return 130
 
 
 def entrypoint() -> None:
