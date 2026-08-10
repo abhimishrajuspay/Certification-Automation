@@ -10,12 +10,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from grounding.models import GroundingSnippet
 from synthesis.models import (
     SynthesisCallRecord,
     SynthesisCheckpoint,
     SynthesisExportManifest,
     SynthesisFile,
     SynthesisPackage,
+    SynthesisStrategy,
+    SynthesisToolObservation,
     TestCaseExecutionSpec,
 )
 
@@ -99,6 +102,9 @@ def save_checkpoint(
     calls: tuple[SynthesisCallRecord, ...],
     specifications: tuple[TestCaseExecutionSpec, ...],
     errors: tuple[str, ...],
+    strategy: SynthesisStrategy = SynthesisStrategy.BULK,
+    retrieved_snippets: tuple[GroundingSnippet, ...] = (),
+    agent_observations: tuple[SynthesisToolObservation, ...] = (),
 ) -> SynthesisCheckpoint:
     """Atomically replace a secret-free checkpoint after a completed batch."""
 
@@ -110,7 +116,10 @@ def save_checkpoint(
         configuration_sha256=configuration_sha256,
         model=model,
         updated_at=datetime.now(timezone.utc),
+        strategy=strategy,
         calls=calls,
+        retrieved_snippets=retrieved_snippets,
+        agent_observations=agent_observations,
         specifications=specifications,
         errors=errors,
     )

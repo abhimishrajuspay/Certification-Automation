@@ -31,6 +31,7 @@ from synthesis.models import (
     SynthesisCoverage,
     SynthesisDisposition,
     SynthesisPackage,
+    SynthesisStrategy,
     TemplateVariableSource,
     TestCaseExecutionSpec,
     synthesis_call_id,
@@ -50,7 +51,7 @@ Rules:
 1. Return exactly one specification for every supplied testcase ID, with no
    additions, omissions, renaming, or dependency changes.
 2. Use only facts supported by the testcase fields, description, and supplied
-   evidence. Cite only snippet IDs listed for that testcase.
+   evidence. Cite only portal state IDs and snippet IDs listed for that testcase.
 3. Never invent an HTTP method, path, payload field, expected result, credential,
    or dependency. If required information is absent or contradictory, mark the
    testcase needs_review or blocked and state each missing requirement.
@@ -503,6 +504,14 @@ class SynthesisBuilder:
             "field_labels": {field.key: field.label for field in case.context.fields},
             "dependency_case_ids": list(case.context.dependency_case_ids),
             "description": case.context.description,
+            "available_portal_evidence_state_ids": list(
+                dict.fromkeys(
+                    (
+                        *case.context.evidence_state_ids,
+                        *case.context.description_state_ids,
+                    )
+                )
+            ),
             "available_evidence_snippet_ids": list(
                 case.repository_snippet_ids + case.mcp_snippet_ids
             ),
@@ -533,10 +542,22 @@ class SynthesisBuilder:
                 raise ValueError(
                     f"{spec.test_case_id} cites unavailable evidence snippet IDs"
                 )
-            if available and not spec.evidence_snippet_ids:
-                raise ValueError(
-                    f"{spec.test_case_id} omitted all available external citations"
+            portal_available = set(
+                (
+                    *source.context.evidence_state_ids,
+                    *source.context.description_state_ids,
                 )
+            )
+            if not set(spec.portal_evidence_state_ids).issubset(portal_available):
+                raise ValueError(
+                    f"{spec.test_case_id} cites unavailable portal state IDs"
+                )
+            if (
+                available
+                and not spec.evidence_snippet_ids
+                and not spec.portal_evidence_state_ids
+            ):
+                raise ValueError(f"{spec.test_case_id} omitted all available citations")
             source_fields = {field.key: field.value for field in source.context.fields}
             for binding in spec.variable_bindings:
                 if binding.source == TemplateVariableSource.PORTAL_FIELD and (
@@ -569,6 +590,16 @@ class SynthesisBuilder:
             if not set(spec.evidence_snippet_ids).issubset(available):
                 raise SynthesisBuildError(
                     f"checkpoint has invalid citations for {spec.test_case_id}"
+                )
+            portal_available = set(
+                (
+                    *source.context.evidence_state_ids,
+                    *source.context.description_state_ids,
+                )
+            )
+            if not set(spec.portal_evidence_state_ids).issubset(portal_available):
+                raise SynthesisBuildError(
+                    f"checkpoint has invalid portal citations for {spec.test_case_id}"
                 )
             source_fields = {field.key: field.value for field in source.context.fields}
             for binding in spec.variable_bindings:
@@ -657,6 +688,7 @@ def synthesis_configuration_sha256(
 
     return _hash_json(
         {
+            "strategy": SynthesisStrategy.BULK.value,
             "prompt_version": PROMPT_VERSION,
             "prompt_sha256": _hash_text(SYSTEM_PROMPT),
             "endpoint": llm.config.endpoint,

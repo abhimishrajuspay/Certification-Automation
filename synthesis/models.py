@@ -13,11 +13,12 @@ from xml.etree import ElementTree
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from grounding.models import GroundingSnippet
 from knowledge.models import SHA256_PATTERN
 
 
-SYNTHESIS_SCHEMA_VERSION = "1.1"
-PROMPT_VERSION = "1.0"
+SYNTHESIS_SCHEMA_VERSION = "1.2"
+PROMPT_VERSION = "2.0"
 _ENVIRONMENT_VALUE = re.compile(r"^\{\{[A-Za-z_][A-Za-z0-9_]*\}\}$")
 _TEMPLATE_VALUE = re.compile(r"\{\{[A-Za-z_][A-Za-z0-9_]*\}\}")
 _SENSITIVE_HEADER_NAMES = {
@@ -87,6 +88,23 @@ class SynthesisDisposition(str, Enum):
     READY = "ready"
     NEEDS_REVIEW = "needs_review"
     BLOCKED = "blocked"
+
+
+class SynthesisStrategy(str, Enum):
+    AGENTIC = "agentic"
+    BULK = "bulk"
+
+
+class SynthesisAgentAction(str, Enum):
+    SEARCH_REPOSITORY = "search_repository"
+    SEARCH_MCP = "search_mcp"
+    READ_EVIDENCE = "read_evidence"
+    FINAL = "final"
+
+
+class SynthesisCallStage(str, Enum):
+    SPECIFICATION = "specification"
+    AGENT_TURN = "agent_turn"
 
 
 class Confidence(str, Enum):
@@ -319,6 +337,7 @@ class TestCaseExecutionSpec(SynthesisModel):
     request: Optional[HTTPRequestSpec] = None
     assertions: tuple[ResponseAssertion, ...] = ()
     variable_bindings: tuple[TemplateVariableBinding, ...] = ()
+    portal_evidence_state_ids: tuple[str, ...] = ()
     evidence_snippet_ids: tuple[str, ...] = ()
     confidence: Confidence
     rationale: str = Field(min_length=1)
@@ -329,6 +348,7 @@ class TestCaseExecutionSpec(SynthesisModel):
     def validate_execution_state(self) -> "TestCaseExecutionSpec":
         for label, values in (
             ("dependency_case_ids", self.dependency_case_ids),
+            ("portal_evidence_state_ids", self.portal_evidence_state_ids),
             ("evidence_snippet_ids", self.evidence_snippet_ids),
             ("unresolved_requirements", self.unresolved_requirements),
         ):
@@ -358,8 +378,8 @@ class TestCaseExecutionSpec(SynthesisModel):
                 raise ValueError(
                     "ready specifications require a request and assertions"
                 )
-            if not self.evidence_snippet_ids:
-                raise ValueError("ready specifications require external citations")
+            if not self.portal_evidence_state_ids and not self.evidence_snippet_ids:
+                raise ValueError("ready specifications require evidence citations")
             if self.unresolved_requirements or self.human_review_required:
                 raise ValueError("ready specifications cannot retain unresolved review")
             unused_bindings = set(binding_names) - used_variables
@@ -424,6 +444,52 @@ class SynthesisBatchResponse(SynthesisModel):
     specifications: tuple[TestCaseExecutionSpec, ...]
 
 
+class SynthesisAgentResponse(SynthesisModel):
+    """Exactly one tool action or final specification from an agent turn."""
+
+    action: SynthesisAgentAction
+    rationale: str = Field(min_length=1, max_length=1_000)
+    query: Optional[str] = Field(default=None, max_length=2_000)
+    tool_name: Optional[str] = Field(default=None, max_length=200)
+    snippet_id: Optional[str] = Field(default=None, pattern=SHA256_PATTERN)
+    specification: Optional[TestCaseExecutionSpec] = None
+
+    @model_validator(mode="after")
+    def validate_action_payload(self) -> "SynthesisAgentResponse":
+        if self.action == SynthesisAgentAction.SEARCH_REPOSITORY:
+            valid = self.query is not None
+        elif self.action == SynthesisAgentAction.SEARCH_MCP:
+            valid = self.query is not None and self.tool_name is not None
+        elif self.action == SynthesisAgentAction.READ_EVIDENCE:
+            valid = self.snippet_id is not None
+        else:
+            valid = self.specification is not None
+        if not valid:
+            raise ValueError(f"{self.action.value} lacks its required payload")
+        if (
+            self.action != SynthesisAgentAction.SEARCH_MCP
+            and self.tool_name is not None
+        ):
+            raise ValueError("tool_name is valid only for search_mcp")
+        if (
+            self.action
+            not in {
+                SynthesisAgentAction.SEARCH_REPOSITORY,
+                SynthesisAgentAction.SEARCH_MCP,
+            }
+            and self.query is not None
+        ):
+            raise ValueError("query is invalid for this action")
+        if (
+            self.action != SynthesisAgentAction.READ_EVIDENCE
+            and self.snippet_id is not None
+        ):
+            raise ValueError("snippet_id is valid only for read_evidence")
+        if self.action != SynthesisAgentAction.FINAL and self.specification is not None:
+            raise ValueError("specification is valid only for final")
+        return self
+
+
 class TokenUsage(SynthesisModel):
     prompt_tokens: int = Field(default=0, ge=0)
     completion_tokens: int = Field(default=0, ge=0)
@@ -445,6 +511,8 @@ class SynthesisCallRecord(SynthesisModel):
     test_case_ids: tuple[str, ...]
     request_sha256: str = Field(pattern=SHA256_PATTERN)
     response_sha256: str = Field(pattern=SHA256_PATTERN)
+    stage: SynthesisCallStage = SynthesisCallStage.SPECIFICATION
+    agent_action: Optional[SynthesisAgentAction] = None
     valid: bool
     validation_error: Optional[str] = None
     usage: TokenUsage = Field(default_factory=TokenUsage)
@@ -459,6 +527,11 @@ class SynthesisCallRecord(SynthesisModel):
             raise ValueError(
                 "valid calls cannot have errors; invalid calls require one"
             )
+        if self.stage == SynthesisCallStage.AGENT_TURN:
+            if self.valid and self.agent_action is None:
+                raise ValueError("valid agent-turn calls require an agent_action")
+        elif self.agent_action is not None:
+            raise ValueError("specification calls cannot have an agent_action")
         expected = _hash_json(
             {
                 "batch_id": self.batch_id,
@@ -469,6 +542,28 @@ class SynthesisCallRecord(SynthesisModel):
         )
         if self.call_id != expected:
             raise ValueError("call_id does not match call evidence")
+        return self
+
+
+class SynthesisToolObservation(SynthesisModel):
+    """Secret-free audit record for one bounded evidence-tool execution."""
+
+    sequence: int = Field(ge=1)
+    test_case_id: str = Field(min_length=1)
+    turn: int = Field(ge=1)
+    action: SynthesisAgentAction
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    result_sha256: str = Field(pattern=SHA256_PATTERN)
+    result_characters: int = Field(ge=0)
+    evidence_snippet_ids: tuple[str, ...] = ()
+    error: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_tool_action(self) -> "SynthesisToolObservation":
+        if self.action == SynthesisAgentAction.FINAL:
+            raise ValueError("final is not an evidence-tool action")
+        if len(self.evidence_snippet_ids) != len(set(self.evidence_snippet_ids)):
+            raise ValueError("tool observation snippet IDs must be unique")
         return self
 
 
@@ -548,8 +643,11 @@ class SynthesisPackage(SynthesisModel):
     source_run_id: str = Field(min_length=1)
     source_grounding_sha256: str = Field(pattern=SHA256_PATTERN)
     synthesized_at: datetime
+    strategy: SynthesisStrategy = SynthesisStrategy.BULK
     provider: LLMProviderSummary
     calls: tuple[SynthesisCallRecord, ...]
+    retrieved_snippets: tuple[GroundingSnippet, ...] = ()
+    agent_observations: tuple[SynthesisToolObservation, ...] = ()
     specifications: tuple[TestCaseExecutionSpec, ...]
     coverage: SynthesisCoverage
 
@@ -568,6 +666,16 @@ class SynthesisPackage(SynthesisModel):
         case_ids = [spec.test_case_id for spec in self.specifications]
         if len(case_ids) != len(set(case_ids)):
             raise ValueError("synthesized testcase specifications must be unique")
+        snippet_ids = [item.snippet_id for item in self.retrieved_snippets]
+        if len(snippet_ids) != len(set(snippet_ids)):
+            raise ValueError("retrieved synthesis snippets must be unique")
+        observation_sequences = [item.sequence for item in self.agent_observations]
+        if observation_sequences != list(range(1, len(observation_sequences) + 1)):
+            raise ValueError("agent observation sequence must be contiguous")
+        if self.strategy == SynthesisStrategy.BULK and (
+            self.retrieved_snippets or self.agent_observations
+        ):
+            raise ValueError("bulk synthesis cannot contain agent tool evidence")
         if self.coverage.synthesized != len(self.specifications):
             raise ValueError("synthesis coverage does not match specifications")
         valid_responses = sum(call.valid for call in self.calls)
@@ -613,7 +721,10 @@ class SynthesisCheckpoint(SynthesisModel):
     configuration_sha256: str = Field(pattern=SHA256_PATTERN)
     model: str = Field(min_length=1)
     updated_at: datetime
+    strategy: SynthesisStrategy = SynthesisStrategy.BULK
     calls: tuple[SynthesisCallRecord, ...] = ()
+    retrieved_snippets: tuple[GroundingSnippet, ...] = ()
+    agent_observations: tuple[SynthesisToolObservation, ...] = ()
     specifications: tuple[TestCaseExecutionSpec, ...] = ()
     errors: tuple[str, ...] = ()
 
@@ -632,6 +743,12 @@ class SynthesisCheckpoint(SynthesisModel):
             raise ValueError("checkpoint call records must be unique")
         if len(case_ids) != len(set(case_ids)):
             raise ValueError("checkpoint specifications must be unique")
+        snippet_ids = [item.snippet_id for item in self.retrieved_snippets]
+        if len(snippet_ids) != len(set(snippet_ids)):
+            raise ValueError("checkpoint retrieved snippets must be unique")
+        observation_sequences = [item.sequence for item in self.agent_observations]
+        if observation_sequences != list(range(1, len(observation_sequences) + 1)):
+            raise ValueError("checkpoint agent observation sequence must be contiguous")
         return self
 
 
@@ -683,13 +800,18 @@ __all__ = [
     "ResponseAssertion",
     "SYNTHESIS_SCHEMA_VERSION",
     "SynthesisBatchResponse",
+    "SynthesisAgentAction",
+    "SynthesisAgentResponse",
     "SynthesisCallRecord",
+    "SynthesisCallStage",
     "SynthesisCheckpoint",
     "SynthesisCoverage",
     "SynthesisDisposition",
     "SynthesisExportManifest",
     "SynthesisFile",
     "SynthesisPackage",
+    "SynthesisStrategy",
+    "SynthesisToolObservation",
     "TemplateVariableBinding",
     "TemplateVariableSource",
     "TestCaseExecutionSpec",

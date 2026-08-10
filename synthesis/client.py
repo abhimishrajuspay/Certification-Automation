@@ -8,6 +8,8 @@ import json
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional, Protocol, Type
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
@@ -32,6 +34,15 @@ class LiteLLMTransportError(LiteLLMError):
 class LiteLLMRetryableError(LiteLLMTransportError):
     """Raised for a transient failure that may safely be retried."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: Optional[float] = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
 
 class LiteLLMProtocolError(LiteLLMError):
     """Raised when a successful response violates the chat-completion contract."""
@@ -47,7 +58,7 @@ class LiteLLMConfig:
     timeout_seconds: float = 90.0
     maximum_response_bytes: int = 8_000_000
     maximum_transport_attempts: int = 3
-    retry_backoff_seconds: float = 1.0
+    retry_backoff_seconds: float = 15.0
     maximum_output_tokens: int = 16_000
     response_format: str = "json_schema"
     progress_heartbeat_seconds: float = 15.0
@@ -168,6 +179,13 @@ class UrllibLiteLLMTransport:
                 if exc.code == 408 or exc.code == 429 or exc.code >= 500
                 else LiteLLMTransportError
             )
+            if error_type is LiteLLMRetryableError:
+                raise error_type(
+                    message,
+                    retry_after_seconds=_retry_after_seconds(
+                        exc.headers.get("Retry-After") if exc.headers else None
+                    ),
+                ) from exc
             raise error_type(message) from exc
         except (TimeoutError, URLError, OSError) as exc:
             raise LiteLLMRetryableError(f"LiteLLM request failed: {exc}") from exc
@@ -264,7 +282,9 @@ class LiteLLMClient:
                         exc,
                     )
                     raise
-                delay = self.config.retry_backoff_seconds * attempt
+                delay = self.config.retry_backoff_seconds * (2 ** (attempt - 1))
+                if exc.retry_after_seconds is not None:
+                    delay = max(delay, exc.retry_after_seconds)
                 LOGGER.warning(
                     "model request retrying request=%s attempt=%d/%d "
                     "elapsed_seconds=%.1f next_attempt_in_seconds=%.1f error=%s",
@@ -436,6 +456,22 @@ def _nonnegative_int(value: object) -> int:
 def _origin(value: str) -> tuple[str, str, Optional[int]]:
     parsed = urlsplit(value)
     return parsed.scheme.casefold(), (parsed.hostname or "").casefold(), parsed.port
+
+
+def _retry_after_seconds(value: Optional[str]) -> Optional[float]:
+    if value is None:
+        return None
+    stripped = value.strip()
+    try:
+        return max(0.0, float(stripped))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(stripped)
+        except (TypeError, ValueError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
 
 
 def _canonical_json(value: object) -> bytes:

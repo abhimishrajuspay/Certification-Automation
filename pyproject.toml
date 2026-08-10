@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cz-certification-automation"
-version = "0.11.2"
+version = "0.12.0"
 description = "Cited CZ portal evidence, LLM synthesis, and Postman generation"
 readme = "README.md"
 requires-python = ">=3.10"

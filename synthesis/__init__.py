@@ -1,5 +1,10 @@
 """Constrained, cited LiteLLM synthesis for CZ testcase execution specs."""
 
+from synthesis.agentic import (
+    AgenticSynthesisBuilder,
+    AgenticSynthesisConfig,
+    SynthesisEvidenceTools,
+)
 from synthesis.builder import (
     LoadedGrounding,
     SynthesisBuildConfig,
@@ -25,14 +30,18 @@ from synthesis.exporter import (
 from synthesis.models import (
     HTTPRequestSpec,
     SynthesisCoverage,
+    SynthesisAgentAction,
     SynthesisDisposition,
     SynthesisPackage,
+    SynthesisStrategy,
     TemplateVariableBinding,
     TemplateVariableSource,
     TestCaseExecutionSpec,
 )
 
 __all__ = [
+    "AgenticSynthesisBuilder",
+    "AgenticSynthesisConfig",
     "HTTPRequestSpec",
     "LiteLLMClient",
     "LiteLLMCompletion",
@@ -43,10 +52,13 @@ __all__ = [
     "SynthesisBuildError",
     "SynthesisBuilder",
     "SynthesisCoverage",
+    "SynthesisAgentAction",
     "SynthesisDisposition",
     "SynthesisExportError",
     "SynthesisExportResult",
     "SynthesisPackage",
+    "SynthesisEvidenceTools",
+    "SynthesisStrategy",
     "TemplateVariableBinding",
     "TemplateVariableSource",
     "TestCaseExecutionSpec",

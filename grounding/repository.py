@@ -43,10 +43,12 @@ DEFAULT_EXCLUDED_DIRECTORIES = (
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
+    ".stack-work",
     ".venv",
     "artifacts",
     "build",
     "dist",
+    "dist-newstyle",
     "dummy-portal",
     "dummy_portal",
     "htmlcov",
@@ -309,6 +311,7 @@ class RepositoryIndex:
         if not query_tokens:
             return ()
         anchor_tokens = frozenset(_tokenize(" ".join(anchor_terms)))
+        anchor_identifiers = frozenset(_identifier_tokens(anchor_terms))
         if anchor_terms:
             required_tokens = anchor_tokens - _GENERIC_RETRIEVAL_TERMS
             if not required_tokens:
@@ -321,6 +324,10 @@ class RepositoryIndex:
         scored: list[tuple[int, str, int, _IndexedDocument]] = []
         for index in candidates:
             document = self._documents[index]
+            if anchor_identifiers and not anchor_identifiers.intersection(
+                document.tokens
+            ):
+                continue
             minimum_required_matches = min(2, len(required_tokens))
             if len(required_tokens & document.tokens) < minimum_required_matches:
                 continue
@@ -394,6 +401,20 @@ def _tokenize(value: str) -> tuple[str, ...]:
             if len(token) >= 2 and token not in _STOPWORDS
         )
     )
+
+
+def _identifier_tokens(values: tuple[str, ...]) -> tuple[str, ...]:
+    """Return exact compound identifiers that should anchor retrieval."""
+
+    identifiers: list[str] = []
+    for value in values:
+        stripped = value.strip()
+        if not stripped or any(character.isspace() for character in stripped):
+            continue
+        normalized = re.sub(r"[^A-Za-z0-9]", "", stripped).casefold()
+        if len(normalized) >= 3 and normalized not in _GENERIC_RETRIEVAL_TERMS:
+            identifiers.append(normalized)
+    return tuple(dict.fromkeys(identifiers))
 
 
 def _hash_json(value: object) -> str:

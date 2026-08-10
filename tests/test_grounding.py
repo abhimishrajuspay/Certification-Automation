@@ -250,6 +250,38 @@ def test_repository_index_is_bounded_cited_and_secret_safe(tmp_path: Path) -> No
         GroundingSnippet.model_validate(tampered)
 
 
+def test_repository_index_excludes_generated_build_trees_and_requires_api_anchor(
+    tmp_path: Path,
+) -> None:
+    repository_root = tmp_path / "newton"
+    generated = repository_root / "dist-newstyle" / "generated"
+    generated.mkdir(parents=True)
+    (generated / "aws.json").write_text(
+        '{"description":"session registration request response payload"}'
+    )
+    docs = repository_root / "docs"
+    docs.mkdir()
+    (docs / "unrelated.md").write_text(
+        "This discusses session registration request response handling."
+    )
+    (docs / "sdk.md").write_text(
+        "SdkSessionReg calls SessionRegistration at /merchantSDK/getSessionToken."
+    )
+
+    repository = RepositoryIndex.build(repository_root)
+    matches = repository.search(
+        "SdkSessionReg SessionRegistration request response payload",
+        limit=5,
+        anchor_terms=("SdkSessionReg", "SessionRegistration"),
+    )
+
+    assert repository.summary.files_indexed == 2
+    assert matches
+    assert [
+        item.repository.path for item in matches if item.repository is not None
+    ] == ["docs/sdk.md"]
+
+
 @pytest.mark.asyncio
 async def test_mcp_client_discovers_allowlists_and_cites_results() -> None:
     transport = _FakeMCPTransport()

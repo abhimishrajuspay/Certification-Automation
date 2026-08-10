@@ -72,7 +72,8 @@ grounding/
 synthesis/
   models.py          # Strict HTTP request, assertion, review, and audit models
   client.py          # Bounded OpenAI-compatible LiteLLM proxy client
-  builder.py         # Semantic batching, prompting, retries, and citation checks
+  agentic.py         # Per-testcase search/read/final evidence tool loop
+  builder.py         # Legacy semantic batching and citation checks
   exporter.py        # Atomic audit/JSONL export and resumable checkpoints
   cli.py             # Grounding-to-execution-spec command
   __main__.py        # python -m synthesis entrypoint
@@ -467,21 +468,48 @@ to an artifact:
 ```bash
 export CZ_LITELLM_URL="https://litellm.example.test"
 export CZ_LITELLM_MODEL="your-proxy-model-name"
+export CZ_MCP_URL="http://10.200.3.108:8000/mcp"
 # Inject CZ_LITELLM_API_KEY with your shell or secret manager.
 
 python -m synthesis \
   --run-id portal-baseline \
-  --maximum-cases-per-batch 8 \
-  --concurrency 2 \
+  --strategy agentic \
+  --repo-path /path/to/integration-repository \
+  --mcp-tool search_docs \
+  --concurrency 1 \
+  --maximum-agent-turns 6 \
+  --maximum-output-tokens 8000 \
+  --timeout-seconds 600 \
+  --maximum-transport-attempts 2 \
+  --retry-backoff-seconds 30 \
   --progress-interval-seconds 15
 ```
 
+Agentic synthesis is the default. Each model turn starts with exactly one
+testcase's portal fields, description, dependency IDs, and state citations. The
+model may immediately return the final specification when those facts are
+sufficient. Otherwise it chooses one bounded action: `search_repository`,
+`search_mcp`, or `read_evidence`. Searches return metadata plus short previews;
+the model must explicitly read a result before its content can enter context or
+its snippet ID can be cited. Retrieved content is capped at 2,000 characters by
+default. Generated build trees such as `dist-newstyle`, caches, artifacts,
+virtual environments, and package dependencies are excluded from repository
+indexing.
+
+The legacy eager batching implementation remains available only through
+`--strategy bulk --maximum-cases-per-batch <n>`. Bulk mode unions all selected
+snippet contents into each request and is not recommended for large grounding
+packages.
+
 Synthesis prints safe progress to stderr and writes the same events to
-`artifacts/synthesis/<run-id>/progress.log`. It reports queued/active/completed
-batches, periodic heartbeats while an HTTP request is waiting, retry delays,
-validation failures, token usage, and checkpoint counts. It never logs API
-keys, prompts, model response bodies, or testcase payload contents. Follow a
-running job from another terminal with:
+`artifacts/synthesis/<run-id>/progress.log`. It reports active testcases, agent
+turns, selected tool actions, bounded result sizes, periodic heartbeats while an
+HTTP request is waiting, retry delays, validation failures, token usage, and
+checkpoint counts. HTTP 429 responses honor `Retry-After` and exponential
+backoff; an exhausted 429 opens a circuit so queued testcases do not continue
+bombarding the provider. Logs never contain API keys, prompts, model response
+bodies, or testcase payload contents. Follow a running job from another terminal
+with:
 
 ```bash
 tail -f "artifacts/synthesis/$RUN_ID/progress.log"
@@ -494,7 +522,7 @@ Use `--no-api-key` only for a trusted proxy that authenticates outside the
 request. If the selected model cannot accept JSON Schema response formatting,
 use `--response-format json_object`; the same Pydantic validation still applies
 after the response. A stopped or partially failed run can continue without
-repeating completed batches:
+repeating completed testcases:
 
 ```bash
 python -m synthesis --run-id portal-baseline --resume
@@ -506,7 +534,8 @@ The default output under `artifacts/synthesis/<run-id>/` contains:
   validation history, token totals, coverage, and every execution spec;
 - `execution_specs.jsonl`, one strict request/assertion specification per
   successfully synthesized testcase;
-- `checkpoint.json`, atomically updated after each completed batch; and
+- `checkpoint.json`, atomically updated after each completed testcase, including
+  retrieved snippet citations and secret-free tool observations; and
 - `manifest.json`, with final output hashes and separate `synthesis_complete`
   and `execution_ready` gates.
 
@@ -519,11 +548,13 @@ portal-field, cited-literal, generated, or dependency binding; copied portal
 values are checked against the Phase 8 input. Raw model responses and prompts
 are deliberately not persisted.
 
-The LLM—not MCP—makes these decisions. Phase 8 MCP tools only retrieve cited
-documentation. Phase 9 sends portal facts plus those excerpts to the configured
-LiteLLM model, which proposes the HTTP method/path, payload, typed variables,
-assertions, confidence, and ready/review/blocked disposition. Local validators
-reject unsupported or invented output before anything reaches Postman.
+The LLM—not MCP—makes these decisions. Phase 8 provides a cited candidate
+catalog. Phase 9 lets the LLM inspect portal facts first and invoke bounded live
+repository/MCP tools only for missing requirements. It proposes the HTTP
+method/path, payload, typed variables, assertions, confidence, and
+ready/review/blocked disposition. Local validators reject changed IDs or
+dependencies, unread external citations, unknown portal states, unsupported
+bindings, and invented output before anything reaches Postman.
 
 ## Reviewed repository remediation
 

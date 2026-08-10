@@ -22,6 +22,7 @@ from grounding.models import (
     RepositoryCitation,
     RepositoryIndexSummary,
 )
+from grounding.repository import RepositoryIndex, RepositoryIndexConfig
 from knowledge.models import KnowledgeField
 from synthesis.builder import (
     SynthesisBuildConfig,
@@ -29,11 +30,17 @@ from synthesis.builder import (
     SynthesisBuilder,
     load_grounding,
 )
+from synthesis.agentic import (
+    AgenticSynthesisBuilder,
+    AgenticSynthesisConfig,
+    SynthesisEvidenceTools,
+)
 from synthesis.cli import _configure_progress_logging, main as synthesis_main
 from synthesis.client import (
     LiteLLMClient,
     LiteLLMCompletion,
     LiteLLMConfig,
+    LiteLLMRetryableError,
     LiteLLMTransportResponse,
     normalize_litellm_endpoint,
 )
@@ -50,7 +57,11 @@ from synthesis.models import (
     RequestBodySpec,
     ResponseAssertion,
     SynthesisBatchResponse,
+    SynthesisAgentAction,
+    SynthesisAgentResponse,
     SynthesisDisposition,
+    SynthesisStrategy,
+    SynthesisToolObservation,
     TemplateVariableBinding,
     TemplateVariableSource,
     TestCaseExecutionSpec as ExecutionSpec,
@@ -280,6 +291,40 @@ class _FakeTransport:
         )
 
 
+class _AgentLLM:
+    def __init__(self, responses: list[SynthesisAgentResponse]) -> None:
+        self._config = LiteLLMConfig(
+            endpoint="https://llm.example.test",
+            model="fixture-agent-model",
+            response_format="json_schema",
+        )
+        self.responses = responses
+        self.prompts: list[str] = []
+
+    @property
+    def config(self) -> LiteLLMConfig:
+        return self._config
+
+    async def complete(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: Type[BaseModel],
+        schema_name: str,
+    ) -> LiteLLMCompletion:
+        del system_prompt, response_model, schema_name
+        self.prompts.append(user_prompt)
+        response = self.responses[len(self.prompts) - 1]
+        content = response.model_dump_json()
+        return LiteLLMCompletion(
+            content=content,
+            request_sha256=hashlib.sha256(user_prompt.encode()).hexdigest(),
+            response_sha256=hashlib.sha256(content.encode()).hexdigest(),
+            usage=TokenUsage(prompt_tokens=20, completion_tokens=10, total_tokens=30),
+        )
+
+
 class _SlowTransport(_FakeTransport):
     async def post_json(
         self,
@@ -298,6 +343,31 @@ class _SlowTransport(_FakeTransport):
             timeout_seconds=timeout_seconds,
             maximum_response_bytes=maximum_response_bytes,
         )
+
+
+class _RateLimitedLLM:
+    def __init__(self) -> None:
+        self._config = LiteLLMConfig(
+            endpoint="https://llm.example.test",
+            model="fixture-agent-model",
+        )
+        self.calls = 0
+
+    @property
+    def config(self) -> LiteLLMConfig:
+        return self._config
+
+    async def complete(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: Type[BaseModel],
+        schema_name: str,
+    ) -> LiteLLMCompletion:
+        del system_prompt, user_prompt, response_model, schema_name
+        self.calls += 1
+        raise LiteLLMRetryableError("LiteLLM HTTP 429")
 
 
 def test_request_models_reject_unsafe_or_invalid_ready_specs() -> None:
@@ -319,6 +389,238 @@ def test_request_models_reject_unsafe_or_invalid_ready_specs() -> None:
             dependency_case_id="TC_PARENT",
             description="Missing extraction source is rejected",
         )
+
+
+def _portal_ready_spec(case_id: str, state_id: str) -> ExecutionSpec:
+    grounding = _grounding()
+    source_case = next(
+        case for case in grounding.test_cases if case.context.test_case_id == case_id
+    )
+    data = _ready_spec(
+        {
+            "test_case_id": case_id,
+            "dependency_case_ids": list(source_case.context.dependency_case_ids),
+            "available_evidence_snippet_ids": [grounding.snippets[0].snippet_id],
+        }
+    ).model_dump(mode="python")
+    data["portal_evidence_state_ids"] = (state_id,)
+    data["evidence_snippet_ids"] = ()
+    return ExecutionSpec.model_validate(data)
+
+
+@pytest.mark.asyncio
+async def test_agentic_synthesis_finishes_from_portal_facts_without_tools() -> None:
+    grounding = _grounding()
+    specification = _portal_ready_spec("TC_01", "state-1")
+    llm = _AgentLLM(
+        [
+            SynthesisAgentResponse(
+                action=SynthesisAgentAction.FINAL,
+                rationale="Portal facts contain the complete request and assertions",
+                specification=specification,
+            )
+        ]
+    )
+    tools = SynthesisEvidenceTools(grounding)
+
+    package = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        tools,
+        config=AgenticSynthesisConfig(maximum_turns_per_case=2),
+    ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    assert package.strategy == SynthesisStrategy.AGENTIC
+    assert package.coverage.synthesis_complete is True
+    assert package.agent_observations == ()
+    assert package.retrieved_snippets == ()
+    assert len(package.calls) == 1
+    assert len(llm.prompts) == 1
+    assert len(llm.prompts[0]) < 10_000
+
+
+@pytest.mark.asyncio
+async def test_agentic_synthesis_searches_then_reads_bounded_evidence(
+    tmp_path: Path,
+) -> None:
+    repository_root = tmp_path / "repository"
+    docs = repository_root / "docs"
+    docs.mkdir(parents=True)
+    content = (
+        "BillFetchRequest POST /bill/fetch accepts requestId. "
+        + ("supporting-context " * 30)
+        + "TAIL_ASSERTION HTTP 200"
+    )
+    (docs / "BillFetchRequest.md").write_text(content)
+    repository = RepositoryIndex.build(
+        repository_root,
+        RepositoryIndexConfig(maximum_excerpt_characters=2_000),
+    )
+    live_snippet = repository.search(
+        "BillFetchRequest requestId endpoint",
+        limit=1,
+        anchor_terms=("BillFetchRequest",),
+    )[0]
+    case = {
+        "test_case_id": "TC_01",
+        "dependency_case_ids": [],
+        "available_evidence_snippet_ids": [live_snippet.snippet_id],
+    }
+    llm = _AgentLLM(
+        [
+            SynthesisAgentResponse(
+                action=SynthesisAgentAction.SEARCH_REPOSITORY,
+                rationale="Find the exact API contract",
+                query="BillFetchRequest requestId endpoint",
+            ),
+            SynthesisAgentResponse(
+                action=SynthesisAgentAction.READ_EVIDENCE,
+                rationale="Read the matching API contract",
+                snippet_id=live_snippet.snippet_id,
+            ),
+            SynthesisAgentResponse(
+                action=SynthesisAgentAction.FINAL,
+                rationale="The read contract supports the execution specification",
+                specification=_ready_spec(case),
+            ),
+        ]
+    )
+    grounding = _grounding()
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(
+            maximum_turns_per_case=4,
+            evidence_preview_characters=120,
+            maximum_evidence_characters=2_000,
+        ),
+    )
+
+    package = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        tools,
+        config=tools.config,
+    ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    assert [item.action for item in package.agent_observations] == [
+        SynthesisAgentAction.SEARCH_REPOSITORY,
+        SynthesisAgentAction.READ_EVIDENCE,
+    ]
+    assert package.specifications[0].evidence_snippet_ids == (live_snippet.snippet_id,)
+    assert [item.snippet_id for item in package.retrieved_snippets] == [
+        live_snippet.snippet_id
+    ]
+    assert "TAIL_ASSERTION" not in llm.prompts[1]
+    assert "TAIL_ASSERTION" in llm.prompts[2]
+    assert max(map(len, llm.prompts)) < 15_000
+
+
+@pytest.mark.asyncio
+async def test_agent_rejects_unread_external_citation_then_self_corrects() -> None:
+    grounding = _grounding()
+    unread = grounding.snippets[0].snippet_id
+    invalid_case = {
+        "test_case_id": "TC_01",
+        "dependency_case_ids": [],
+        "available_evidence_snippet_ids": [unread],
+    }
+    llm = _AgentLLM(
+        [
+            SynthesisAgentResponse(
+                action=SynthesisAgentAction.FINAL,
+                rationale="Attempt an unread citation",
+                specification=_ready_spec(invalid_case),
+            ),
+            SynthesisAgentResponse(
+                action=SynthesisAgentAction.FINAL,
+                rationale="Use the directly observed portal evidence",
+                specification=_portal_ready_spec("TC_01", "state-1"),
+            ),
+        ]
+    )
+
+    package = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        SynthesisEvidenceTools(grounding),
+        config=AgenticSynthesisConfig(maximum_turns_per_case=2),
+    ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    assert package.coverage.synthesis_complete is True
+    assert [item.valid for item in package.calls] == [False, True]
+    assert "evidence that was not read" in llm.prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_agent_rejects_resumed_specification_with_unread_evidence() -> None:
+    grounding = _grounding()
+    snippet = grounding.snippets[0]
+    case = {
+        "test_case_id": "TC_01",
+        "dependency_case_ids": [],
+        "available_evidence_snippet_ids": [snippet.snippet_id],
+    }
+
+    with pytest.raises(ValueError, match="evidence that was not read"):
+        await AgenticSynthesisBuilder(
+            grounding,
+            "d" * 64,
+            _AgentLLM([]),
+            SynthesisEvidenceTools(grounding),
+        ).build(
+            initial_specifications=(_ready_spec(case),),
+            initial_retrieved_snippets=(snippet,),
+            initial_observations=(),
+        )
+
+    read_observation = SynthesisToolObservation(
+        sequence=1,
+        test_case_id="TC_01",
+        turn=1,
+        action=SynthesisAgentAction.READ_EVIDENCE,
+        request_sha256="a" * 64,
+        result_sha256="b" * 64,
+        result_characters=len(snippet.content),
+        evidence_snippet_ids=(snippet.snippet_id,),
+    )
+    resumed = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        _AgentLLM([]),
+        SynthesisEvidenceTools(grounding),
+    ).build(
+        initial_specifications=(
+            _ready_spec(case),
+            _portal_ready_spec("TC_02", "state-2"),
+        ),
+        initial_retrieved_snippets=(snippet,),
+        initial_observations=(read_observation,),
+    )
+
+    assert resumed.coverage.synthesis_complete is True
+    assert resumed.agent_observations == (read_observation,)
+
+
+@pytest.mark.asyncio
+async def test_agent_opens_provider_circuit_after_rate_limit() -> None:
+    grounding = _grounding()
+    llm = _RateLimitedLLM()
+
+    package = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        SynthesisEvidenceTools(grounding),
+        config=AgenticSynthesisConfig(concurrency=1, maximum_turns_per_case=2),
+    ).build()
+
+    assert llm.calls == 1
+    assert package.coverage.synthesized == 0
+    assert any("provider circuit opened" in error for error in package.provider.errors)
 
 
 @pytest.mark.asyncio
@@ -420,6 +722,44 @@ def test_checkpoint_is_validated_and_secret_free(tmp_path: Path) -> None:
 
     assert load_checkpoint(checkpoint_path) == saved
     assert "top-secret" not in checkpoint_path.read_text().casefold()
+
+
+def test_agentic_checkpoint_preserves_retrieved_evidence_and_observations(
+    tmp_path: Path,
+) -> None:
+    grounding = _grounding()
+    snippet = grounding.snippets[0]
+    observation = SynthesisToolObservation(
+        sequence=1,
+        test_case_id="TC_01",
+        turn=1,
+        action=SynthesisAgentAction.READ_EVIDENCE,
+        request_sha256="a" * 64,
+        result_sha256="b" * 64,
+        result_characters=len(snippet.content),
+        evidence_snippet_ids=(snippet.snippet_id,),
+    )
+    checkpoint_path = tmp_path / "agentic-checkpoint.json"
+
+    saved = save_checkpoint(
+        checkpoint_path,
+        source_run_id="fixture-run",
+        source_grounding_sha256="d" * 64,
+        configuration_sha256="e" * 64,
+        model="fixture-model",
+        strategy=SynthesisStrategy.AGENTIC,
+        calls=(),
+        retrieved_snippets=(snippet,),
+        agent_observations=(observation,),
+        specifications=(_portal_ready_spec("TC_01", "state-1"),),
+        errors=(),
+    )
+
+    loaded = load_checkpoint(checkpoint_path)
+    assert loaded == saved
+    assert loaded.strategy == SynthesisStrategy.AGENTIC
+    assert loaded.retrieved_snippets == (snippet,)
+    assert loaded.agent_observations == (observation,)
 
 
 @pytest.mark.asyncio
