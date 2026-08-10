@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -73,6 +74,28 @@ def load_checkpoint(path: Path) -> CampaignCheckpoint:
         raise CampaignIOError(f"invalid campaign checkpoint: {exc}") from exc
 
 
+def archive_checkpoint_attempt(
+    checkpoint_path: Path,
+    progress_path: Path,
+) -> Path:
+    """Archive one resumable attempt exactly once using its content digest."""
+
+    source = checkpoint_path.expanduser().resolve()
+    if not source.is_file():
+        raise CampaignIOError(f"campaign checkpoint does not exist: {source}")
+    checkpoint_bytes = source.read_bytes()
+    digest = hashlib.sha256(checkpoint_bytes).hexdigest()[:16]
+    destination = source.parent / "history" / digest
+    archived_checkpoint = destination / "checkpoint.json"
+    if not archived_checkpoint.exists():
+        _atomic_write(archived_checkpoint, checkpoint_bytes)
+    progress = progress_path.expanduser().resolve()
+    archived_progress = destination / "progress.log"
+    if progress.is_file() and not archived_progress.exists():
+        _atomic_write(archived_progress, progress.read_bytes())
+    return destination
+
+
 def export_apply_report(
     report: RemediationApplyReport,
     path: Path,
@@ -116,6 +139,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 __all__ = [
     "CampaignIOError",
+    "archive_checkpoint_attempt",
     "export_apply_report",
     "export_plan",
     "export_support_matrix",

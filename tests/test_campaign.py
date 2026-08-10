@@ -10,13 +10,24 @@ from typing import Type
 import pytest
 from pydantic import BaseModel
 
-from campaign.builder import CertificationCampaignAgent, campaign_groups
+from campaign.builder import (
+    CampaignBuildConfig,
+    CampaignBuildError,
+    CertificationCampaignAgent,
+    _legacy_campaign_configuration_sha256,
+    campaign_groups,
+)
+from campaign.io import archive_checkpoint_attempt
 from campaign.models import (
     CampaignAction,
     CampaignAgentResponse,
     CampaignAssessment,
+    CampaignCallRecord,
+    CampaignCheckpoint,
     CampaignConclusion,
+    CampaignPhase,
     CampaignPlan,
+    CampaignToolObservation,
     CaseSupportStatus,
     campaign_plan_id,
 )
@@ -35,7 +46,7 @@ from grounding.models import (
 from knowledge.models import KnowledgeField
 from remediation.models import FileOperation, RepositoryFileChange
 from remediation.workspace import RepositoryWorkspaceError
-from synthesis.client import LiteLLMCompletion, LiteLLMConfig
+from synthesis.client import LiteLLMClient, LiteLLMCompletion, LiteLLMConfig
 from synthesis.models import TokenUsage
 
 
@@ -239,6 +250,40 @@ class _CampaignLLM:
         )
 
 
+class _ControlledLLM:
+    def __init__(self, responses: list[CampaignAgentResponse]) -> None:
+        self._config = LiteLLMConfig(
+            endpoint="https://llm.example.test",
+            model="fixture-model",
+            response_format="json_schema",
+        )
+        self.responses = responses
+        self.prompts: list[str] = []
+
+    @property
+    def config(self) -> LiteLLMConfig:
+        return self._config
+
+    async def complete(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: Type[BaseModel],
+        schema_name: str,
+    ) -> LiteLLMCompletion:
+        del system_prompt, response_model, schema_name
+        self.prompts.append(user_prompt)
+        response = self.responses.pop(0)
+        payload = response.model_dump_json()
+        return LiteLLMCompletion(
+            content=payload,
+            request_sha256=_sha(user_prompt),
+            response_sha256=_sha(payload),
+            usage=TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        )
+
+
 @pytest.mark.asyncio
 async def test_campaign_reads_lazily_and_builds_one_shared_change(
     tmp_path: Path,
@@ -274,6 +319,205 @@ async def test_campaign_reads_lazily_and_builds_one_shared_change(
     assert (repository / "service.py").read_text() == source
 
 
+@pytest.mark.asyncio
+async def test_campaign_forces_assessment_after_bounded_discovery(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "service.py").write_text("def bill_fetch():\n    return None\n")
+    grounding = _grounding()
+    group = campaign_groups(grounding.test_cases)[0]
+    assessments = tuple(
+        CampaignAssessment(
+            test_case_id=case.context.test_case_id,
+            status=CaseSupportStatus.SUPPORTED_AS_IS,
+            rationale="The repository search confirms the shared handler",
+            required_capabilities=("bill fetch handler",),
+            portal_evidence_state_ids=case.context.evidence_state_ids,
+        )
+        for case in grounding.test_cases
+    )
+    llm = _ControlledLLM(
+        [
+            CampaignAgentResponse(
+                action=CampaignAction.READ_TEST_CASES,
+                group_id=group.group_id,
+                test_case_ids=("TC_01", "TC_02"),
+            ),
+            CampaignAgentResponse(
+                action=CampaignAction.SEARCH_REPOSITORY,
+                query="bill fetch handler",
+            ),
+            CampaignAgentResponse(
+                action=CampaignAction.SEARCH_REPOSITORY,
+                query="bill fetch response code",
+            ),
+            CampaignAgentResponse(
+                action=CampaignAction.RECORD_ASSESSMENTS,
+                assessments=assessments,
+            ),
+            CampaignAgentResponse(
+                action=CampaignAction.FINAL,
+                conclusion=CampaignConclusion(summary="All cases are supported"),
+            ),
+        ]
+    )
+
+    plan = await CertificationCampaignAgent(
+        grounding=grounding,
+        grounding_sha256="d" * 64,
+        workspace=CampaignWorkspace(repository),
+        llm=llm,
+        objective="Assess support",
+        config=CampaignBuildConfig(maximum_discovery_actions_per_group=2),
+    ).build()
+
+    assert len(plan.assessments) == 2
+    assert '"phase":"assess"' in llm.prompts[3]
+    assert '"required_action":"record_assessments"' in llm.prompts[3]
+    assert len(plan.calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_campaign_stops_repeated_no_progress_actions(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    grounding = _grounding()
+    group = campaign_groups(grounding.test_cases)[0]
+    read_cases = CampaignAgentResponse(
+        action=CampaignAction.READ_TEST_CASES,
+        group_id=group.group_id,
+        test_case_ids=("TC_01", "TC_02"),
+    )
+    repeated_search = CampaignAgentResponse(
+        action=CampaignAction.SEARCH_REPOSITORY,
+        query="bill fetch handler",
+    )
+    llm = _ControlledLLM([read_cases, *([repeated_search] * 4)])
+    checkpoints: list[CampaignCheckpoint] = []
+
+    with pytest.raises(CampaignBuildError, match="3 consecutive no-progress"):
+        await CertificationCampaignAgent(
+            grounding=grounding,
+            grounding_sha256="d" * 64,
+            workspace=CampaignWorkspace(repository),
+            llm=llm,
+            objective="Assess support",
+            config=CampaignBuildConfig(maximum_no_progress_turns=3),
+        ).build(progress=checkpoints.append)
+
+    assert len(llm.prompts) == 5
+    assert checkpoints[-1].no_progress_turns == 3
+    assert checkpoints[-1].phase == CampaignPhase.DISCOVER
+    assert any(
+        "duplicate campaign action rejected" in item for item in checkpoints[-1].errors
+    )
+    assert checkpoints[-1].errors[-1].startswith("campaign stopped after 3")
+
+
+@pytest.mark.asyncio
+async def test_legacy_loop_checkpoint_recovers_directly_into_assessment(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source = "def bill_fetch():\n    return {'responseCode': '000'}\n"
+    (repository / "service.py").write_text(source)
+    grounding = _grounding()
+    selected = tuple(item.context.test_case_id for item in grounding.test_cases)
+    workspace = CampaignWorkspace(repository)
+    config = CampaignBuildConfig()
+    llm_config = LiteLLMConfig(
+        endpoint="https://llm.example.test",
+        model="fixture-model",
+        response_format="json_schema",
+    )
+    legacy_llm = LiteLLMClient(llm_config)
+    objective = "Assess support"
+    legacy_hash = _legacy_campaign_configuration_sha256(
+        objective,
+        selected,
+        config,
+        legacy_llm,
+    )
+    calls = tuple(
+        CampaignCallRecord(
+            turn=index,
+            action=CampaignAction.SEARCH_REPOSITORY,
+            request_sha256=_sha(f"request-{index}"),
+            response_sha256=_sha(f"response-{index}"),
+            valid=True,
+        )
+        for index in range(1, 13)
+    )
+    observations = tuple(
+        CampaignToolObservation(
+            sequence=index,
+            turn=index,
+            action=CampaignAction.SEARCH_REPOSITORY,
+            request=f"query-{index}",
+            result_sha256=_sha(f"result-{index}"),
+            result_characters=10,
+        )
+        for index in range(1, 13)
+    )
+    checkpoint = CampaignCheckpoint(
+        source_run_id=grounding.source_run_id,
+        source_grounding_sha256="d" * 64,
+        repository_id=workspace.repository_id,
+        configuration_sha256=legacy_hash,
+        model="fixture-model",
+        objective=objective,
+        updated_at="2026-08-10T00:00:00Z",
+        selected_test_case_ids=selected,
+        read_test_case_ids=selected,
+        read_repository_paths=("service.py",),
+        calls=calls,
+        observations=observations,
+    )
+    assessments = tuple(
+        CampaignAssessment(
+            test_case_id=case.context.test_case_id,
+            status=CaseSupportStatus.SUPPORTED_AS_IS,
+            rationale="The existing shared handler supports this case",
+            required_capabilities=("bill fetch handler",),
+            repository_paths=("service.py",),
+            portal_evidence_state_ids=case.context.evidence_state_ids,
+        )
+        for case in grounding.test_cases
+    )
+    llm = _ControlledLLM(
+        [
+            CampaignAgentResponse(
+                action=CampaignAction.RECORD_ASSESSMENTS,
+                assessments=assessments,
+            ),
+            CampaignAgentResponse(
+                action=CampaignAction.FINAL,
+                conclusion=CampaignConclusion(summary="Recovered campaign"),
+            ),
+        ]
+    )
+
+    plan = await CertificationCampaignAgent(
+        grounding=grounding,
+        grounding_sha256="d" * 64,
+        workspace=workspace,
+        llm=llm,
+        objective=objective,
+        config=config,
+    ).build(initial=checkpoint)
+
+    assert '"phase":"assess"' in llm.prompts[0]
+    assert '"required_action":"record_assessments"' in llm.prompts[0]
+    assert "def bill_fetch" in llm.prompts[0]
+    assert len(plan.assessments) == 2
+    assert len(plan.calls) == 14
+
+
 def test_campaign_workspace_stages_without_mutating_and_rejects_stale_hash(
     tmp_path: Path,
 ) -> None:
@@ -302,6 +546,22 @@ def test_campaign_workspace_stages_without_mutating_and_rejects_stale_hash(
     stale_workspace.read_file("settings.py")
     with pytest.raises(RepositoryWorkspaceError, match="digest is stale"):
         stale_workspace.stage(change.model_copy(update={"expected_sha256": "0" * 64}))
+
+
+def test_campaign_resume_archive_is_content_addressed_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "checkpoint.json"
+    progress = tmp_path / "progress.log"
+    checkpoint.write_text('{"saved":true}\n')
+    progress.write_text("one completed turn\n")
+
+    first = archive_checkpoint_attempt(checkpoint, progress)
+    second = archive_checkpoint_attempt(checkpoint, progress)
+
+    assert first == second
+    assert (first / "checkpoint.json").read_bytes() == checkpoint.read_bytes()
+    assert (first / "progress.log").read_bytes() == progress.read_bytes()
 
 
 @pytest.mark.asyncio

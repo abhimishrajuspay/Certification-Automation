@@ -22,6 +22,7 @@ from campaign.builder import (
 )
 from campaign.io import (
     CampaignIOError,
+    archive_checkpoint_attempt,
     export_apply_report,
     export_plan,
     export_support_matrix,
@@ -91,6 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="allowlisted read-only MCP search tool; repeatable",
     )
     plan.add_argument("--maximum-turns", type=int, default=160)
+    plan.add_argument("--assessment-batch-size", type=int, default=6)
+    plan.add_argument(
+        "--maximum-discovery-actions-per-group",
+        type=int,
+        default=12,
+    )
+    plan.add_argument("--maximum-change-actions", type=int, default=12)
+    plan.add_argument("--maximum-no-progress-turns", type=int, default=3)
     plan.add_argument("--maximum-output-tokens", type=int, default=20_000)
     plan.add_argument("--timeout-seconds", type=float, default=180.0)
     plan.add_argument("--maximum-transport-attempts", type=int, default=3)
@@ -174,7 +183,15 @@ async def _plan(args: argparse.Namespace) -> int:
     plan_path = output_directory / "plan.json"
     matrix_path = output_directory / "support_matrix.jsonl"
     progress_path = output_directory / "progress.log"
+    initial = load_checkpoint(checkpoint_path) if args.resume else None
+    archived_attempt = (
+        archive_checkpoint_attempt(checkpoint_path, progress_path)
+        if initial is not None
+        else None
+    )
     _configure_logging(progress_path)
+    if archived_attempt is not None:
+        LOGGER.info("campaign attempt archived path=%s", archived_attempt)
 
     allowed_tools = tuple(args.mcp_tool) or DEFAULT_READ_ONLY_TOOLS
     mcp = (
@@ -199,7 +216,6 @@ async def _plan(args: argparse.Namespace) -> int:
             response_format=args.response_format,
         )
     )
-    initial = load_checkpoint(checkpoint_path) if args.resume else None
     if not args.resume and checkpoint_path.exists() and not args.overwrite:
         raise CampaignIOError(
             "campaign checkpoint already exists; use --resume or --overwrite"
@@ -212,7 +228,15 @@ async def _plan(args: argparse.Namespace) -> int:
         objective=args.objective,
         selected_test_case_ids=selected_ids,
         mcp=mcp,
-        config=CampaignBuildConfig(maximum_turns=args.maximum_turns),
+        config=CampaignBuildConfig(
+            maximum_turns=args.maximum_turns,
+            assessment_batch_size=args.assessment_batch_size,
+            maximum_discovery_actions_per_group=(
+                args.maximum_discovery_actions_per_group
+            ),
+            maximum_change_actions=args.maximum_change_actions,
+            maximum_no_progress_turns=args.maximum_no_progress_turns,
+        ),
     )
     result = await agent.build(
         initial=initial,
@@ -272,7 +296,7 @@ def _status(args: argparse.Namespace) -> int:
     elif checkpoint_path.is_file():
         checkpoint = load_checkpoint(checkpoint_path)
         payload = {
-            "status": "running_or_interrupted",
+            "status": "checkpointed",
             "source_run_id": checkpoint.source_run_id,
             "updated_at": checkpoint.updated_at.isoformat(),
             "test_cases": len(checkpoint.selected_test_case_ids),
@@ -280,6 +304,12 @@ def _status(args: argparse.Namespace) -> int:
             "assessed": len(checkpoint.assessments),
             "support": _status_counts(checkpoint.assessments),
             "staged_files": len(checkpoint.staged_changes),
+            "phase": (
+                checkpoint.phase.value
+                if checkpoint.phase is not None
+                else "legacy_recovery"
+            ),
+            "no_progress_turns": checkpoint.no_progress_turns,
             "agent_turns": len(checkpoint.calls),
             "tool_calls": len(checkpoint.observations),
             "errors": list(checkpoint.errors),

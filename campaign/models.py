@@ -17,7 +17,8 @@ from synthesis.models import TokenUsage
 
 
 CAMPAIGN_SCHEMA_VERSION = "1.0"
-CAMPAIGN_PROMPT_VERSION = "1.0"
+CAMPAIGN_PROMPT_VERSION = "1.1"
+LEGACY_CAMPAIGN_PROMPT_VERSION = "1.0"
 
 
 class CampaignModel(BaseModel):
@@ -46,6 +47,14 @@ class CampaignAction(str, Enum):
     RECORD_ASSESSMENTS = "record_assessments"
     STAGE_FILE = "stage_file"
     FINAL = "final"
+
+
+class CampaignPhase(str, Enum):
+    READ_CASES = "read_cases"
+    DISCOVER = "discover"
+    ASSESS = "assess"
+    PLAN_CHANGES = "plan_changes"
+    FINALIZE = "finalize"
 
 
 class CampaignGroup(CampaignModel):
@@ -253,6 +262,31 @@ class CampaignToolObservation(CampaignModel):
     error: Optional[str] = None
 
 
+class CampaignRepositoryRead(CampaignModel):
+    """Content-free descriptor for one repository read that can be reconstructed."""
+
+    path: str = Field(min_length=1)
+    sha256: str = Field(pattern=SHA256_PATTERN)
+    total_lines: int = Field(ge=0)
+    line_start: int = Field(ge=1)
+    line_end: int = Field(ge=0)
+    full_file_read: bool
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "CampaignRepositoryRead":
+        if self.total_lines == 0:
+            if self.line_start != 1 or self.line_end != 0:
+                raise ValueError("empty repository reads must use the range 1..0")
+            return self
+        if self.line_end < self.line_start or self.line_end > self.total_lines:
+            raise ValueError("repository read range must fall within the file")
+        if self.full_file_read and (
+            self.line_start != 1 or self.line_end != self.total_lines
+        ):
+            raise ValueError("full repository reads must cover the complete file")
+        return self
+
+
 class CampaignPlan(CampaignModel):
     schema_version: str = CAMPAIGN_SCHEMA_VERSION
     plan_id: str = Field(pattern=SHA256_PATTERN)
@@ -334,9 +368,13 @@ class CampaignCheckpoint(CampaignModel):
     objective: str = Field(min_length=1)
     updated_at: datetime
     selected_test_case_ids: tuple[str, ...]
+    phase: Optional[CampaignPhase] = None
+    no_progress_turns: int = Field(default=0, ge=0)
+    completed_action_keys: tuple[str, ...] = ()
     read_test_case_ids: tuple[str, ...] = ()
     read_evidence_snippet_ids: tuple[str, ...] = ()
     read_repository_paths: tuple[str, ...] = ()
+    repository_reads: tuple[CampaignRepositoryRead, ...] = ()
     assessments: tuple[CampaignAssessment, ...] = ()
     retrieved_snippets: tuple[GroundingSnippet, ...] = ()
     staged_changes: tuple[RepositoryFileChange, ...] = ()
@@ -355,6 +393,7 @@ class CampaignCheckpoint(CampaignModel):
     def validate_progress(self) -> "CampaignCheckpoint":
         for label, values in (
             ("selected_test_case_ids", self.selected_test_case_ids),
+            ("completed_action_keys", self.completed_action_keys),
             ("read_test_case_ids", self.read_test_case_ids),
             ("read_evidence_snippet_ids", self.read_evidence_snippet_ids),
             ("read_repository_paths", self.read_repository_paths),
@@ -376,6 +415,12 @@ class CampaignCheckpoint(CampaignModel):
             for item in self.staged_changes
         ):
             raise ValueError("checkpoint changes must cite selected testcases")
+        repository_read_keys = [
+            (item.path, item.line_start, item.line_end)
+            for item in self.repository_reads
+        ]
+        if len(repository_read_keys) != len(set(repository_read_keys)):
+            raise ValueError("checkpoint repository reads must be unique")
         sequences = [item.sequence for item in self.observations]
         if sequences != list(range(1, len(sequences) + 1)):
             raise ValueError("checkpoint observation sequence must be contiguous")
@@ -419,6 +464,7 @@ def _hash_json(value: object) -> str:
 
 __all__ = [
     "CAMPAIGN_PROMPT_VERSION",
+    "LEGACY_CAMPAIGN_PROMPT_VERSION",
     "CAMPAIGN_SCHEMA_VERSION",
     "CampaignAction",
     "CampaignAgentResponse",
@@ -428,6 +474,8 @@ __all__ = [
     "CampaignConclusion",
     "CampaignGroup",
     "CampaignPlan",
+    "CampaignPhase",
+    "CampaignRepositoryRead",
     "CampaignToolObservation",
     "CaseSupportStatus",
     "campaign_plan_id",

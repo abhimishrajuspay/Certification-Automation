@@ -499,7 +499,11 @@ python -m campaign plan \
   --mcp-tool search_docs \
   --response-format json_object \
   --maximum-output-tokens 20000 \
-  --timeout-seconds 600
+  --timeout-seconds 600 \
+  --assessment-batch-size 6 \
+  --maximum-discovery-actions-per-group 12 \
+  --maximum-change-actions 12 \
+  --maximum-no-progress-turns 3
 ```
 
 The initial model prompt contains only the objective, repository summary,
@@ -510,6 +514,15 @@ complete files incrementally; it never receives the entire grounding file or
 repository tree in every request. Existing files require an exact digest from a
 prior read. Planning never mutates the repository.
 
+Campaign progression is state-machine bounded. Unread testcase batches must be
+read exactly once, identical discovery actions are rejected, and each semantic
+group receives a finite discovery budget. Once that budget is exhausted the
+next action is constrained to a complete assessment batch; after three rejected
+or otherwise no-progress turns the run checkpoints and stops instead of burning
+the remaining model-turn allowance. Cases that lack enough evidence must be
+marked `needs_review`, not investigated indefinitely. The same rules bound code
+planning and require either a staged cited file or a conservative reassessment.
+
 Monitor or resume without guessing whether the process is alive:
 
 ```bash
@@ -519,6 +532,13 @@ tail -f "artifacts/campaign/$RUN_ID/progress.log"
 # Re-run the same plan command with this additional flag after interruption:
 #   --resume
 ```
+
+`--resume` first stores the exact prior checkpoint and progress log under
+`artifacts/campaign/<run-id>/history/<digest>/`. Checkpoints created by prompt
+version 1.0 are migrated safely: completed testcase/repository evidence is
+retained, while an evidence-saturated legacy loop resumes directly at the
+assessment gate. `campaign status` reports `checkpointed`; it does not claim a
+process is alive merely because a checkpoint exists.
 
 The completed package contains `plan.json`, a one-row-per-case
 `support_matrix.jsonl`, `checkpoint.json`, and `progress.log`. Each testcase is
