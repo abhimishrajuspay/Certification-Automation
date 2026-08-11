@@ -483,6 +483,17 @@ async def test_assessment_turn_caps_cases_and_omits_duplicated_context(
     )
 
     directive = agent._directive()
+    agent._observations.append(
+        CampaignToolObservation(
+            sequence=1,
+            turn=1,
+            action=CampaignAction.RECORD_ASSESSMENTS,
+            request="TC_01,TC_02",
+            result_sha256=_sha("validation-error"),
+            result_characters=16,
+            error="assessment citation needs correction",
+        )
+    )
     prompt = agent._prompt(directive)
     context_text = prompt.split("INPUT_CONTEXT=", 1)[1].split(
         "\nOUTPUT_JSON_SCHEMA=", 1
@@ -499,6 +510,70 @@ async def test_assessment_turn_caps_cases_and_omits_duplicated_context(
     assert "completed_action_keys" not in context["progress"]
     assert context["assessment_context"]["repository_evidence"] == []
     assert len(context["assessment_context"]["test_cases"]) == 2
+    assert (
+        context["assessment_context"]["last_validation_error"]
+        == "assessment citation needs correction"
+    )
+
+
+@pytest.mark.asyncio
+async def test_assessment_accepts_path_backed_by_its_cited_read_snippet(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    grounding = _grounding()
+    group = campaign_groups(grounding.test_cases)[0]
+    snippet_id = grounding.snippets[0].snippet_id
+    agent = CertificationCampaignAgent(
+        grounding=grounding,
+        grounding_sha256="d" * 64,
+        workspace=CampaignWorkspace(repository),
+        llm=_CampaignLLM("", snippet_id, group.group_id),
+        objective="Assess support",
+    )
+    await agent._execute_tool(
+        CampaignAgentResponse(
+            action=CampaignAction.READ_TEST_CASES,
+            test_case_ids=("TC_01", "TC_02"),
+        )
+    )
+    await agent._execute_tool(
+        CampaignAgentResponse(
+            action=CampaignAction.READ_EVIDENCE,
+            snippet_id=snippet_id,
+        )
+    )
+    base = CampaignAssessment(
+        test_case_id="TC_01",
+        status=CaseSupportStatus.SUPPORTED_AS_IS,
+        rationale="The cited repository snippet confirms the route",
+        required_capabilities=("bill fetch handler",),
+        portal_evidence_state_ids=("state-1",),
+        evidence_snippet_ids=(snippet_id,),
+        repository_paths=("docs/bill-fetch.md",),
+    )
+
+    _, _, invalid_error = await agent._execute_tool(
+        CampaignAgentResponse(
+            action=CampaignAction.RECORD_ASSESSMENTS,
+            assessments=(
+                base.model_copy(update={"repository_paths": ("service.py",)}),
+            ),
+        )
+    )
+    _, cited_snippets, valid_error = await agent._execute_tool(
+        CampaignAgentResponse(
+            action=CampaignAction.RECORD_ASSESSMENTS,
+            assessments=(base,),
+        )
+    )
+
+    assert invalid_error is not None
+    assert "full read or a cited read snippet" in invalid_error
+    assert valid_error is None
+    assert cited_snippets == (snippet_id,)
+    assert agent._assessments["TC_01"].repository_paths == ("docs/bill-fetch.md",)
 
 
 @pytest.mark.asyncio

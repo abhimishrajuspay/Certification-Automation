@@ -958,8 +958,23 @@ class CertificationCampaignAgent:
         )
         if not set(assessment.portal_evidence_state_ids).issubset(portal_ids):
             raise ValueError("assessment cites an unavailable portal state")
-        if not set(assessment.repository_paths).issubset(self.workspace.read_paths):
-            raise ValueError("assessment cites a repository file that was not read")
+        snippet_repository_paths = {
+            snippet.repository.path
+            for snippet_id in assessment.evidence_snippet_ids
+            if (snippet := self._catalog[snippet_id]).repository is not None
+        }
+        allowed_repository_paths = {
+            *self.workspace.read_paths,
+            *snippet_repository_paths,
+        }
+        unread_repository_paths = set(assessment.repository_paths).difference(
+            allowed_repository_paths
+        )
+        if unread_repository_paths:
+            raise ValueError(
+                "assessment repository paths require a full read or a cited "
+                "read snippet: " + ", ".join(sorted(unread_repository_paths))
+            )
         if not (
             assessment.portal_evidence_state_ids
             or assessment.evidence_snippet_ids
@@ -1366,6 +1381,15 @@ class CertificationCampaignAgent:
             maximum_snippets=_MAXIMUM_ASSESSMENT_SNIPPETS,
             include_repository=not self._read_snippet_ids,
         )
+        last_validation_error = next(
+            (
+                item.error
+                for item in reversed(self._observations)
+                if item.action == CampaignAction.RECORD_ASSESSMENTS
+                and item.error is not None
+            ),
+            None,
+        )
         return {
             "test_cases": [
                 self._bounded_assessment_case(self.cases[item])
@@ -1374,9 +1398,12 @@ class CertificationCampaignAgent:
             **evidence,
             "citation_rule": (
                 "Use only portal state IDs shown in test_cases, snippet IDs shown "
-                "in read_evidence, and paths shown in repository_evidence. If the "
-                "facts are insufficient, choose needs_review instead of searching."
+                "in read_evidence, and paths shown in repository_evidence. A path "
+                "shown inside read_evidence is valid only when that snippet_id is "
+                "also included in evidence_snippet_ids. If the facts are "
+                "insufficient, choose needs_review instead of searching."
             ),
+            "last_validation_error": last_validation_error,
         }
 
     def _bounded_evidence_context(

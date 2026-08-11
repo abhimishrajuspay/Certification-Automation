@@ -575,6 +575,12 @@ tool-result copies, completed-action keys, and older full-file bodies are omitte
 Repository file bodies remain available during change-planning turns. This
 compaction does not alter the checkpoint configuration fingerprint, so an
 interrupted six-case checkpoint resumes safely with two-case decisions.
+For support assessment, a repository path may be backed either by a complete
+file read or by an explicitly cited, already-read repository snippet for that
+same path. Full-file reads remain mandatory before replacing existing code.
+When a structured assessment is rejected, only the latest validation error is
+returned in the next compact assessment prompt so the model can correct it
+without restoring the discarded bulk context.
 
 The completed package contains `plan.json`, a one-row-per-case
 `support_matrix.jsonl`, `checkpoint.json`, and `progress.log`. Each testcase is
