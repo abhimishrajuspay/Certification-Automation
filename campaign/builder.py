@@ -93,6 +93,9 @@ _GROUP_FIELD_KEYS = {
     "service_name",
 }
 _MAXIMUM_REPOSITORY_LINES_PER_READ = 400
+_MAXIMUM_ASSESSMENT_CASES_PER_TURN = 2
+_MAXIMUM_ASSESSMENT_EVIDENCE_CHARACTERS = 12_000
+_MAXIMUM_ASSESSMENT_SNIPPETS = 4
 _DEDUPLICATED_ACTIONS = {
     CampaignAction.LIST_TEST_CASES,
     CampaignAction.READ_TEST_CASES,
@@ -256,12 +259,18 @@ class CertificationCampaignAgent:
 
         started = time.monotonic()
         LOGGER.info(
-            "campaign started run_id=%s testcases=%d groups=%d model=%s resumed=%s",
+            "campaign started run_id=%s testcases=%d groups=%d model=%s resumed=%s "
+            "assessment_batch_limit=%d effective_assessment_batch_limit=%d",
             self.grounding.source_run_id,
             len(self.selected_ids),
             len(self.groups),
             self.llm.config.model,
             initial is not None,
+            self.config.assessment_batch_size,
+            min(
+                self.config.assessment_batch_size,
+                _MAXIMUM_ASSESSMENT_CASES_PER_TURN,
+            ),
         )
         for turn in range(len(self._calls) + 1, self.config.maximum_turns + 1):
             directive = self._directive()
@@ -272,11 +281,12 @@ class CertificationCampaignAgent:
                 )
             LOGGER.info(
                 "campaign turn started turn=%d phase=%s assessed=%d/%d "
-                "staged_files=%d no_progress=%d prompt_chars=%d",
+                "targets=%d staged_files=%d no_progress=%d prompt_chars=%d",
                 turn,
                 directive.phase.value,
                 len(self._assessments),
                 len(self.selected_ids),
+                len(directive.target_test_case_ids),
                 len(self.workspace.staged_changes),
                 self._no_progress_turns,
                 len(prompt),
@@ -661,8 +671,10 @@ class CertificationCampaignAgent:
             group_remaining = tuple(
                 item for item in group.test_case_ids if item in set(remaining)
             )
-            target = group_remaining[: self.config.assessment_batch_size]
-            unread = tuple(item for item in target if item not in self._read_case_ids)
+            read_target = group_remaining[: self.config.assessment_batch_size]
+            unread = tuple(
+                item for item in read_target if item not in self._read_case_ids
+            )
             if unread:
                 return _CampaignDirective(
                     phase=CampaignPhase.READ_CASES,
@@ -672,6 +684,12 @@ class CertificationCampaignAgent:
                     required_action=CampaignAction.READ_TEST_CASES,
                 )
 
+            target = group_remaining[
+                : min(
+                    self.config.assessment_batch_size,
+                    _MAXIMUM_ASSESSMENT_CASES_PER_TURN,
+                )
+            ]
             evidence_selection = self._evidence_selection(target)
             unresolved_evidence = tuple(
                 item
@@ -1248,6 +1266,12 @@ class CertificationCampaignAgent:
             "task": self._directive_task(directive),
         }
         if directive.phase == CampaignPhase.ASSESS:
+            context.pop("available_evidence", None)
+            context.pop("recent_tool_results", None)
+            context.pop("recent_errors", None)
+            progress_context = context["progress"]
+            assert isinstance(progress_context, dict)
+            progress_context.pop("completed_action_keys", None)
             context["assessment_context"] = self._assessment_context(directive)
         elif directive.phase == CampaignPhase.PLAN_CHANGES:
             evidence = self._bounded_evidence_context(directive.target_test_case_ids)
@@ -1333,7 +1357,15 @@ class CertificationCampaignAgent:
         self,
         directive: _CampaignDirective,
     ) -> dict[str, object]:
-        evidence = self._bounded_evidence_context(directive.target_test_case_ids)
+        evidence = self._bounded_evidence_context(
+            directive.target_test_case_ids,
+            maximum_characters=min(
+                self.config.maximum_assessment_evidence_characters,
+                _MAXIMUM_ASSESSMENT_EVIDENCE_CHARACTERS,
+            ),
+            maximum_snippets=_MAXIMUM_ASSESSMENT_SNIPPETS,
+            include_repository=not self._read_snippet_ids,
+        )
         return {
             "test_cases": [
                 self._bounded_assessment_case(self.cases[item])
@@ -1350,10 +1382,18 @@ class CertificationCampaignAgent:
     def _bounded_evidence_context(
         self,
         target_test_case_ids: tuple[str, ...],
+        *,
+        maximum_characters: Optional[int] = None,
+        maximum_snippets: Optional[int] = None,
+        include_repository: bool = True,
     ) -> dict[str, object]:
         repository_evidence: list[dict[str, object]] = []
         read_evidence: list[dict[str, object]] = []
-        remaining = self.config.maximum_assessment_evidence_characters
+        remaining = (
+            maximum_characters
+            if maximum_characters is not None
+            else self.config.maximum_assessment_evidence_characters
+        )
         target_terms = _search_terms(
             " ".join(self.cases[item].retrieval_query for item in target_test_case_ids)
         )
@@ -1365,13 +1405,14 @@ class CertificationCampaignAgent:
                 item.snippet_id,
             ),
         )
-        for snippet in prioritized_snippets:
+        for snippet in prioritized_snippets[:maximum_snippets]:
             if remaining <= 0:
                 break
             payload = _snippet_payload(snippet, min(remaining, 6_000))
             read_evidence.append(payload)
             remaining -= len(str(payload.get("content", "")))
-        for descriptor in self._repository_reads.values():
+        repository_reads = self._repository_reads.values() if include_repository else ()
+        for descriptor in repository_reads:
             content, digest = self.workspace.inspect_file(descriptor.path)
             if digest != descriptor.sha256:
                 raise CampaignBuildError(

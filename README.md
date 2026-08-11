@@ -567,6 +567,15 @@ first model call, so a transport interruption remains resumable. `campaign
 status` reports `checkpointed`; it does not claim a process is alive merely
 because a checkpoint exists.
 
+`--assessment-batch-size` is an upper bound. Assessment turns have a two-case
+safety cap so large portal descriptions cannot create provider-sized response
+bursts. These forced decision prompts contain only the targeted testcase pair
+and up to four already-read relevant snippets; global evidence catalogs, recent
+tool-result copies, completed-action keys, and older full-file bodies are omitted.
+Repository file bodies remain available during change-planning turns. This
+compaction does not alter the checkpoint configuration fingerprint, so an
+interrupted six-case checkpoint resumes safely with two-case decisions.
+
 The completed package contains `plan.json`, a one-row-per-case
 `support_matrix.jsonl`, `checkpoint.json`, and `progress.log`. Each testcase is
 classified as `supported_as_is`, `supported_after_change`,

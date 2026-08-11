@@ -67,7 +67,7 @@ def _hash_json(value: object) -> str:
     )
 
 
-def _grounding() -> GroundingPackage:
+def _grounding(case_count: int = 2) -> GroundingPackage:
     content = "BillFetchRequest requires POST /bill/fetch and response code 000."
     citation = RepositoryCitation(
         repository_id="a" * 64,
@@ -117,7 +117,7 @@ def _grounding() -> GroundingPackage:
             retrieval_query=f"TC_0{index} BillFetchRequest",
             repository_snippet_ids=(snippet_id,),
         )
-        for index in (1, 2)
+        for index in range(1, case_count + 1)
     )
     return GroundingPackage(
         source_run_id="fixture-run",
@@ -138,10 +138,10 @@ def _grounding() -> GroundingPackage:
         coverage=GroundingCoverage(
             source_testcase_context_complete=True,
             mcp_required=False,
-            test_cases=2,
-            repository_grounded=2,
+            test_cases=case_count,
+            repository_grounded=case_count,
             mcp_grounded=0,
-            externally_grounded=2,
+            externally_grounded=case_count,
             grounding_complete=True,
         ),
     )
@@ -445,6 +445,60 @@ async def test_assessment_context_prioritizes_read_snippets_over_large_files(
         )
         <= agent.config.maximum_assessment_evidence_characters
     )
+
+
+@pytest.mark.asyncio
+async def test_assessment_turn_caps_cases_and_omits_duplicated_context(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    grounding = _grounding(case_count=6)
+    group = campaign_groups(grounding.test_cases)[0]
+    agent = CertificationCampaignAgent(
+        grounding=grounding,
+        grounding_sha256="d" * 64,
+        workspace=CampaignWorkspace(repository),
+        llm=_CampaignLLM(
+            "",
+            grounding.snippets[0].snippet_id,
+            group.group_id,
+        ),
+        objective="Assess support",
+        config=CampaignBuildConfig(assessment_batch_size=6),
+    )
+    all_ids = tuple(item.context.test_case_id for item in grounding.test_cases)
+    _, _, cases_error = await agent._execute_tool(
+        CampaignAgentResponse(
+            action=CampaignAction.READ_TEST_CASES,
+            test_case_ids=all_ids,
+        )
+    )
+    agent._add_dynamic(grounding.snippets)
+    _, _, evidence_error = await agent._execute_tool(
+        CampaignAgentResponse(
+            action=CampaignAction.READ_EVIDENCE,
+            snippet_id=grounding.snippets[0].snippet_id,
+        )
+    )
+
+    directive = agent._directive()
+    prompt = agent._prompt(directive)
+    context_text = prompt.split("INPUT_CONTEXT=", 1)[1].split(
+        "\nOUTPUT_JSON_SCHEMA=", 1
+    )[0]
+    context = json.loads(context_text)
+
+    assert cases_error is None
+    assert evidence_error is None
+    assert directive.phase == CampaignPhase.ASSESS
+    assert directive.target_test_case_ids == ("TC_01", "TC_02")
+    assert "available_evidence" not in context
+    assert "recent_tool_results" not in context
+    assert "recent_errors" not in context
+    assert "completed_action_keys" not in context["progress"]
+    assert context["assessment_context"]["repository_evidence"] == []
+    assert len(context["assessment_context"]["test_cases"]) == 2
 
 
 @pytest.mark.asyncio
