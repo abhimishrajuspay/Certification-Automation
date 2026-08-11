@@ -567,6 +567,12 @@ first model call, so a transport interruption remains resumable. `campaign
 status` reports `checkpointed`; it does not claim a process is alive merely
 because a checkpoint exists.
 
+Reassessment initialization is idempotent. Once the checkpoint carries its
+reopened-case audit marker, later `--reassess-needs-review --resume` invocations
+retain every newly recorded assessment and only reset the transient no-progress
+counter. The completed source plan remains unchanged until the reassessment
+finishes, but it cannot cause partial reassessment decisions to be reopened.
+
 `--assessment-batch-size` is an upper bound. Assessment turns have a two-case
 safety cap so large portal descriptions cannot create provider-sized response
 bursts. These forced decision prompts contain only the targeted testcase pair

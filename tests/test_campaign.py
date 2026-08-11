@@ -889,6 +889,26 @@ def test_reassessment_reopens_only_needs_review_cases() -> None:
     assert resumed.assessments == reopened.assessments
     assert resumed.errors == reopened.errors
 
+    reassessed = assessments[0].model_copy(
+        update={
+            "status": CaseSupportStatus.SUPPORTED_AS_IS,
+            "rationale": "The newly read evidence confirms support",
+        }
+    )
+    partial = reopened.model_copy(
+        update={
+            "no_progress_turns": 2,
+            "assessments": (reassessed, *reopened.assessments),
+        }
+    )
+    resumed_partial = _reopen_needs_review(
+        partial,
+        source_plan=CampaignPlan.model_construct(assessments=assessments),
+    )
+    assert resumed_partial.assessments == partial.assessments
+    assert resumed_partial.no_progress_turns == 0
+    assert resumed_partial.errors == partial.errors
+
 
 def test_read_testcases_accepts_optional_group_context() -> None:
     response = CampaignAgentResponse(

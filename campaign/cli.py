@@ -477,14 +477,15 @@ def _reopen_needs_review(
         "reopened needs_review cases for retained-evidence reassessment: "
         + ", ".join(reopened)
     )
+    already_reopened = audit_message in checkpoint.errors
     return checkpoint.model_copy(
         update={
             "phase": None,
             "no_progress_turns": 0,
-            "assessments": retained,
+            "assessments": checkpoint.assessments if already_reopened else retained,
             "errors": (
                 checkpoint.errors
-                if audit_message in checkpoint.errors
+                if already_reopened
                 else (*checkpoint.errors, audit_message)
             ),
         }
