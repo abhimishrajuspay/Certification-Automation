@@ -21,6 +21,7 @@ from scraper.extractor import PageStateExtractor, SnapshotConfig
 from scraper.guidance import (
     CrawlGuide,
     CrawlStrategy,
+    GuideBranchRule,
     GuideRepeatRule,
     GuideStep,
     GuideTarget,
@@ -46,9 +47,13 @@ RUN_BROWSER_TESTS = os.environ.get("CZ_RUN_BROWSER_TESTS") == "1"
 
 class _ExplorerFixtureHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    request_counts: dict[str, int] = {}
+    request_counts_lock = threading.Lock()
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
+        with self.request_counts_lock:
+            self.request_counts[path] = self.request_counts.get(path, 0) + 1
         if path == "/":
             self._send_html(_EXPLORER_HTML)
         elif path == "/testcase-context":
@@ -62,6 +67,16 @@ class _ExplorerFixtureHandler(BaseHTTPRequestHandler):
         elif path == "/guided-paginated":
             page = int(parse_qs(urlsplit(self.path).query).get("page", ["1"])[0])
             self._send_html(_guided_paginated_html(page))
+        elif path == "/branch-entry":
+            self._send_html(_BRANCH_ENTRY_HTML)
+        elif path == "/branch-group":
+            group = parse_qs(urlsplit(self.path).query).get("group", ["A"])[0]
+            self._send_html(_branch_group_html(group))
+        elif path == "/branch-cases":
+            query = parse_qs(urlsplit(self.path).query)
+            group = query.get("group", ["A"])[0]
+            slot = query.get("slot", ["1"])[0]
+            self._send_html(_branch_cases_html(group, slot))
         elif path == "/frame":
             self._send_html(_FRAME_HTML)
         elif path == "/popup":
@@ -80,6 +95,11 @@ class _ExplorerFixtureHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format_string: str, *args: object) -> None:
         return
+
+    @classmethod
+    def reset_request_counts(cls) -> None:
+        with cls.request_counts_lock:
+            cls.request_counts.clear()
 
     def _send_html(self, html: str) -> None:
         payload = html.encode()
@@ -323,6 +343,55 @@ def _guided_paginated_html(page: int) -> str:
   }});
 </script>
 </body></html>"""
+
+
+_BRANCH_ENTRY_HTML = """<!doctype html>
+<html><head><title>Portal-wide branch entry</title></head>
+<body><main id="main">
+  <div id="groups">
+    <a href="/branch-group?group=A">Group A</a>
+    <a href="/branch-group?group=B">Group B</a>
+  </div>
+</main></body></html>
+"""
+
+
+def _branch_group_html(group: str) -> str:
+    return f"""<!doctype html>
+<html><head><title>Group {group}</title></head>
+<body><main id="main"><table>
+  <thead><tr><th>API Name</th><th>Total TCs</th><th>Test</th></tr></thead>
+  <tbody>
+    <tr><td>{group}Payments</td><td>2</td><td><a title="Test" href="/branch-cases?group={group}&slot=1">Test</a></td></tr>
+    <tr><td>{group}Refunds</td><td>2</td><td><a title="Test" href="/branch-cases?group={group}&slot=2">Test</a></td></tr>
+  </tbody>
+</table></main></body></html>"""
+
+
+def _branch_cases_html(group: str, slot: str) -> str:
+    api = "Payments" if slot == "1" else "Refunds"
+    rows = "".join(
+        f"<tr><td>{group}{slot}_TC_{index}</td><td>{group}{api}</td><td>pending</td>"
+        f'<td><button data-case="{group}{slot}_TC_{index}" title="Test case details">i</button></td></tr>'
+        for index in range(1, 3)
+    )
+    return f"""<!doctype html>
+<html><head><title>{group}{api} cases</title></head>
+<body><main id="main"><table>
+  <thead><tr><th>TC ID</th><th>API Name</th><th>Status</th><th>Info</th></tr></thead>
+  <tbody>{rows}</tbody>
+</table>
+<div id="modal"></div>
+</main><script>
+const modal = document.querySelector('#modal');
+for (const button of document.querySelectorAll('button[data-case]')) {{
+  button.addEventListener('click', () => {{
+    const id = button.dataset.case;
+    modal.innerHTML = `<div role="dialog"><p class="modal-body">${{id}}: validates the portal-wide branch flow</p><button aria-label="Close details">Close</button></div>`;
+    modal.querySelector('button').addEventListener('click', () => modal.replaceChildren());
+  }});
+}}
+</script></body></html>"""
 
 
 @pytest.fixture
@@ -1030,3 +1099,161 @@ async def test_guided_parallel_pagination_and_visual_modals_complete_context(
     assert knowledge.coverage.test_cases_normalized == 12
     assert knowledge.coverage.descriptions_captured == 12
     assert knowledge.coverage.testcase_context_complete is True
+
+
+@pytest.mark.skipif(
+    not RUN_BROWSER_TESTS,
+    reason="set CZ_RUN_BROWSER_TESTS=1 to run real Chromium verification",
+)
+@pytest.mark.parametrize("worker_count", [1, 2])
+@pytest.mark.asyncio
+async def test_guided_nested_branches_merge_portal_wide_testcase_context(
+    tmp_path: Path,
+    explorer_portal: str,
+    worker_count: int,
+) -> None:
+    _ExplorerFixtureHandler.reset_request_counts()
+    entry_url = f"{explorer_portal}/branch-entry"
+    run = ScrapeRun(
+        run_id="portal-wide-branch-run",
+        root_url=entry_url,
+        allowed_origins=(explorer_portal,),
+        limits=CrawlLimits(
+            maximum_depth=6,
+            maximum_states=80,
+            maximum_actions=80,
+            maximum_runtime_seconds=90,
+        ),
+        capture_policy=CapturePolicy(
+            capture_dom=False,
+            capture_screenshots=False,
+            capture_accessibility_tree=False,
+            capture_trace=False,
+            capture_har=False,
+        ),
+    )
+    store = ArtifactStore.create(tmp_path / "crawls", run)
+    managers = tuple(
+        BrowserManager(
+            store,
+            BrowserLaunchConfig(
+                headless=True,
+                viewport_width=1280,
+                viewport_height=720,
+            ),
+        )
+        for _ in range(worker_count)
+    )
+    guide = CrawlGuide(
+        branch_rules=(
+            GuideBranchRule(
+                name="certification_groups",
+                target=GuideTarget(tag="a", role="link"),
+            ),
+            GuideBranchRule(
+                name="certification_slots",
+                target=GuideTarget(
+                    tag="a",
+                    role="link",
+                    accessible_name="Test",
+                ),
+                require_row_label=True,
+            ),
+        ),
+        repeat_rules=(
+            GuideRepeatRule(
+                name="testcase_details",
+                target=GuideTarget(
+                    tag="button",
+                    title="Test case details",
+                ),
+                close_target=GuideTarget(
+                    tag="button",
+                    role="button",
+                    accessible_name="Close details",
+                ),
+            ),
+        ),
+        root_scope_selector="main",
+    )
+
+    try:
+        page = await managers[0].start()
+        await managers[0].navigate(entry_url)
+        for manager in managers[1:]:
+            await manager.start()
+        extractors = tuple(
+            PageStateExtractor(
+                store,
+                manager.recorder,
+                SnapshotConfig(
+                    quiet_window_ms=100,
+                    quiet_timeout_ms=2_000,
+                    full_page_screenshot=False,
+                ),
+            )
+            for manager in managers
+        )
+        result = await StateGraphExplorer(
+            store,
+            managers[0].recorder,
+            extractors[0],
+            ActionPlanner(store),
+            ActionExecutor(store, managers[0].recorder, extractors[0]),
+            ExplorerConfig(
+                completion_goal=CrawlCompletionGoal.TESTCASE_CONTEXT,
+                testcase_context_stability_observations=2,
+                strategy=CrawlStrategy.GUIDED,
+                worker_count=worker_count,
+                parallel_session_mode=(
+                    ParallelSessionMode.OFF
+                    if worker_count == 1
+                    else ParallelSessionMode.PROBE
+                ),
+            ),
+            guide=guide,
+            additional_workers=tuple(
+                ExplorationWorker(
+                    worker_id=f"worker-{index + 1}",
+                    page=managers[index].page,
+                    recorder=managers[index].recorder,
+                    extractor=extractors[index],
+                    executor=ActionExecutor(
+                        store,
+                        managers[index].recorder,
+                        extractors[index],
+                    ),
+                )
+                for index in range(1, worker_count)
+            ),
+        ).explore(page)
+    finally:
+        for manager in reversed(managers):
+            await manager.stop()
+
+    context = result.coverage.testcase_context
+    assert context is not None
+    assert result.completion_reason == "testcase context complete", context.model_dump(
+        mode="json"
+    )
+    assert result.coverage.configured_goal_complete is True
+    assert context.declared_test_cases == 8
+    assert context.test_cases_discovered == 8
+    assert context.descriptions_captured == 8
+    assert context.missing_description_ids == ()
+    assert context.conflicting_test_case_ids == ()
+    assert any(
+        "guided branch fan-out swept 4 terminal root(s)" in limitation
+        for limitation in result.coverage.limitations
+    )
+    if worker_count == 1:
+        assert _ExplorerFixtureHandler.request_counts["/branch-cases"] == 4
+    else:
+        assert any(
+            "terminal roots were distributed across 2 in-place worker(s)" in limitation
+            for limitation in result.coverage.limitations
+        )
+    assert (
+        "terminal branch controls were catalogued before being entered once"
+        in result.coverage.limitations
+    )

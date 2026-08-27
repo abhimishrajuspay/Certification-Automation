@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import NoReturn, Optional, Sequence, cast
@@ -14,6 +15,7 @@ from pydantic import ValidationError
 
 from scraper.browser import BrowserName
 from scraper.explorer import ExplorerConfig
+from scraper.extractor import SnapshotConfig
 from scraper.guidance import CrawlStrategy, ParallelSessionMode
 from scraper.models import CapturePolicy, CrawlCompletionGoal, CrawlLimits
 from scraper.runner import (
@@ -110,6 +112,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=900,
     )
     parser.add_argument(
+        "--teach-branch-depth",
+        type=_nonnegative_int,
+        default=0,
+        help=(
+            "promote the final N demonstrated navigation clicks before the "
+            "testcase info click into nested sibling fan-out levels"
+        ),
+    )
+    parser.add_argument(
         "--workers",
         type=_positive_int,
         default=1,
@@ -139,6 +150,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--viewport-width", type=_positive_int, default=1920)
     parser.add_argument("--viewport-height", type=_positive_int, default=1080)
     parser.add_argument("--ignore-https-errors", action="store_true")
+    parser.add_argument(
+        "--action-timeout-seconds",
+        type=_positive_int,
+        default=10,
+        help="maximum Playwright timeout for one browser action",
+    )
+    parser.add_argument(
+        "--popup-detection-timeout-ms",
+        type=_positive_int,
+        default=100,
+        help="bounded post-action wait for a newly opened page",
+    )
+    parser.add_argument(
+        "--quiet-window-ms",
+        type=_nonnegative_int,
+        default=400,
+        help="unchanged DOM interval required before each state snapshot",
+    )
+    parser.add_argument(
+        "--quiet-timeout-ms",
+        type=_positive_int,
+        default=5_000,
+        help="maximum DOM-settling wait before retaining a bounded snapshot",
+    )
+    parser.add_argument(
+        "--quiet-poll-interval-ms",
+        type=_positive_int,
+        default=100,
+        help="DOM-settling polling interval",
+    )
     parser.add_argument("--maximum-depth", type=_nonnegative_int, default=20)
     parser.add_argument("--maximum-states", type=_positive_int, default=10_000)
     parser.add_argument("--maximum-actions", type=_positive_int, default=100_000)
@@ -277,13 +318,21 @@ def request_from_args(args: argparse.Namespace) -> CrawlRequest:
         viewport_height=args.viewport_height,
         ignore_https_errors=args.ignore_https_errors,
         authentication_timeout_ms=args.authentication_timeout_seconds * 1_000,
+        action_timeout_ms=args.action_timeout_seconds * 1_000,
+        popup_detection_timeout_ms=args.popup_detection_timeout_ms,
         ready_selector=args.ready_selector,
         guide_path=args.crawl_guide,
         taught_guide_output_path=args.teach_guide,
         overwrite_taught_guide=args.overwrite_taught_guide,
         teaching_timeout_ms=args.teaching_timeout_seconds * 1_000,
+        teaching_branch_depth=args.teach_branch_depth,
         limits=limits,
         capture_policy=capture_policy,
+        snapshot_config=SnapshotConfig(
+            quiet_window_ms=args.quiet_window_ms,
+            quiet_timeout_ms=args.quiet_timeout_ms,
+            quiet_poll_interval_ms=args.quiet_poll_interval_ms,
+        ),
         explorer_config=ExplorerConfig(
             completion_goal=CrawlCompletionGoal(args.completion_goal),
             testcase_context_stability_observations=(
@@ -306,6 +355,10 @@ async def async_main(argv: Optional[Sequence[str]] = None) -> int:
         if args.validate_only:
             print(json.dumps(_validation_summary(request), indent=2, sort_keys=True))
             return 0
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
         result = await CrawlRunner(request).run()
         print(
             json.dumps(
@@ -362,6 +415,13 @@ def _validation_summary(request: CrawlRequest) -> dict[str, object]:
         "browser": request.browser_name,
         "ready_selector_configured": request.ready_selector is not None,
         "existing_run_policy": request.existing_run_policy.value,
+        "action_timeout_ms": request.action_timeout_ms,
+        "popup_detection_timeout_ms": request.popup_detection_timeout_ms,
+        "snapshot_config": {
+            "quiet_window_ms": request.snapshot_config.quiet_window_ms,
+            "quiet_timeout_ms": request.snapshot_config.quiet_timeout_ms,
+            "quiet_poll_interval_ms": (request.snapshot_config.quiet_poll_interval_ms),
+        },
         "limits": request.limits.model_dump(mode="json"),
         "completion_goal": request.explorer_config.completion_goal.value,
         "testcase_context_stability_observations": (
@@ -370,6 +430,7 @@ def _validation_summary(request: CrawlRequest) -> dict[str, object]:
         "strategy": request.explorer_config.strategy.value,
         "crawl_guide_configured": request.guide_path is not None,
         "teaching_configured": request.taught_guide_output_path is not None,
+        "teaching_branch_depth": request.teaching_branch_depth,
         "worker_count": request.explorer_config.worker_count,
         "parallel_session_mode": (request.explorer_config.parallel_session_mode.value),
         "capture_policy": request.capture_policy.model_dump(mode="json"),

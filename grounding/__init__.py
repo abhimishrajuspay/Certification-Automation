@@ -1,5 +1,12 @@
 """Repository and MCP grounding for normalized CZ portal testcases."""
 
+from grounding.agent import (
+    AGENT_SYSTEM_PROMPT,
+    AgenticGroundingBuilder,
+    AgenticGroundingConfig,
+    GroundingAgentError,
+    GroundingAgentTransportError,
+)
 from grounding.builder import (
     GroundingBuildConfig,
     GroundingBuildError,
@@ -13,6 +20,7 @@ from grounding.exporter import (
     export_grounding,
 )
 from grounding.mcp import (
+    AGENT_READ_ONLY_TOOLS,
     DEFAULT_READ_ONLY_TOOLS,
     MCPClient,
     MCPClientConfig,
@@ -23,10 +31,20 @@ from grounding.mcp import (
 )
 from grounding.models import (
     GroundedTestCase,
+    GroundingAgentAction,
+    GroundingAgentCallRecord,
+    GroundingAgentDecision,
+    GroundingAgentObservation,
+    GroundingAgentSelection,
+    GroundingAgentToolKind,
+    GroundingAgentToolRequest,
     GroundingCoverage,
     GroundingPackage,
+    GroundingProviderSummary,
     GroundingSnippet,
     GroundingSourceKind,
+    GroundingStrategy,
+    GroundingTokenUsage,
 )
 from grounding.repository import (
     RepositoryIndex,
@@ -35,8 +53,21 @@ from grounding.repository import (
 )
 
 __all__ = [
+    "AGENT_READ_ONLY_TOOLS",
+    "AGENT_SYSTEM_PROMPT",
+    "AgenticGroundingBuilder",
+    "AgenticGroundingConfig",
     "DEFAULT_READ_ONLY_TOOLS",
     "GroundedTestCase",
+    "GroundingAgentAction",
+    "GroundingAgentCallRecord",
+    "GroundingAgentDecision",
+    "GroundingAgentError",
+    "GroundingAgentObservation",
+    "GroundingAgentSelection",
+    "GroundingAgentToolKind",
+    "GroundingAgentToolRequest",
+    "GroundingAgentTransportError",
     "GroundingBuildConfig",
     "GroundingBuildError",
     "GroundingBuilder",
@@ -44,8 +75,11 @@ __all__ = [
     "GroundingExportError",
     "GroundingExportResult",
     "GroundingPackage",
+    "GroundingProviderSummary",
     "GroundingSnippet",
     "GroundingSourceKind",
+    "GroundingStrategy",
+    "GroundingTokenUsage",
     "LoadedKnowledge",
     "MCPClient",
     "MCPClientConfig",

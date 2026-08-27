@@ -3,25 +3,44 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Type
 
 import pytest
+from pydantic import BaseModel, ValidationError
 
+from grounding.agent import (
+    AgenticGroundingBuilder,
+    AgenticGroundingConfig,
+    _safe_validation_error,
+)
 from grounding.builder import (
     GroundingBuildError,
     GroundingBuilder,
     load_knowledge,
 )
-from grounding.cli import main as grounding_main
+from grounding.cli import _configure_progress_logging, main as grounding_main
 from grounding.exporter import GroundingExportError, export_grounding
 from grounding.mcp import (
+    AGENT_READ_ONLY_TOOLS,
     MCPClient,
     MCPClientConfig,
     MCPProtocolError,
     MCPRetryableTransportError,
 )
-from grounding.models import GroundingSnippet, GroundingSourceKind
+from grounding.models import (
+    GroundingAgentAction,
+    GroundingAgentDecision,
+    GroundingAgentSelection,
+    GroundingAgentToolKind,
+    GroundingAgentToolRequest,
+    GroundingSnippet,
+    GroundingSourceKind,
+    GroundingStrategy,
+)
 from grounding.repository import RepositoryIndex
 from knowledge.exporter import export_knowledge
 from knowledge.models import (
@@ -33,6 +52,8 @@ from knowledge.models import (
     TestCaseKnowledge as PortalTestCase,
 )
 from scraper.models import ScrapeRunStatus
+from synthesis.client import LiteLLMCompletion, LiteLLMConfig
+from synthesis.models import TokenUsage
 
 
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
@@ -128,6 +149,132 @@ class _FlakyMCPTransport(_FakeMCPTransport):
             payload,
             timeout_seconds=timeout_seconds,
             maximum_response_bytes=maximum_response_bytes,
+        )
+
+
+class _AgentMCPTransport(_FakeMCPTransport):
+    async def post_json(
+        self,
+        endpoint: str,
+        payload: dict[str, object],
+        *,
+        timeout_seconds: float,
+        maximum_response_bytes: int,
+    ) -> dict[str, object]:
+        if payload["method"] != "tools/list":
+            return await super().post_json(
+                endpoint,
+                payload,
+                timeout_seconds=timeout_seconds,
+                maximum_response_bytes=maximum_response_bytes,
+            )
+        self.requests.append(payload)
+        return {
+            "jsonrpc": "2.0",
+            "id": payload["id"],
+            "result": {
+                "tools": [
+                    {
+                        "name": "get_api_spec",
+                        "description": "retrieve one API specification",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"api_name": {"type": "string"}},
+                            "required": ["api_name"],
+                            "additionalProperties": False,
+                        },
+                        "annotations": {"readOnlyHint": True},
+                    },
+                    {
+                        "name": "generate_payload",
+                        "description": "mutating generator",
+                        "inputSchema": {"type": "object"},
+                        "annotations": {"readOnlyHint": False},
+                    },
+                ]
+            },
+        }
+
+
+class _AgentGroundingLLM:
+    def __init__(self, *, use_mcp: bool = False, unseen_first: bool = False) -> None:
+        self._config = LiteLLMConfig(
+            endpoint="https://llm.example.test",
+            model="fixture-grounding-model",
+            response_format="json_schema",
+        )
+        self.use_mcp = use_mcp
+        self.unseen_first = unseen_first
+        self.prompts: list[str] = []
+
+    @property
+    def config(self) -> LiteLLMConfig:
+        return self._config
+
+    async def complete(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: Type[BaseModel],
+        schema_name: str,
+        maximum_output_tokens: int | None = None,
+    ) -> LiteLLMCompletion:
+        del system_prompt, schema_name, maximum_output_tokens
+        self.prompts.append(user_prompt)
+        context_text = user_prompt.split("INPUT_CONTEXT=", 1)[1]
+        context = json.JSONDecoder().raw_decode(context_text)[0]
+        case_ids = tuple(context["control"]["target_test_case_ids"])
+        candidates = context["candidate_evidence"]["by_test_case"]
+        if not any(candidates.values()):
+            request = (
+                GroundingAgentToolRequest(
+                    request_id="mcp-spec",
+                    kind=GroundingAgentToolKind.CALL_MCP,
+                    test_case_ids=case_ids,
+                    tool_name="get_api_spec",
+                    arguments={"api_name": "BillFetchRequest"},
+                )
+                if self.use_mcp
+                else GroundingAgentToolRequest(
+                    request_id="repo-search",
+                    kind=GroundingAgentToolKind.SEARCH_REPOSITORY,
+                    test_case_ids=case_ids,
+                    query="BillFetchRequest request response schema",
+                )
+            )
+            decision = GroundingAgentDecision(
+                action=GroundingAgentAction.SEARCH,
+                rationale="Retrieve the API contract shared by these cases.",
+                requests=(request,),
+            )
+        else:
+            snippet_ids = {case_id: tuple(candidates[case_id]) for case_id in case_ids}
+            if self.unseen_first and len(self.prompts) == 2:
+                snippet_ids[case_ids[0]] = ("f" * 64,)
+            decision = GroundingAgentDecision(
+                action=GroundingAgentAction.FINAL,
+                rationale="Select only the evidence returned by bounded tools.",
+                selections=tuple(
+                    GroundingAgentSelection(
+                        test_case_id=case_id,
+                        snippet_ids=snippet_ids[case_id],
+                        limitations=(
+                            ()
+                            if snippet_ids[case_id]
+                            else ("No applicable evidence was returned",)
+                        ),
+                    )
+                    for case_id in case_ids
+                ),
+            )
+        assert isinstance(decision, response_model)
+        content = decision.model_dump_json()
+        return LiteLLMCompletion(
+            content=content,
+            request_sha256=hashlib.sha256(user_prompt.encode()).hexdigest(),
+            response_sha256=hashlib.sha256(content.encode()).hexdigest(),
+            usage=TokenUsage(prompt_tokens=25, completion_tokens=15, total_tokens=40),
         )
 
 
@@ -364,6 +511,98 @@ async def test_grounding_groups_mcp_queries_and_exports_llm_ready_jsonl(
 
 
 @pytest.mark.asyncio
+async def test_agentic_grounding_lets_model_select_repository_evidence(
+    tmp_path: Path,
+) -> None:
+    llm = _AgentGroundingLLM()
+    package = await AgenticGroundingBuilder(
+        _knowledge(),
+        "c" * 64,
+        _repository(tmp_path),
+        llm,
+        config=AgenticGroundingConfig(
+            cases_per_batch=2,
+            concurrency=1,
+            maximum_turns_per_batch=3,
+            maximum_snippet_characters=2_000,
+        ),
+    ).build()
+
+    assert package.strategy == GroundingStrategy.AGENTIC
+    assert package.coverage.grounding_complete is True
+    assert package.coverage.repository_grounded == 2
+    assert package.coverage.mcp_grounded == 0
+    assert len(package.agent_calls) == 2
+    assert len(package.agent_observations) == 1
+    assert package.provider is not None
+    assert package.provider.prompt_tokens == 50
+    assert all(case.repository_snippet_ids for case in package.test_cases)
+    assert len(llm.prompts[1]) < 40_000
+    second_context = json.JSONDecoder().raw_decode(
+        llm.prompts[1].split("INPUT_CONTEXT=", 1)[1]
+    )[0]
+    candidate_catalog = second_context["candidate_evidence"]["snippets"]
+    assert len(candidate_catalog) == len(package.snippets)
+    assert len({item["snippet_id"] for item in candidate_catalog}) == len(
+        candidate_catalog
+    )
+    persisted = package.model_dump_json()
+    assert "Retrieve the API contract shared by these cases" not in persisted
+    assert "Select only the evidence returned by bounded tools" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_agentic_grounding_discovers_and_uses_safe_mcp_tool(
+    tmp_path: Path,
+) -> None:
+    transport = _AgentMCPTransport()
+    mcp = MCPClient(
+        MCPClientConfig(
+            endpoint="https://mcp.example.test/mcp",
+            allowed_tools=AGENT_READ_ONLY_TOOLS,
+        ),
+        transport=transport,
+    )
+    package = await AgenticGroundingBuilder(
+        _knowledge(),
+        "d" * 64,
+        _repository(tmp_path),
+        _AgentGroundingLLM(use_mcp=True),
+        mcp_client=mcp,
+        config=AgenticGroundingConfig(cases_per_batch=2, concurrency=1),
+    ).build()
+
+    assert package.coverage.grounding_complete is True
+    assert package.coverage.mcp_grounded == 2
+    assert package.mcp.invoked_tools == ("get_api_spec",)
+    assert "generate_payload" not in package.mcp.discovered_tools
+    assert package.agent_observations[0].tool_name == "get_api_spec"
+    assert all(case.mcp_snippet_ids for case in package.test_cases)
+
+
+@pytest.mark.asyncio
+async def test_agentic_grounding_rejects_unseen_citation_then_self_corrects(
+    tmp_path: Path,
+) -> None:
+    package = await AgenticGroundingBuilder(
+        _knowledge(),
+        "e" * 64,
+        _repository(tmp_path),
+        _AgentGroundingLLM(unseen_first=True),
+        config=AgenticGroundingConfig(
+            cases_per_batch=2,
+            concurrency=1,
+            maximum_turns_per_batch=3,
+        ),
+    ).build()
+
+    assert package.coverage.grounding_complete is True
+    assert len(package.agent_calls) == 3
+    assert package.agent_calls[1].valid is False
+    assert "unseen snippets" in (package.agent_calls[1].validation_error or "")
+
+
+@pytest.mark.asyncio
 async def test_incomplete_source_context_is_rejected_by_default(tmp_path: Path) -> None:
     builder = GroundingBuilder(
         _knowledge(complete=False),
@@ -399,6 +638,8 @@ def test_cli_exports_incomplete_diagnostics_with_distinct_exit_status(
         "--repo-path",
         str(repository),
         "--no-mcp",
+        "--strategy",
+        "deterministic",
         "--output-root",
         str(output_root),
     ]
@@ -408,3 +649,59 @@ def test_cli_exports_incomplete_diagnostics_with_distinct_exit_status(
     assert (
         grounding_main([*arguments, "--allow-incomplete-grounding", "--overwrite"]) == 0
     )
+
+
+def test_grounding_progress_log_includes_shared_litellm_transport(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "progress.log"
+    logger_names = ("cz.grounding", "cz.synthesis.transport")
+    try:
+        _configure_progress_logging(path, quiet=True)
+
+        logging.getLogger("cz.grounding.agent").info("agent batch started")
+        logging.getLogger("cz.synthesis.transport").info("model request waiting")
+        for logger_name in logger_names:
+            for handler in logging.getLogger(logger_name).handlers:
+                handler.flush()
+
+        content = path.read_text()
+        assert "agent batch started" in content
+        assert "model request waiting" in content
+    finally:
+        handlers = {
+            handler
+            for logger_name in logger_names
+            for handler in logging.getLogger(logger_name).handlers
+        }
+        for logger_name in logger_names:
+            logger = logging.getLogger(logger_name)
+            logger.handlers.clear()
+            logger.propagate = True
+            logger.setLevel(logging.NOTSET)
+        for handler in handlers:
+            handler.close()
+
+
+def test_agentic_validation_errors_do_not_persist_model_input() -> None:
+    secret_marker = "raw-model-content-must-not-persist"
+    with pytest.raises(ValidationError) as captured:
+        GroundingAgentDecision.model_validate(
+            {
+                "action": "search",
+                "rationale": "search",
+                "requests": [
+                    {
+                        "request_id": "search-1",
+                        "kind": "search_repository",
+                        "test_case_ids": ["TC_01"],
+                        "query": "BillFetchRequest",
+                        "unexpected": secret_marker,
+                    }
+                ],
+            }
+        )
+
+    sanitized = _safe_validation_error(captured.value)
+    assert secret_marker not in sanitized
+    assert "unexpected" in sanitized

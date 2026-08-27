@@ -6,6 +6,7 @@ import pytest
 
 from scraper.actions import ActionPlanner
 from scraper.artifact_store import ArtifactStore
+from scraper.explorer import StateGraphExplorer, _ExplorationLedger
 from scraper.extractor import CapturedState
 from scraper.models import (
     ActionCandidate,
@@ -109,6 +110,32 @@ def _capture(
     )
     receipt = store.append_record(state)
     return CapturedState(state=state, elements=elements, receipt=receipt)
+
+
+def test_exploration_ledger_does_not_retain_full_element_captures(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore.create(
+        tmp_path / "crawls",
+        ScrapeRun(
+            run_id="bounded-ledger",
+            root_url="https://portal.test/start",
+            allowed_origins=("https://portal.test",),
+        ),
+    )
+    capture = _capture(store, (_element("info", name="Info"),))
+    ledger = _ExplorationLedger()
+
+    assert StateGraphExplorer._retain_capture(ledger, capture) is True
+    assert ledger.states == {capture.state.fingerprint: capture.state}
+    assert ledger.elements_discovered == 1
+    assert ledger.routes == {capture.state.url}
+    assert ledger.frames_discovered == 1
+    assert ledger.modals_discovered == 0
+
+    assert StateGraphExplorer._retain_capture(ledger, capture) is False
+    assert ledger.duplicate_states == 1
+    assert ledger.elements_discovered == 1
 
 
 @pytest.mark.asyncio

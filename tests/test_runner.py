@@ -282,6 +282,65 @@ async def test_cli_exposes_testcase_context_completion_goal(
 
 
 @pytest.mark.asyncio
+async def test_cli_exposes_bounded_action_and_snapshot_timing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    status = await async_main(
+        [
+            "--url",
+            PORTAL_URL,
+            "--action-timeout-seconds",
+            "6",
+            "--popup-detection-timeout-ms",
+            "75",
+            "--quiet-window-ms",
+            "150",
+            "--quiet-timeout-ms",
+            "1500",
+            "--quiet-poll-interval-ms",
+            "50",
+            "--validate-only",
+        ]
+    )
+
+    summary = json.loads(capsys.readouterr().out)
+    assert status == 0
+    assert summary["action_timeout_ms"] == 6_000
+    assert summary["popup_detection_timeout_ms"] == 75
+    assert summary["snapshot_config"] == {
+        "quiet_window_ms": 150,
+        "quiet_timeout_ms": 1_500,
+        "quiet_poll_interval_ms": 50,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cli_exposes_portal_wide_teaching_branch_depth(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    status = await async_main(
+        [
+            "--url",
+            PORTAL_URL,
+            "--auth",
+            "manual",
+            "--headed",
+            "--teach-guide",
+            str(tmp_path / "portal-wide.json"),
+            "--teach-branch-depth",
+            "2",
+            "--validate-only",
+        ]
+    )
+
+    summary = json.loads(capsys.readouterr().out)
+    assert status == 0
+    assert summary["teaching_configured"] is True
+    assert summary["teaching_branch_depth"] == 2
+
+
+@pytest.mark.asyncio
 async def test_cli_validates_hybrid_guide_and_parallel_worker_policy(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

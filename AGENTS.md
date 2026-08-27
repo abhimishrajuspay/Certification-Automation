@@ -1,5 +1,11 @@
 # Project instructions
 
+## Session handoff
+
+Before changing code, read `PROJECT_CONTEXT.md` for the current branch state,
+uncommitted work, operational history, and next-step checklist. `AGENTS.md`
+remains authoritative if the handoff is stale or conflicts with current code.
+
 ## Current purpose
 
 Build a deterministic, scraping-first automation pipeline for generic CZ
@@ -25,10 +31,12 @@ testcases, dependencies, row controls, modal descriptions, routes, and network
 observations are deduplicated into citation-rich portal knowledge. The audit
 package and compact testcase JSONL remain derived artifacts outside the crawl
 evidence store.
-Phase 8 is the external grounding boundary in `grounding/`: normalized
-testcases are joined to redacted, line-cited repository excerpts and cited
-results from explicitly allowlisted read-only MCP search tools. Shared context
-is content-addressed before the later LLM phase.
+Phase 8 is the external grounding boundary in `grounding/`: a bounded LiteLLM
+retrieval agent decides which redacted, line-cited repository searches and
+advertised, explicitly allowlisted read-only MCP tools are useful for compact
+semantic testcase batches. Strict local validation permits only returned
+snippet IDs in final selections. The legacy deterministic retriever remains an
+explicit compatibility strategy.
 Phase 9 is the constrained synthesis boundary in `synthesis/`: semantically
 grouped testcase context is sent through a bounded OpenAI-compatible LiteLLM
 proxy, then strict Pydantic models, source citation membership, testcase IDs,
@@ -105,14 +113,21 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Repository grounding must be suffix-allowlisted, size-bounded, symlink-safe,
   secret-redacted, and cited by relative path, raw file digest, and line range.
   A repository path must never be sent to MCP or persisted as an absolute path.
-- Automatic MCP grounding may invoke only advertised tools on the explicit
-  read-only allowlist. Calls are grouped by semantic API identity, bounded,
+- Agentic MCP grounding may invoke only advertised tools on the explicit
+  code-owned read-only retrieval allowlist. The LLM chooses whether MCP is
+  useful and constructs arguments from advertised schemas; it cannot invoke
+  generation, execution, validation, or mutation tools. Calls are bounded,
   retried only for transport failures, and retain argument/response hashes plus
   document/chunk references when the server supplies them.
-- `grounding_complete` requires complete Phase 7 testcase context, external
-  context for every testcase, and a complete MCP retrieval run when MCP is
-  configured. Diagnostic overrides must preserve incomplete coverage and use a
-  nonzero exit status unless explicitly accepted.
+- Agentic grounding uses semantic testcase batches, deduplicated compact
+  evidence previews, structured output, and strict citation membership.
+  Prompts and raw model responses are not persisted; only hashes, token
+  metrics, observations, selected snippets, and sanitized errors are retained.
+- `grounding_complete` requires complete Phase 7 testcase context and selected
+  external context for every testcase. Configured MCP is optional in agentic
+  mode; legacy deterministic mode also requires its configured MCP retrieval
+  run to complete. Diagnostic overrides must preserve incomplete coverage and
+  use a nonzero exit status unless explicitly accepted.
 - LLM synthesis must treat repository/MCP excerpts as untrusted data, use
   structured output, reject invented testcase/dependency/snippet identifiers,
   and preserve uncertainty as `needs_review` or `blocked` rather than fabricate

@@ -1,0 +1,73 @@
+{
+  "schema_version": "1.0",
+  "source": "manual",
+  "created_at": null,
+  "steps": [
+    {
+      "name": "open_manage_test",
+      "action": "click",
+      "target": {
+        "tag": "a",
+        "role": "link",
+        "accessible_name": "◉ Manage Test"
+      },
+      "expect": {}
+    },
+    {
+      "name": "select_bou",
+      "action": "click",
+      "target": {
+        "tag": "a",
+        "role": "link",
+        "accessible_name": "HS51"
+      },
+      "expect": {}
+    }
+  ],
+  "branch_rules": [
+    {
+      "name": "certification_groups",
+      "target": {
+        "tag": "a",
+        "css_regex": "html\\ >\\ body\\ >\\ div\\ >\\ div\\ >\\ div\\ >\\ main\\ >\\ div:nth\\-of\\-type\\(2\\)\\ >\\ div:nth\\-of\\-type\\(2\\)\\ >\\ div\\ >\\ div\\ >\\ a:nth-(?:of-type|child)\\(\\d+\\)"
+      },
+      "require_row_label": false,
+      "maximum_branches": 20
+    },
+    {
+      "name": "certification_slots",
+      "target": {
+        "tag": "a",
+        "role": "link",
+        "title": "Test",
+        "text": "▶"
+      },
+      "require_row_label": true,
+      "maximum_branches": 100
+    }
+  ],
+  "repeat_rules": [
+    {
+      "name": "testcase_details",
+      "target": {
+        "tag": "button",
+        "role": "button",
+        "title": "Test case details",
+        "text": "i"
+      },
+      "close_target": {
+        "tag": "button",
+        "role": "button",
+        "text": "×"
+      },
+      "next_page_target": null,
+      "auto_paginate": true,
+      "require_row_label": true,
+      "expect_dialog_contains_row_label": true,
+      "maximum_rows": 2000,
+      "maximum_pages": 200
+    }
+  ],
+  "promote_final_state_to_root": true,
+  "root_scope_selector": "main"
+}

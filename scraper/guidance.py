@@ -68,6 +68,7 @@ class GuideTarget(GuideModel):
     title: Optional[str] = Field(default=None, max_length=2_000)
     text: Optional[str] = Field(default=None, max_length=2_000)
     css: Optional[str] = Field(default=None, max_length=4_000)
+    css_regex: Optional[str] = Field(default=None, max_length=4_000)
     frame_path: Optional[str] = Field(default=None, max_length=1_000)
 
     @model_validator(mode="after")
@@ -81,12 +82,25 @@ class GuideTarget(GuideModel):
                 self.title,
                 self.text,
                 self.css,
+                self.css_regex,
             )
         ):
             raise ValueError("guide target requires at least one locator signal")
         if self.accessible_name and not self.role:
             raise ValueError("accessible_name requires a role")
         return self
+
+    @field_validator("css_regex")
+    @classmethod
+    def validate_css_regex(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None:
+            try:
+                re.compile(value)
+            except re.error as exc:
+                raise ValueError(
+                    f"invalid CSS locator regular expression: {exc}"
+                ) from exc
+        return value
 
 
 class GuideExpectation(GuideModel):
@@ -147,6 +161,15 @@ class GuideRepeatRule(GuideModel):
     maximum_pages: int = Field(default=1_000, gt=0)
 
 
+class GuideBranchRule(GuideModel):
+    """One demonstrated navigation level expanded across sibling controls."""
+
+    name: str = Field(min_length=1, max_length=200)
+    target: GuideTarget
+    require_row_label: bool = False
+    maximum_branches: int = Field(default=1_000, gt=0)
+
+
 class CrawlGuide(GuideModel):
     """Portable, portal-specific data consumed by the generic crawler."""
 
@@ -154,6 +177,7 @@ class CrawlGuide(GuideModel):
     source: str = Field(default="manual", pattern=r"^(manual|taught)$")
     created_at: Optional[datetime] = None
     steps: tuple[GuideStep, ...] = ()
+    branch_rules: tuple[GuideBranchRule, ...] = ()
     repeat_rules: tuple[GuideRepeatRule, ...] = ()
     promote_final_state_to_root: bool = True
     root_scope_selector: Optional[str] = Field(default="main", max_length=4_000)
@@ -161,11 +185,16 @@ class CrawlGuide(GuideModel):
     @model_validator(mode="after")
     def validate_names(self) -> "CrawlGuide":
         names = [step.name for step in self.steps]
+        names.extend(rule.name for rule in self.branch_rules)
         names.extend(rule.name for rule in self.repeat_rules)
         if len(names) != len(set(names)):
-            raise ValueError("guide step and repeat-rule names must be unique")
-        if not self.steps and not self.repeat_rules:
-            raise ValueError("crawl guide requires a step or repeat rule")
+            raise ValueError(
+                "guide step, branch-rule, and repeat-rule names must be unique"
+            )
+        if not self.steps and not self.branch_rules and not self.repeat_rules:
+            raise ValueError("crawl guide requires a step, branch rule, or repeat rule")
+        if self.branch_rules and not self.repeat_rules:
+            raise ValueError("branch rules require a terminal repeat rule")
         return self
 
 
@@ -353,11 +382,17 @@ class OperatorActionRecorder:
         )
 
 
-def compile_taught_guide(clicks: tuple[OperatorClick, ...]) -> CrawlGuide:
+def compile_taught_guide(
+    clicks: tuple[OperatorClick, ...],
+    *,
+    branch_depth: int = 0,
+) -> CrawlGuide:
     """Compile navigation clicks and one row/modal demonstration into a guide."""
 
     if not clicks:
         raise GuidanceError("teaching finished without any recorded clicks")
+    if branch_depth < 0:
+        raise GuidanceError("teaching branch depth cannot be negative")
 
     repeated_index: Optional[int] = None
     close_index: Optional[int] = None
@@ -372,9 +407,28 @@ def compile_taught_guide(clicks: tuple[OperatorClick, ...]) -> CrawlGuide:
             break
 
     route_clicks = clicks if repeated_index is None else clicks[:repeated_index]
+    if branch_depth and repeated_index is None:
+        raise GuidanceError(
+            "portal-wide teaching requires a testcase info and dialog-close example"
+        )
+    if branch_depth > len(route_clicks):
+        raise GuidanceError(
+            "teaching branch depth exceeds the demonstrated navigation levels"
+        )
+    explicit_route_clicks = (
+        route_clicks[:-branch_depth] if branch_depth else route_clicks
+    )
     steps = tuple(
         GuideStep(name=f"taught_step_{index + 1}", target=click.target)
-        for index, click in enumerate(route_clicks)
+        for index, click in enumerate(explicit_route_clicks)
+    )
+    branch_rules = tuple(
+        GuideBranchRule(
+            name=f"taught_branch_{index + 1}",
+            target=_generalize_branch_target(click),
+            require_row_label=bool(click.row_label),
+        )
+        for index, click in enumerate(route_clicks[len(explicit_route_clicks) :])
     )
     repeat_rules: tuple[GuideRepeatRule, ...] = ()
     root_scope_selector = "main"
@@ -384,6 +438,11 @@ def compile_taught_guide(clicks: tuple[OperatorClick, ...]) -> CrawlGuide:
         if close is None:  # pragma: no cover - inference requires the next click
             raise GuidanceError(
                 "row observation teaching requires a dialog close click"
+            )
+        if close.target.tag in {"a", "area"} or close.target.role == "link":
+            raise GuidanceError(
+                "dialog close teaching must use the actual button-like close "
+                "control, not a link inside the dialog"
             )
         repeat_rules = (
             GuideRepeatRule(
@@ -403,6 +462,7 @@ def compile_taught_guide(clicks: tuple[OperatorClick, ...]) -> CrawlGuide:
         source="taught",
         created_at=utc_now(),
         steps=steps,
+        branch_rules=branch_rules,
         repeat_rules=repeat_rules,
         promote_final_state_to_root=True,
         root_scope_selector=root_scope_selector,
@@ -558,6 +618,19 @@ def target_elements(
                 )
             )
         )
+    if target.css_regex:
+        pattern = re.compile(target.css_regex)
+        tiers.append(
+            tuple(
+                element
+                for element in elements
+                if any(
+                    locator.strategy == LocatorStrategy.CSS
+                    and pattern.fullmatch(locator.value)
+                    for locator in element.locators
+                )
+            )
+        )
     if target.text:
         tiers.append(
             tuple(element for element in elements if element.text == target.text)
@@ -642,7 +715,33 @@ def _generalize_repeat_target(target: GuideTarget, row_label: str) -> GuideTarge
         title=title,
         text=text,
         css=None,
+        css_regex=None,
         frame_path=target.frame_path,
+    )
+
+
+def _generalize_branch_target(click: OperatorClick) -> GuideTarget:
+    """Generalize one taught branch exemplar to its semantic siblings."""
+
+    if click.row_label:
+        return _generalize_repeat_target(click.target, click.row_label)
+    css = click.target.css
+    if css:
+        matches = tuple(re.finditer(r":nth-(?:of-type|child)\(\d+\)", css))
+        if matches:
+            exemplar = matches[-1]
+            css_regex = (
+                re.escape(css[: exemplar.start()])
+                + r":nth-(?:of-type|child)\(\d+\)"
+                + re.escape(css[exemplar.end() :])
+            )
+            return GuideTarget(
+                tag=click.target.tag,
+                css_regex=css_regex,
+                frame_path=click.target.frame_path,
+            )
+    raise GuidanceError(
+        "a non-row branch exemplar requires a repeatable sibling CSS position"
     )
 
 
@@ -650,6 +749,7 @@ __all__ = [
     "CrawlGuide",
     "CrawlStrategy",
     "GuidanceError",
+    "GuideBranchRule",
     "GuideExpectation",
     "GuideRepeatRule",
     "GuideStep",

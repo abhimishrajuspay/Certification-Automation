@@ -25,6 +25,21 @@ from scraper.redaction import redact_text
 
 
 DEFAULT_READ_ONLY_TOOLS = ("search_docs", "search_documents")
+AGENT_READ_ONLY_TOOLS = (
+    "get_api_spec",
+    "get_flow",
+    "get_integration_guide",
+    "get_interactive_guide",
+    "get_test_cases",
+    "get_webhook_handler",
+    "list_api_specs",
+    "lookup_error_map",
+    "search_api_use_cases",
+    "search_contextual_embeddings",
+    "search_docs",
+    "search_documents",
+    "search_known_issues",
+)
 
 
 class MCPError(RuntimeError):
@@ -88,6 +103,7 @@ class MCPTool:
     name: str
     description: str
     input_schema: dict[str, object]
+    read_only_hint: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -240,11 +256,18 @@ class MCPClient:
             if not isinstance(tool_name, str) or not isinstance(schema, dict):
                 raise MCPProtocolError("MCP tool definition is invalid")
             description = raw_tool.get("description", "")
+            annotations = raw_tool.get("annotations")
+            read_only_hint = None
+            if isinstance(annotations, dict) and isinstance(
+                annotations.get("readOnlyHint"), bool
+            ):
+                read_only_hint = annotations["readOnlyHint"]
             tools.append(
                 MCPTool(
                     name=tool_name,
                     description=description if isinstance(description, str) else "",
                     input_schema=schema,
+                    read_only_hint=read_only_hint,
                 )
             )
         self.identity = identity
@@ -265,9 +288,11 @@ class MCPClient:
         discovered = {tool.name for tool in self.tools}
         if name not in discovered:
             raise MCPProtocolError(f"MCP tool was not advertised: {name}")
-        query = arguments.get("query")
-        if not isinstance(query, str) or not query.strip():
-            raise MCPProtocolError("automatic MCP search arguments require a query")
+        tool = next(item for item in self.tools if item.name == name)
+        if tool.read_only_hint is False:
+            raise MCPProtocolError(f"MCP tool is explicitly not read-only: {name}")
+        _validate_tool_arguments(tool, arguments)
+        query = _request_label(name, arguments, self.config.redacted_names)
 
         result = await self._request(
             "tools/call", {"name": name, "arguments": arguments}
@@ -405,6 +430,47 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _validate_tool_arguments(tool: MCPTool, arguments: dict[str, object]) -> None:
+    """Enforce the advertised top-level object contract without extra packages."""
+
+    if len(_canonical_json(arguments)) > 20_000:
+        raise MCPProtocolError("MCP tool arguments exceeded the size limit")
+    schema = tool.input_schema
+    if schema.get("type") not in (None, "object"):
+        raise MCPProtocolError("MCP tool input schema must describe an object")
+    properties = schema.get("properties")
+    if isinstance(properties, dict) and schema.get("additionalProperties") is False:
+        unknown = set(arguments) - set(properties)
+        if unknown:
+            raise MCPProtocolError(
+                f"MCP tool arguments contain unknown fields: {sorted(unknown)}"
+            )
+    required = schema.get("required", ())
+    if isinstance(required, list):
+        missing = [
+            item for item in required if isinstance(item, str) and item not in arguments
+        ]
+        if missing:
+            raise MCPProtocolError(
+                f"MCP tool arguments omit required fields: {sorted(missing)}"
+            )
+
+
+def _request_label(
+    tool_name: str,
+    arguments: dict[str, object],
+    redacted_names: tuple[str, ...],
+) -> str:
+    query = arguments.get("query")
+    if isinstance(query, str) and query.strip():
+        raw = query.strip()
+    else:
+        raw = f"{tool_name} " + _canonical_json(arguments).decode(
+            "utf-8", errors="replace"
+        )
+    return redact_text(raw, redacted_names)[:2_000] or tool_name
+
+
 def _json_from_event_stream(text: str) -> dict[str, object]:
     for line in reversed(text.splitlines()):
         if not line.startswith("data:"):
@@ -476,6 +542,7 @@ def _hash_json(value: object) -> str:
 
 
 __all__ = [
+    "AGENT_READ_ONLY_TOOLS",
     "DEFAULT_READ_ONLY_TOOLS",
     "MCPClient",
     "MCPClientConfig",

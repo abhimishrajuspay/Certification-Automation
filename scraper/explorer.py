@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ from scraper.extractor import CapturedState, PageStateExtractor
 from scraper.guidance import (
     CrawlGuide,
     CrawlStrategy,
+    GuideBranchRule,
     GuideRepeatRule,
     GuideStep,
     ParallelSessionMode,
@@ -43,13 +45,18 @@ from scraper.models import (
     EffectKind,
     ElementSnapshot,
     InteractionTransition,
+    LocatorStrategy,
     ScrapeRunStatus,
+    StateSnapshot,
     TestcaseContextCoverage,
     utc_now,
 )
 from scraper.recorder import BrowserRecorder, RecorderError
 from scraper.redaction import redact_text
 from scraper.testcase_context import TestcaseContextTracker
+
+
+LOGGER = logging.getLogger("cz.scraper")
 
 
 RESTORE_STORAGE_SCRIPT = r"""
@@ -138,6 +145,15 @@ class _GraphNode:
     depth: int
 
 
+@dataclass(frozen=True)
+class _BranchLeaf:
+    """One terminal control catalogued without opening its destination."""
+
+    parent_capture: CapturedState
+    parent_path: tuple[PlannedAction, ...]
+    action: PlannedAction
+
+
 @dataclass(frozen=True, repr=False)
 class _BrowserCheckpoint:
     root_url: str
@@ -148,12 +164,43 @@ class _BrowserCheckpoint:
 
 @dataclass
 class _ExplorationLedger:
-    states: dict[str, CapturedState] = field(default_factory=dict)
+    """Memory-bounded coverage accounting for already durable captures."""
+
+    states: dict[str, StateSnapshot] = field(default_factory=dict)
     actions: list[ActionCandidate] = field(default_factory=list)
     transitions: list[InteractionTransition] = field(default_factory=list)
     duplicate_states: int = 0
+    elements_discovered: int = 0
+    routes: set[str] = field(default_factory=set)
+    frames_discovered: int = 0
+    table_identities: set[tuple[str, ...]] = field(default_factory=set)
+    modals_discovered: int = 0
+    cross_origin_frames_discovered: bool = False
     limitations: set[str] = field(default_factory=set)
     sequence: int = 0
+
+
+@dataclass
+class _GuidedExecutionCoordinator:
+    """Allocate global action budget and state sequences across leaf workers."""
+
+    sequence: int
+    attempted_actions: int
+    maximum_actions: int
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+
+    async def reserve(self, count: int = 1) -> tuple[int, ...]:
+        if count <= 0:
+            raise ValueError("guided execution reservation must be positive")
+        async with self.lock:
+            if self.attempted_actions + count > self.maximum_actions:
+                raise ExplorationError(
+                    "maximum executed actions reached during guided branch sweep"
+                )
+            start = self.sequence
+            self.sequence += count
+            self.attempted_actions += count
+            return tuple(range(start, start + count))
 
 
 class StateGraphExplorer:
@@ -256,7 +303,34 @@ class StateGraphExplorer:
             root_capture,
             ledger,
         )
-        if self.guide is not None and self.guide.repeat_rules:
+        if self.guide is not None and self.guide.branch_rules:
+            try:
+                (
+                    active_page,
+                    root_capture,
+                    testcase_context,
+                    branch_attempts,
+                ) = await self._execute_branch_rules(
+                    primary_worker,
+                    workers,
+                    checkpoint,
+                    root_capture,
+                    ledger,
+                    context_tracker=context_tracker,
+                    testcase_context=testcase_context,
+                    deadline=deadline,
+                    attempted_actions=attempted_actions,
+                )
+                attempted_actions += branch_attempts
+                testcase_goal_stopped = bool(
+                    testcase_context and testcase_context.stable_for_early_stop
+                )
+            except Exception as exc:
+                if self.config.strategy == CrawlStrategy.GUIDED:
+                    await self._finalize_failed_run(started_at, ledger, str(exc))
+                    raise
+                ledger.limitations.add(f"guided branch fan-out fell back: {exc}")
+        elif self.guide is not None and self.guide.repeat_rules:
             try:
                 (
                     active_page,
@@ -487,9 +561,7 @@ class StateGraphExplorer:
         )
         await asyncio.to_thread(self.store.append_record, coverage)
         ended_at = utc_now()
-        unique_states = tuple(
-            capture.state.state_id for capture in ledger.states.values()
-        )
+        unique_states = tuple(state.state_id for state in ledger.states.values())
         transition_ids = tuple(
             transition.transition_id for transition in ledger.transitions
         )
@@ -589,10 +661,12 @@ class StateGraphExplorer:
             )
         return current_page, current_capture, tuple(recovery_path)
 
-    async def _execute_repeat_rules(
+    async def _execute_branch_rules(
         self,
-        active_page: Page,
-        capture: CapturedState,
+        primary_worker: ExplorationWorker,
+        workers: tuple[ExplorationWorker, ...],
+        checkpoint: _BrowserCheckpoint,
+        root_capture: CapturedState,
         ledger: _ExplorationLedger,
         *,
         context_tracker: Optional[TestcaseContextTracker],
@@ -605,10 +679,238 @@ class StateGraphExplorer:
         Optional[TestcaseContextCoverage],
         int,
     ]:
+        """Discover nested sibling branches, then sweep every terminal table."""
+
+        if self.guide is None or not self.guide.branch_rules:
+            return primary_worker.page, root_capture, testcase_context, 0
+        if not self.guide.repeat_rules:
+            raise ExplorationError("guided branch fan-out requires a repeat rule")
+
+        attempts = 0
+        leaves: list[_BranchLeaf] = []
+
+        async def discover(
+            level: int,
+            capture: CapturedState,
+            path: tuple[PlannedAction, ...],
+        ) -> None:
+            nonlocal attempts, testcase_context
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ExplorationError(
+                    "maximum runtime reached during guided branch discovery"
+                )
+            rule = self.guide.branch_rules[level]
+            matches = tuple(
+                sorted(
+                    (
+                        element
+                        for element in target_elements(
+                            capture,
+                            rule.target,
+                            allow_many=True,
+                        )
+                        if element.visible
+                        and element.enabled
+                        and (
+                            not rule.require_row_label
+                            or bool(element.context.row_label)
+                        )
+                    ),
+                    key=_branch_element_key,
+                )[: rule.maximum_branches]
+            )
+            if not matches:
+                raise ExplorationError(f"branch rule {rule.name!r} matched no controls")
+            LOGGER.info(
+                "guided branch controls discovered level=%d/%d controls=%d",
+                level + 1,
+                len(self.guide.branch_rules),
+                len(matches),
+            )
+
+            for element in matches:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise ExplorationError(
+                        "maximum runtime reached during guided branch discovery"
+                    )
+                if attempted_actions + attempts >= self.limits.maximum_actions:
+                    raise ExplorationError(
+                        "maximum executed actions reached during guided branch discovery"
+                    )
+                planned = await self.planner.plan(
+                    capture,
+                    element_ids={element.element_id},
+                    action_kinds={ActionKind.CLICK},
+                )
+                ledger.actions.extend(item.candidate for item in planned)
+                selected = self._one_pending_branch_action(rule, planned)
+                if level + 1 == len(self.guide.branch_rules):
+                    leaves.append(
+                        _BranchLeaf(
+                            parent_capture=capture,
+                            parent_path=path,
+                            action=selected,
+                        )
+                    )
+                    continue
+
+                outcome = await self._execute_from_parent(
+                    primary_worker,
+                    checkpoint,
+                    _GraphNode(capture=capture, path=path, depth=len(path)),
+                    selected,
+                    sequence=ledger.sequence,
+                )
+                ledger.sequence += 1
+                ledger.transitions.append(outcome.transition)
+                attempts += 1
+                if outcome.capture is None:
+                    raise ExplorationError(
+                        f"branch rule {rule.name!r} failed for "
+                        f"{_branch_element_key(element)!r}"
+                    )
+                child_capture = outcome.capture
+                self._retain_capture(ledger, child_capture)
+                if context_tracker is not None:
+                    testcase_context = context_tracker.observe(child_capture)
+                await discover(level + 1, child_capture, (*path, selected))
+
+        await discover(0, root_capture, ())
+        if not leaves:
+            raise ExplorationError("guided branch fan-out produced no terminal roots")
+        LOGGER.info(
+            "guided terminal catalog ready roots=%d workers=%d",
+            len(leaves),
+            min(len(workers), len(leaves)),
+        )
+
+        coordinator = _GuidedExecutionCoordinator(
+            sequence=ledger.sequence,
+            attempted_actions=attempted_actions + attempts,
+            maximum_actions=self.limits.maximum_actions,
+        )
+        indexed_leaves = tuple(enumerate(leaves, start=1))
+        worker_queues = tuple(
+            tuple(indexed_leaves[index :: len(workers)])
+            for index in range(len(workers))
+        )
+
+        async def sweep_worker(
+            worker: ExplorationWorker,
+            queue: tuple[tuple[int, _BranchLeaf], ...],
+        ) -> None:
+            nonlocal testcase_context
+            for leaf_index, leaf in queue:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise ExplorationError(
+                        "maximum runtime reached during guided branch row sweeps"
+                    )
+                LOGGER.info(
+                    "guided terminal sweep started worker=%s root=%d/%d",
+                    worker.worker_id,
+                    leaf_index,
+                    len(leaves),
+                )
+                active_page = await self._restore_parent(
+                    worker,
+                    checkpoint,
+                    leaf.parent_path,
+                )
+                sequence = (await coordinator.reserve())[0]
+                outcome = await worker.executor.execute(
+                    active_page,
+                    leaf.action,
+                    leaf.parent_capture,
+                    sequence=sequence,
+                )
+                ledger.transitions.append(outcome.transition)
+                if outcome.capture is None:
+                    raise ExplorationError(
+                        "terminal branch control failed while entering its row table"
+                    )
+                active_page = outcome.active_page
+                leaf_capture = outcome.capture
+                self._retain_capture(ledger, leaf_capture)
+                if context_tracker is not None:
+                    testcase_context = context_tracker.observe(leaf_capture)
+                (
+                    _,
+                    _,
+                    testcase_context,
+                    _,
+                ) = await self._execute_repeat_rules(
+                    active_page,
+                    leaf_capture,
+                    ledger,
+                    context_tracker=context_tracker,
+                    testcase_context=testcase_context,
+                    deadline=deadline,
+                    attempted_actions=coordinator.attempted_actions,
+                    allow_early_stop=False,
+                    coordinator=coordinator,
+                    executor=worker.executor,
+                )
+                progress = context_tracker.snapshot() if context_tracker else None
+                LOGGER.info(
+                    "guided terminal sweep completed worker=%s root=%d/%d "
+                    "testcases=%d descriptions=%d declared=%s",
+                    worker.worker_id,
+                    leaf_index,
+                    len(leaves),
+                    progress.test_cases_discovered if progress else 0,
+                    progress.descriptions_captured if progress else 0,
+                    progress.declared_test_cases if progress else "unknown",
+                )
+
+        await asyncio.gather(
+            *(
+                sweep_worker(worker, queue)
+                for worker, queue in zip(workers, worker_queues)
+                if queue
+            )
+        )
+        ledger.sequence = coordinator.sequence
+        attempts = coordinator.attempted_actions - attempted_actions
+        if context_tracker is not None:
+            testcase_context = context_tracker.snapshot()
+
+        await self._restore_parent(primary_worker, checkpoint, ())
+        ledger.limitations.add(
+            f"guided branch fan-out swept {len(leaves)} terminal root(s)"
+        )
+        ledger.limitations.add(
+            "terminal branch controls were catalogued before being entered once"
+        )
+        ledger.limitations.add(
+            f"terminal roots were distributed across {min(len(workers), len(leaves))} "
+            "in-place worker(s)"
+        )
+        return primary_worker.page, root_capture, testcase_context, attempts
+
+    async def _execute_repeat_rules(
+        self,
+        active_page: Page,
+        capture: CapturedState,
+        ledger: _ExplorationLedger,
+        *,
+        context_tracker: Optional[TestcaseContextTracker],
+        testcase_context: Optional[TestcaseContextCoverage],
+        deadline: float,
+        attempted_actions: int,
+        allow_early_stop: bool = True,
+        coordinator: Optional[_GuidedExecutionCoordinator] = None,
+        executor: Optional[ActionExecutor] = None,
+    ) -> tuple[
+        Page,
+        CapturedState,
+        Optional[TestcaseContextCoverage],
+        int,
+    ]:
         """Sweep demonstrated row controls in place without restoring the root."""
 
         current_page = active_page
         current_capture = capture
+        action_executor = executor or self.executor
         attempts = 0
         for rule in self.guide.repeat_rules if self.guide else ():
             processed_rows: set[str] = set()
@@ -629,7 +931,10 @@ class StateGraphExplorer:
                         raise ExplorationError(
                             "maximum runtime reached during guided row sweep"
                         )
-                    if attempted_actions + attempts >= self.limits.maximum_actions:
+                    if (
+                        coordinator is None
+                        and attempted_actions + attempts >= self.limits.maximum_actions
+                    ):
                         raise ExplorationError(
                             "maximum executed actions reached during guided row sweep"
                         )
@@ -666,11 +971,15 @@ class StateGraphExplorer:
                     )
                     selected = self._one_pending_repeat_action(rule, planned)
                     ledger.actions.extend(item.candidate for item in planned)
-                    outcome = await self.executor.execute(
+                    sequence = await self._reserve_guided_sequence(
+                        ledger,
+                        coordinator,
+                    )
+                    outcome = await action_executor.execute(
                         current_page,
                         selected,
                         current_capture,
-                        sequence=ledger.sequence,
+                        sequence=sequence,
                     )
                     ledger.transitions.append(outcome.transition)
                     attempts += 1
@@ -678,7 +987,6 @@ class StateGraphExplorer:
                         raise ExplorationError(
                             f"repeat rule {rule.name!r} failed for row {row_key!r}"
                         )
-                    ledger.sequence += 1
                     self._retain_capture(ledger, outcome.capture)
                     modal_capture = outcome.capture
                     if rule.expect_dialog_contains_row_label and not _capture_contains(
@@ -706,11 +1014,17 @@ class StateGraphExplorer:
                         current_capture,
                         rule,
                         ledger,
+                        coordinator=coordinator,
+                        executor=action_executor,
                     )
                     attempts += close_attempts
                     if context_tracker is not None:
                         testcase_context = context_tracker.observe(current_capture)
-                    if testcase_context and testcase_context.stable_for_early_stop:
+                    if (
+                        allow_early_stop
+                        and testcase_context
+                        and testcase_context.stable_for_early_stop
+                    ):
                         return (
                             current_page,
                             current_capture,
@@ -722,6 +1036,16 @@ class StateGraphExplorer:
                     raise ExplorationError(
                         f"repeat rule {rule.name!r} matched no row controls"
                     )
+                if coordinator is not None:
+                    progress = context_tracker.snapshot() if context_tracker else None
+                    LOGGER.info(
+                        "guided row page completed root_rows=%d testcases=%d "
+                        "descriptions=%d declared=%s",
+                        len(processed_rows),
+                        progress.test_cases_discovered if progress else 0,
+                        progress.descriptions_captured if progress else 0,
+                        progress.declared_test_cases if progress else "unknown",
+                    )
                 next_action, planned = await self._pagination_action(
                     current_capture,
                     rule,
@@ -729,19 +1053,25 @@ class StateGraphExplorer:
                 ledger.actions.extend(item.candidate for item in planned)
                 if next_action is None:
                     break
-                if attempted_actions + attempts >= self.limits.maximum_actions:
+                if (
+                    coordinator is None
+                    and attempted_actions + attempts >= self.limits.maximum_actions
+                ):
                     raise ExplorationError(
                         "maximum executed actions reached during guided pagination"
                     )
-                outcome = await self.executor.execute(
+                sequence = await self._reserve_guided_sequence(
+                    ledger,
+                    coordinator,
+                )
+                outcome = await action_executor.execute(
                     current_page,
                     next_action,
                     current_capture,
-                    sequence=ledger.sequence,
+                    sequence=sequence,
                 )
                 ledger.transitions.append(outcome.transition)
                 attempts += 1
-                ledger.sequence += 1
                 if outcome.capture is None:
                     raise ExplorationError(
                         f"repeat rule {rule.name!r} pagination failed"
@@ -765,6 +1095,9 @@ class StateGraphExplorer:
         capture: CapturedState,
         rule: GuideRepeatRule,
         ledger: _ExplorationLedger,
+        *,
+        coordinator: Optional[_GuidedExecutionCoordinator] = None,
+        executor: Optional[ActionExecutor] = None,
     ) -> tuple[Page, CapturedState, int]:
         matches = target_elements(capture, rule.close_target, allow_many=False)
         if len(matches) != 1:
@@ -778,18 +1111,29 @@ class StateGraphExplorer:
         )
         selected = self._one_pending_repeat_action(rule, planned)
         ledger.actions.extend(item.candidate for item in planned)
-        outcome = await self.executor.execute(
+        sequence = await self._reserve_guided_sequence(ledger, coordinator)
+        outcome = await (executor or self.executor).execute(
             page,
             selected,
             capture,
-            sequence=ledger.sequence,
+            sequence=sequence,
         )
         ledger.transitions.append(outcome.transition)
         if outcome.capture is None:
             raise ExplorationError(f"repeat rule {rule.name!r} could not close dialog")
-        ledger.sequence += 1
         self._retain_capture(ledger, outcome.capture)
         return outcome.active_page, outcome.capture, 1
+
+    @staticmethod
+    async def _reserve_guided_sequence(
+        ledger: _ExplorationLedger,
+        coordinator: Optional[_GuidedExecutionCoordinator],
+    ) -> int:
+        if coordinator is not None:
+            return (await coordinator.reserve())[0]
+        sequence = ledger.sequence
+        ledger.sequence += 1
+        return sequence
 
     async def _pagination_action(
         self,
@@ -845,6 +1189,7 @@ class StateGraphExplorer:
         testcase_context: Optional[TestcaseContextCoverage],
         deadline: float,
         attempted_actions: int,
+        allow_early_stop: bool = True,
     ) -> tuple[
         Page,
         CapturedState,
@@ -1026,7 +1371,11 @@ class StateGraphExplorer:
                         if context_tracker is not None:
                             testcase_context = context_tracker.observe(outcome.capture)
                     primary_capture = close_outcomes[0].capture or primary_capture
-                    if testcase_context and testcase_context.stable_for_early_stop:
+                    if (
+                        allow_early_stop
+                        and testcase_context
+                        and testcase_context.stable_for_early_stop
+                    ):
                         ledger.limitations.add(
                             f"guided row sweep distributed across {len(workers)} "
                             "workers"
@@ -1117,6 +1466,20 @@ class StateGraphExplorer:
             )
         return pending[0]
 
+    @staticmethod
+    def _one_pending_branch_action(
+        rule: GuideBranchRule,
+        planned: tuple[PlannedAction, ...],
+    ) -> PlannedAction:
+        pending = tuple(
+            item for item in planned if item.candidate.status == ActionStatus.PENDING
+        )
+        if len(pending) != 1:
+            raise ExplorationError(
+                f"branch rule {rule.name!r} was blocked or ambiguous by action policy"
+            )
+        return pending[0]
+
     def _scoped_element_ids(
         self,
         capture: CapturedState,
@@ -1167,7 +1530,20 @@ class StateGraphExplorer:
         if capture.state.fingerprint in ledger.states:
             ledger.duplicate_states += 1
             return False
-        ledger.states[capture.state.fingerprint] = capture
+        # State and element evidence is already durable at this boundary. Keep
+        # only the comparatively small StateSnapshot plus incremental coverage
+        # counters; retaining every ElementSnapshot for a long modal sweep can
+        # otherwise consume several gigabytes before finalization.
+        ledger.states[capture.state.fingerprint] = capture.state
+        ledger.elements_discovered += len(capture.elements)
+        ledger.routes.add(capture.state.url)
+        ledger.frames_discovered += len(capture.state.frames)
+        ledger.table_identities.update(_table_identities((capture,)))
+        ledger.modals_discovered += capture.state.modal_count
+        ledger.cross_origin_frames_discovered = bool(
+            ledger.cross_origin_frames_discovered
+            or any(frame.is_cross_origin for frame in capture.state.frames)
+        )
         return True
 
     def _limit_reason(
@@ -1488,8 +1864,6 @@ class StateGraphExplorer:
                 ActionStatus.SKIPPED,
             )
         }
-        captures = tuple(ledger.states.values())
-        elements = [element for capture in captures for element in capture.elements]
         action_ids = {transition.action_id for transition in ledger.transitions}
         events = tuple(
             event
@@ -1508,11 +1882,7 @@ class StateGraphExplorer:
             limitations.add(
                 "promoted-root URL drift falls back to one replay of the validated guide"
             )
-        if any(
-            frame.is_cross_origin
-            for capture in captures
-            for frame in capture.state.frames
-        ):
+        if ledger.cross_origin_frames_discovered:
             limitations.add(
                 "cross-origin frames are restored only when present in the root frame tree"
             )
@@ -1532,18 +1902,18 @@ class StateGraphExplorer:
             )
         return CoverageReport(
             run_id=self.store.run.run_id,
-            states_discovered=len(captures),
+            states_discovered=len(ledger.states),
             duplicate_states=ledger.duplicate_states,
-            elements_discovered=len(elements),
+            elements_discovered=ledger.elements_discovered,
             action_candidates=len(ledger.actions),
             actions_succeeded=status_counts[ActionStatus.SUCCEEDED],
             actions_failed=status_counts[ActionStatus.FAILED],
             actions_skipped=status_counts[ActionStatus.SKIPPED],
             actions_pending=len(pending_ids),
-            routes_discovered=len({capture.state.url for capture in captures}),
-            frames_discovered=sum(len(capture.state.frames) for capture in captures),
-            tables_discovered=len(_table_identities(captures)),
-            modals_discovered=sum(capture.state.modal_count for capture in captures),
+            routes_discovered=len(ledger.routes),
+            frames_discovered=ledger.frames_discovered,
+            tables_discovered=len(ledger.table_identities),
+            modals_discovered=ledger.modals_discovered,
             downloads_observed=sum(
                 event.kind == BrowserEventKind.DOWNLOAD for event in events
             ),
@@ -1583,9 +1953,7 @@ class StateGraphExplorer:
                 "started_at": started_at,
                 "ended_at": utc_now(),
                 "completion_reason": safe_error,
-                "state_ids": tuple(
-                    capture.state.state_id for capture in ledger.states.values()
-                ),
+                "state_ids": tuple(state.state_id for state in ledger.states.values()),
                 "transition_ids": tuple(
                     transition.transition_id for transition in ledger.transitions
                 ),
@@ -1607,6 +1975,24 @@ class StateGraphExplorer:
 
         visit(main_frame, "main")
         return result
+
+
+def _branch_element_key(element: ElementSnapshot) -> tuple[str, ...]:
+    """Return a deterministic identity for one demonstrated branch control."""
+
+    css = tuple(
+        locator.value
+        for locator in element.locators
+        if locator.strategy == LocatorStrategy.CSS
+    )
+    return (
+        element.context.row_label or "",
+        element.accessible_name or "",
+        element.title or "",
+        element.text or "",
+        *css,
+        element.element_id,
+    )
 
 
 def _table_identities(

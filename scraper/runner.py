@@ -133,6 +133,7 @@ class CrawlRequest:
     taught_guide_output_path: Optional[Path] = None
     overwrite_taught_guide: bool = False
     teaching_timeout_ms: int = 900_000
+    teaching_branch_depth: int = 0
     limits: CrawlLimits = field(default_factory=CrawlLimits)
     capture_policy: CapturePolicy = field(default_factory=CapturePolicy)
     snapshot_config: SnapshotConfig = field(default_factory=SnapshotConfig)
@@ -150,6 +151,8 @@ class CrawlRequest:
             raise ValueError("authentication_timeout_ms must be positive")
         if self.teaching_timeout_ms <= 0:
             raise ValueError("teaching_timeout_ms must be positive")
+        if self.teaching_branch_depth < 0 or self.teaching_branch_depth > 8:
+            raise ValueError("teaching_branch_depth must be between 0 and 8")
         if self.action_timeout_ms <= 0:
             raise ValueError("action_timeout_ms must be positive")
         if self.popup_detection_timeout_ms <= 0:
@@ -207,6 +210,8 @@ class CrawlRequest:
                 )
         elif self.overwrite_taught_guide:
             raise ValueError("overwrite_taught_guide requires taught_guide_output_path")
+        if self.teaching_branch_depth and self.taught_guide_output_path is None:
+            raise ValueError("teaching_branch_depth requires taught_guide_output_path")
         if not self.explorer_config.capture_initial_state:
             raise ValueError("the crawl runner requires capture_initial_state=True")
 
@@ -320,6 +325,8 @@ class CrawlRunner:
                     ),
                 )
                 taught = True
+                if self.guide is not None and self.guide.branch_rules:
+                    await manager.navigate(self.request.root_url)
             await self._export_storage_state(page)
 
             extractor = PageStateExtractor(
@@ -374,11 +381,14 @@ class CrawlRunner:
                 )
             runtime_guide = self.guide
             if taught and runtime_guide is not None:
-                runtime_guide = (
-                    runtime_guide.model_copy(update={"steps": ()})
-                    if runtime_guide.repeat_rules
-                    else None
-                )
+                if runtime_guide.branch_rules:
+                    runtime_guide = self.guide
+                else:
+                    runtime_guide = (
+                        runtime_guide.model_copy(update={"steps": ()})
+                        if runtime_guide.repeat_rules
+                        else None
+                    )
             result = await StateGraphExplorer(
                 store,
                 manager.recorder,
@@ -670,8 +680,15 @@ class CrawlRunner:
         if teacher is None or output is None:  # pragma: no cover - caller invariant
             raise TeachingError("teaching was not configured")
         prompt = (
-            "Teaching active: click the route to the testcase page, demonstrate "
-            "one testcase info button and close its dialog, then press Enter: "
+            "Teaching active: click the route to the testcase page"
+            + (
+                f", including {self.request.teaching_branch_depth} sibling "
+                "branch level(s) to fan out"
+                if self.request.teaching_branch_depth
+                else ""
+            )
+            + ", demonstrate one testcase info button, click the actual "
+            "button-like control that closes its dialog, then press Enter: "
         )
         confirmation = self.manual_confirmation or _console_confirmation
         teacher.activate()
@@ -688,7 +705,10 @@ class CrawlRunner:
         finally:
             teacher.deactivate()
         try:
-            guide = compile_taught_guide(teacher.clicks)
+            guide = compile_taught_guide(
+                teacher.clicks,
+                branch_depth=self.request.teaching_branch_depth,
+            )
             write_crawl_guide(
                 output,
                 guide,

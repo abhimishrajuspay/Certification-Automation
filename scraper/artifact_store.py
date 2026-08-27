@@ -197,6 +197,8 @@ class ArtifactStore:
         self._run_directory = run_directory
         self._run = run
         self._lock = threading.RLock()
+        self._events_by_action: dict[str, list[BrowserEvent]] = {}
+        self._exchanges_by_action: dict[str, list[NetworkExchange]] = {}
         self._stream_counts: dict[RecordStream, int] = {
             stream: 0 for stream in RecordStream
         }
@@ -265,6 +267,7 @@ class ArtifactStore:
             )
             store._stream_counts[stream] = count
             store._stream_bytes[stream] = byte_length
+        store._rebuild_action_indexes()
         return store
 
     def save_manifest(self, run: ScrapeRun) -> None:
@@ -471,6 +474,7 @@ class ArtifactStore:
 
             self._stream_counts[stream] = sequence + 1
             self._stream_bytes[stream] = byte_offset + len(data)
+            self._index_action_record(record)
 
         return AppendReceipt(
             stream=stream,
@@ -480,6 +484,33 @@ class ArtifactStore:
             record_type=type(record).__name__,
             recorded_at=recorded_at,
         )
+
+    def browser_events_for_action(self, action_id: str) -> tuple[BrowserEvent, ...]:
+        """Return already-durable browser events correlated to one action."""
+
+        with self._lock:
+            return tuple(self._events_by_action.get(action_id, ()))
+
+    def network_exchanges_for_action(
+        self,
+        action_id: str,
+    ) -> tuple[NetworkExchange, ...]:
+        """Return already-durable network exchanges correlated to one action."""
+
+        with self._lock:
+            return tuple(self._exchanges_by_action.get(action_id, ()))
+
+    def _index_action_record(self, record: StorableRecord) -> None:
+        if isinstance(record, BrowserEvent) and record.action_id is not None:
+            self._events_by_action.setdefault(record.action_id, []).append(record)
+        elif isinstance(record, NetworkExchange) and record.action_id is not None:
+            self._exchanges_by_action.setdefault(record.action_id, []).append(record)
+
+    def _rebuild_action_indexes(self) -> None:
+        for event in self.iter_records(BrowserEvent):
+            self._index_action_record(event)
+        for exchange in self.iter_records(NetworkExchange):
+            self._index_action_record(exchange)
 
     def iter_records(self, model_type: Type[RecordModel]) -> Iterator[RecordModel]:
         """Yield a validated snapshot of records for the requested model type."""

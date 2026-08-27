@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from knowledge.models import KnowledgeField, SHA256_PATTERN
 
 
-GROUNDING_SCHEMA_VERSION = "1.0"
+GROUNDING_SCHEMA_VERSION = "1.1"
 
 
 class GroundingModel(BaseModel):
@@ -33,6 +33,220 @@ class GroundingSourceKind(str, Enum):
 
     REPOSITORY = "repository"
     MCP = "mcp"
+
+
+class GroundingStrategy(str, Enum):
+    """Supported external-evidence retrieval strategies."""
+
+    DETERMINISTIC = "deterministic"
+    AGENTIC = "agentic"
+
+
+class GroundingAgentAction(str, Enum):
+    """One bounded action returned by the grounding model."""
+
+    SEARCH = "search"
+    FINAL = "final"
+
+
+class GroundingAgentToolKind(str, Enum):
+    """Read-only tool families exposed to the grounding model."""
+
+    SEARCH_REPOSITORY = "search_repository"
+    CALL_MCP = "call_mcp"
+
+
+class GroundingAgentToolRequest(GroundingModel):
+    """One model-selected, bounded repository or MCP request."""
+
+    request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    kind: GroundingAgentToolKind
+    test_case_ids: tuple[str, ...] = Field(min_length=1)
+    query: Optional[str] = Field(default=None, min_length=1, max_length=2_000)
+    tool_name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    arguments: Optional[dict[str, object]] = None
+
+    @model_validator(mode="after")
+    def validate_request(self) -> "GroundingAgentToolRequest":
+        if len(self.test_case_ids) != len(set(self.test_case_ids)):
+            raise ValueError("grounding tool testcase IDs must be unique")
+        if self.kind == GroundingAgentToolKind.SEARCH_REPOSITORY:
+            if self.query is None or self.tool_name is not None or self.arguments:
+                raise ValueError(
+                    "repository search requires only a query and testcase IDs"
+                )
+        elif self.tool_name is None or self.arguments is None or self.query is not None:
+            raise ValueError(
+                "MCP call requires only tool_name, arguments, and testcase IDs"
+            )
+        if self.arguments is not None:
+            try:
+                encoded = json.dumps(
+                    self.arguments,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("MCP arguments must be JSON serializable") from exc
+            if len(encoded) > 10_000:
+                raise ValueError("MCP arguments exceed the grounding size limit")
+        return self
+
+
+class GroundingAgentSelection(GroundingModel):
+    """Evidence selected for one testcase after the model has read it."""
+
+    test_case_id: str = Field(min_length=1)
+    snippet_ids: tuple[str, ...] = ()
+    limitations: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_selection(self) -> "GroundingAgentSelection":
+        if len(self.snippet_ids) != len(set(self.snippet_ids)):
+            raise ValueError("selected grounding snippet IDs must be unique")
+        if not self.snippet_ids and not self.limitations:
+            raise ValueError("a selection without evidence requires a limitation")
+        return self
+
+
+class GroundingAgentDecision(GroundingModel):
+    """Strict structured output for one agentic grounding turn."""
+
+    action: GroundingAgentAction
+    rationale: str = Field(min_length=1, max_length=1_000)
+    requests: tuple[GroundingAgentToolRequest, ...] = ()
+    selections: tuple[GroundingAgentSelection, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_action_payload(self) -> "GroundingAgentDecision":
+        if self.action == GroundingAgentAction.SEARCH:
+            if not self.requests or self.selections:
+                raise ValueError("search requires requests and no selections")
+            request_ids = [item.request_id for item in self.requests]
+            if len(request_ids) != len(set(request_ids)):
+                raise ValueError("grounding request IDs must be unique per turn")
+        elif not self.selections or self.requests:
+            raise ValueError("final requires selections and no requests")
+        selection_ids = [item.test_case_id for item in self.selections]
+        if len(selection_ids) != len(set(selection_ids)):
+            raise ValueError("grounding selections must have unique testcase IDs")
+        return self
+
+
+class GroundingTokenUsage(GroundingModel):
+    """Provider token metrics retained without prompt or response content."""
+
+    prompt_tokens: int = Field(default=0, ge=0)
+    completion_tokens: int = Field(default=0, ge=0)
+    total_tokens: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_total(self) -> "GroundingTokenUsage":
+        if self.total_tokens < self.prompt_tokens + self.completion_tokens:
+            raise ValueError("grounding token total is smaller than its components")
+        return self
+
+
+class GroundingAgentCallRecord(GroundingModel):
+    """Secret-free audit record for one model grounding turn."""
+
+    call_id: str = Field(pattern=SHA256_PATTERN)
+    batch_id: str = Field(pattern=SHA256_PATTERN)
+    turn: int = Field(ge=1)
+    test_case_ids: tuple[str, ...] = Field(min_length=1)
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    response_sha256: str = Field(pattern=SHA256_PATTERN)
+    valid: bool
+    validation_error: Optional[str] = Field(default=None, max_length=2_000)
+    usage: GroundingTokenUsage = GroundingTokenUsage()
+
+    @model_validator(mode="after")
+    def validate_record(self) -> "GroundingAgentCallRecord":
+        if len(self.test_case_ids) != len(set(self.test_case_ids)) or any(
+            not value for value in self.test_case_ids
+        ):
+            raise ValueError("grounding call testcase IDs must be non-empty and unique")
+        if self.valid == (self.validation_error is not None):
+            raise ValueError(
+                "valid grounding calls cannot have errors; invalid calls require one"
+            )
+        expected = _hash_json(
+            {
+                "batch_id": self.batch_id,
+                "turn": self.turn,
+                "request_sha256": self.request_sha256,
+                "response_sha256": self.response_sha256,
+            }
+        )
+        if self.call_id != expected:
+            raise ValueError("grounding call ID does not match its evidence")
+        return self
+
+
+class GroundingAgentObservation(GroundingModel):
+    """One model-selected read-only tool execution and its cited result IDs."""
+
+    batch_id: str = Field(pattern=SHA256_PATTERN)
+    turn: int = Field(ge=1)
+    request_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    kind: GroundingAgentToolKind
+    test_case_ids: tuple[str, ...] = Field(min_length=1)
+    tool_name: Optional[str] = None
+    request_sha256: str = Field(pattern=SHA256_PATTERN)
+    snippet_ids: tuple[str, ...] = ()
+    error: Optional[str] = Field(default=None, max_length=2_000)
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> "GroundingAgentObservation":
+        if len(self.test_case_ids) != len(set(self.test_case_ids)) or any(
+            not value for value in self.test_case_ids
+        ):
+            raise ValueError(
+                "grounding observation testcase IDs must be non-empty and unique"
+            )
+        if len(self.snippet_ids) != len(set(self.snippet_ids)):
+            raise ValueError("grounding observation snippet IDs must be unique")
+        if self.kind == GroundingAgentToolKind.CALL_MCP:
+            if self.tool_name is None:
+                raise ValueError("MCP grounding observations require a tool name")
+        elif self.tool_name is not None:
+            raise ValueError(
+                "repository grounding observations cannot name an MCP tool"
+            )
+        return self
+
+
+class GroundingProviderSummary(GroundingModel):
+    """Aggregate agentic-grounding model configuration and usage."""
+
+    endpoint: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    response_format: str = Field(pattern=r"^(json_schema|json_object)$")
+    prompt_version: str = "1.0"
+    prompt_sha256: str = Field(pattern=SHA256_PATTERN)
+    calls_completed: int = Field(ge=0)
+    valid_responses: int = Field(ge=0)
+    prompt_tokens: int = Field(ge=0)
+    completion_tokens: int = Field(ge=0)
+    errors: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> "GroundingProviderSummary":
+        if self.valid_responses > self.calls_completed:
+            raise ValueError("valid grounding responses cannot exceed completed calls")
+        return self
+
+    @field_validator("endpoint")
+    @classmethod
+    def validate_endpoint(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("grounding provider endpoint must be absolute HTTP(S)")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("grounding provider endpoint cannot contain secrets")
+        return value
 
 
 class RepositoryCitation(GroundingModel):
@@ -298,6 +512,10 @@ class GroundingPackage(GroundingModel):
     snippets: tuple[GroundingSnippet, ...]
     test_cases: tuple[GroundedTestCase, ...]
     coverage: GroundingCoverage
+    strategy: GroundingStrategy = GroundingStrategy.DETERMINISTIC
+    provider: Optional[GroundingProviderSummary] = None
+    agent_calls: tuple[GroundingAgentCallRecord, ...] = ()
+    agent_observations: tuple[GroundingAgentObservation, ...] = ()
 
     @field_validator("grounded_at")
     @classmethod
@@ -308,6 +526,13 @@ class GroundingPackage(GroundingModel):
 
     @model_validator(mode="after")
     def validate_references(self) -> "GroundingPackage":
+        if self.strategy == GroundingStrategy.DETERMINISTIC:
+            if self.provider is not None or self.agent_calls or self.agent_observations:
+                raise ValueError(
+                    "deterministic grounding cannot contain agent model records"
+                )
+        elif self.provider is None:
+            raise ValueError("agentic grounding requires a provider summary")
         snippet_ids = [snippet.snippet_id for snippet in self.snippets]
         if len(snippet_ids) != len(set(snippet_ids)):
             raise ValueError("grounding snippets must be unique")
@@ -316,6 +541,29 @@ class GroundingPackage(GroundingModel):
         case_ids = [case.context.test_case_id for case in self.test_cases]
         if len(case_ids) != len(set(case_ids)):
             raise ValueError("grounded testcases must be unique")
+        known_case_ids = set(case_ids)
+        call_ids = [record.call_id for record in self.agent_calls]
+        if len(call_ids) != len(set(call_ids)):
+            raise ValueError("grounding agent call records must be unique")
+        valid_turns = {
+            (record.batch_id, record.turn)
+            for record in self.agent_calls
+            if record.valid
+        }
+        for record in self.agent_calls:
+            if not set(record.test_case_ids).issubset(known_case_ids):
+                raise ValueError("grounding call references a non-package testcase")
+        for observation in self.agent_observations:
+            if not set(observation.test_case_ids).issubset(known_case_ids):
+                raise ValueError(
+                    "grounding observation references a non-package testcase"
+                )
+            if not set(observation.snippet_ids).issubset(known):
+                raise ValueError("grounding observation references an unknown snippet")
+            if (observation.batch_id, observation.turn) not in valid_turns:
+                raise ValueError(
+                    "grounding observation has no valid model decision turn"
+                )
         for case in self.test_cases:
             referenced = set(case.repository_snippet_ids + case.mcp_snippet_ids)
             unknown = referenced - known
@@ -371,6 +619,21 @@ class GroundingPackage(GroundingModel):
         )
         if self.coverage.grounding_complete != expected_complete:
             raise ValueError("grounding_complete does not match package evidence")
+        if self.provider is not None:
+            if self.provider.calls_completed != len(self.agent_calls):
+                raise ValueError("provider call count does not match agent records")
+            if self.provider.valid_responses != sum(
+                record.valid for record in self.agent_calls
+            ):
+                raise ValueError("provider valid-response count does not match calls")
+            if self.provider.prompt_tokens != sum(
+                record.usage.prompt_tokens for record in self.agent_calls
+            ):
+                raise ValueError("provider prompt-token count does not match calls")
+            if self.provider.completion_tokens != sum(
+                record.usage.completion_tokens for record in self.agent_calls
+            ):
+                raise ValueError("provider completion-token count does not match calls")
         return self
 
 
@@ -419,13 +682,23 @@ def _hash_json(value: object) -> str:
 
 __all__ = [
     "GROUNDING_SCHEMA_VERSION",
+    "GroundingAgentAction",
+    "GroundingAgentCallRecord",
+    "GroundingAgentDecision",
+    "GroundingAgentObservation",
+    "GroundingAgentSelection",
+    "GroundingAgentToolKind",
+    "GroundingAgentToolRequest",
     "GroundedTestCase",
     "GroundingCoverage",
     "GroundingExportManifest",
     "GroundingFile",
     "GroundingPackage",
+    "GroundingProviderSummary",
     "GroundingSnippet",
     "GroundingSourceKind",
+    "GroundingStrategy",
+    "GroundingTokenUsage",
     "MCPCallCitation",
     "MCPDocumentReference",
     "MCPServerSummary",

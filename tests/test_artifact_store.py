@@ -213,6 +213,41 @@ def test_every_evidence_model_uses_its_own_typed_stream(tmp_path: Path) -> None:
         assert list(store.iter_records(type(record))) == [record]
 
 
+def test_action_evidence_indexes_survive_reopen(tmp_path: Path) -> None:
+    base = tmp_path / "crawls"
+    store = ArtifactStore.create(base, make_run())
+    matching_event = BrowserEvent(
+        event_id="event-matching",
+        run_id="run-1",
+        kind=BrowserEventKind.LOAD,
+        observed_at=NOW,
+        action_id="action-1",
+    )
+    other_event = matching_event.model_copy(
+        update={"event_id": "event-other", "action_id": "action-2"}
+    )
+    matching_exchange = NetworkExchange(
+        exchange_id="exchange-matching",
+        run_id="run-1",
+        request_id="request-1",
+        requested_at=NOW,
+        action_id="action-1",
+        url="https://portal.example.test/api/details",
+        method="GET",
+    )
+    store.append_record(matching_event)
+    store.append_record(other_event)
+    store.append_record(matching_exchange)
+
+    assert store.browser_events_for_action("action-1") == (matching_event,)
+    assert store.network_exchanges_for_action("action-1") == (matching_exchange,)
+
+    reopened = ArtifactStore.open(base, "run-1")
+
+    assert reopened.browser_events_for_action("action-1") == (matching_event,)
+    assert reopened.network_exchanges_for_action("action-1") == (matching_exchange,)
+
+
 def test_checkpoint_captures_stream_boundaries_and_updates_manifest(
     tmp_path: Path,
 ) -> None:

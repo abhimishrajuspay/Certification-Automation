@@ -162,6 +162,66 @@ def test_taught_clicks_compile_route_and_repeated_row_observation() -> None:
     assert guide.repeat_rules[0].close_target.accessible_name == "Close"
 
 
+def test_taught_portal_wide_clicks_compile_nested_branch_fanout() -> None:
+    clicks = (
+        OperatorClick(sequence=0, target=_target("Manage Test", "#manage")),
+        OperatorClick(sequence=1, target=_target("HS51", "#bou")),
+        OperatorClick(
+            sequence=2,
+            target=GuideTarget(
+                tag="a",
+                role="link",
+                accessible_name="UPI",
+                css="#group-list > a:nth-of-type(1)",
+            ),
+        ),
+        OperatorClick(
+            sequence=3,
+            target=GuideTarget(
+                tag="a",
+                role="link",
+                accessible_name="Test",
+                title="Test",
+                css="#slots > tr:nth-of-type(1) a",
+            ),
+            row_label="SessionRegistration",
+        ),
+        OperatorClick(
+            sequence=4,
+            target=_target("Test case details", "#info"),
+            row_label="SDKREG_UAT_01",
+        ),
+        OperatorClick(
+            sequence=5,
+            target=_target("×", "#close"),
+            inside_dialog=True,
+        ),
+    )
+
+    guide = compile_taught_guide(clicks, branch_depth=2)
+
+    assert [step.target.accessible_name for step in guide.steps] == [
+        "Manage Test",
+        "HS51",
+    ]
+    assert len(guide.branch_rules) == 2
+    assert guide.branch_rules[0].target.css_regex is not None
+    assert guide.branch_rules[0].target.accessible_name is None
+    assert guide.branch_rules[1].target.accessible_name == "Test"
+    assert guide.branch_rules[1].require_row_label is True
+    assert guide.repeat_rules[0].target.accessible_name == "Test case details"
+    assert guide.repeat_rules[0].close_target.accessible_name == "×"
+
+
+def test_css_regex_target_matches_all_taught_siblings(tmp_path: Path) -> None:
+    capture = _capture(tmp_path)
+    target = GuideTarget(css_regex=r"#info-(?:one|two)")
+
+    matches = target_elements(capture, target, allow_many=True)
+
+    assert [item.element_id for item in matches] == ["info-1", "info-2"]
+
+
 def test_taught_clicks_without_modal_remain_explicit_steps() -> None:
     guide = compile_taught_guide(
         (
@@ -172,6 +232,28 @@ def test_taught_clicks_without_modal_remain_explicit_steps() -> None:
 
     assert len(guide.steps) == 2
     assert guide.repeat_rules == ()
+
+
+def test_taught_dialog_link_is_rejected_as_a_close_control() -> None:
+    with pytest.raises(GuidanceError, match="actual button-like close"):
+        compile_taught_guide(
+            (
+                OperatorClick(
+                    sequence=0,
+                    target=_target("Info", "#info"),
+                    row_label="TC_01",
+                ),
+                OperatorClick(
+                    sequence=1,
+                    target=GuideTarget(
+                        tag="a",
+                        role="link",
+                        accessible_name="Open full page",
+                    ),
+                    inside_dialog=True,
+                ),
+            )
+        )
 
 
 def test_target_matching_uses_css_to_disambiguate_repeated_roles(

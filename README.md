@@ -8,7 +8,8 @@ artifact store, pre-navigation Playwright recorder, deterministic page
 snapshotter, action safety policy, bounded state-graph explorer, and production
 crawl runner. It now also includes the deterministic normalization boundary
 that turns immutable crawl evidence into cited portal knowledge, plus bounded
-repository and MCP grounding for every normalized testcase. The runner can
+AI-directed repository and read-only MCP grounding for every normalized
+testcase. The runner can
 explicitly export a private authenticated session for reuse without mixing raw
 session material into crawl evidence. Phase 9 compiles that cited context into
 strict, review-aware HTTP execution specifications through a LiteLLM proxy.
@@ -70,7 +71,8 @@ grounding/
   models.py          # Strict repository/MCP citations and coverage gates
   repository.py      # Bounded, redacted, line-cited local retrieval
   mcp.py             # Async JSON-RPC client with read-only tool allowlist
-  builder.py         # Grouped testcase retrieval and shared snippet assembly
+  agent.py           # AI-directed search/final loop with citation validation
+  builder.py         # Legacy deterministic retrieval and snippet assembly
   exporter.py        # Atomic audit JSON and LLM-ready JSONL export
   cli.py             # Knowledge-to-grounding command
   __main__.py        # python -m grounding entrypoint
@@ -242,9 +244,39 @@ Recording is disabled during login. The learned file contains no typed form
 values or session state. It stores ordered semantic locator fallbacks and turns
 the demonstrated row/dialog interaction into a repeated rule, so one example
 can cover every homologous testcase row. The demonstrated final page is
-promoted to graph depth zero. On the teaching run itself, the crawler uses the
-learned repeat rule from the already-open testcase page without replaying the
-navigation clicks.
+promoted to graph depth zero. On a single-table teaching run, the crawler uses
+the learned repeat rule from the already-open testcase page without replaying
+the navigation clicks. Portal-wide branch teaching replays the learned route
+from its validated root so it can expand every sibling branch.
+
+To capture an entire portal catalog rather than one selected API slot, mark the
+final navigation levels as nested sibling branches. For a CZ hierarchy of
+CertGroup -> Certification Slot -> testcase rows, use a branch depth of two:
+
+```bash
+python -m scraper \
+  --url "https://portal.example.test/start" \
+  --run-id portal-wide-teach \
+  --auth manual --headed \
+  --save-storage-state artifacts/sessions/portal-wide.json \
+  --teach-guide artifacts/guides/portal-wide.json \
+  --teach-branch-depth 2 \
+  --strategy guided \
+  --completion-goal testcase_context
+```
+
+During teaching, navigate through one representative CertGroup and one
+representative slot, click one testcase information control, and then click the
+actual button-like modal close control. Do not click an `Open full page` or
+similar link: link targets inside the dialog are rejected as close examples.
+The generated guide keeps the preceding route explicit and generalizes the
+final two demonstrated levels into nested branch rules. It catalogs terminal
+slot controls from their parent tables without opening them, so each terminal
+slot is entered only once for its row and modal sweep. Parent-table totals are
+collected before terminal work begins, and early completion remains disabled
+until every cataloged slot finishes. This means the testcase-context gate
+represents the entire discovered catalog, not the first slot that happens to
+become complete.
 
 Reuse the ignored session and learned guide without manual navigation:
 
@@ -260,6 +292,40 @@ python -m scraper \
   --parallel-session-mode probe \
   --completion-goal testcase_context
 ```
+
+For a portal-wide guide, the same replay command fans out all stored branch
+levels. Use enough action/state/runtime budget for two dialog actions per case,
+pagination, and branch navigation; for the 1,270-case dummy portal a suitable
+full-evidence starting point is:
+
+```bash
+python -m scraper \
+  --url "http://127.0.0.1:8080/" \
+  --run-id dummy-portal-wide \
+  --auth storage_state \
+  --storage-state artifacts/sessions/portal-wide.json \
+  --crawl-guide artifacts/guides/portal-wide.json \
+  --strategy guided \
+  --workers 8 \
+  --parallel-session-mode probe \
+  --completion-goal testcase_context \
+  --maximum-states 5000 \
+  --maximum-actions 5000 \
+  --maximum-runtime-seconds 10800 \
+  --action-timeout-seconds 6 \
+  --popup-detection-timeout-ms 75 \
+  --quiet-window-ms 150 \
+  --quiet-timeout-ms 1500 \
+  --quiet-poll-interval-ms 50 \
+  --no-trace --no-har
+```
+
+The shorter timing values are appropriate only when the guided portal renders
+its tables and description dialogs immediately, as the local fixture does. The
+generic defaults remain a 400 ms quiet window and 5,000 ms quiet timeout. If a
+run reports unstable snapshots or misses late-rendered dialog content, remove
+the timing overrides before increasing worker count. Every chosen value is
+persisted in the behavior manifest.
 
 `guided` executes only configured route and repeated-row actions. `hybrid`
 executes them first and resumes generic discovery inside the promoted content
@@ -290,10 +356,14 @@ and table postconditions detect replay drift.
 the authenticated in-memory checkpoint, checks the promoted URL, title, tables,
 row labels, and modal state, then falls back to the valid worker count if the
 portal rejects concurrent use. `force` fails instead; `off` requires one worker.
-Safe sibling branches and guided rows can run concurrently. Review-required
-actions remain serialized and terminal. For SPA roots that cannot be rebuilt by
-direct reload, a replayed guide acts as a bounded recovery recipe and the
-recovered structure is validated before another action runs.
+For portal-wide branch guides, terminal API slots are distributed across the
+validated workers; each worker stays inside its assigned slot while it reads
+rows, opens/closes detail dialogs, and follows pagination. This avoids a root
+reload for every testcase. A single-table guide without branch rules retains
+restored-parent row batching. Review-required generic actions remain terminal.
+For SPA roots that cannot be rebuilt by direct reload, a replayed guide acts as
+a bounded recovery recipe and the recovered structure is validated before
+another action runs.
 
 Run IDs are exclusive by default. `--existing-run return_completed` verifies
 integrity and returns an already completed compatible run without launching a
@@ -323,6 +393,10 @@ navigation. It records requests/responses, text bodies, console and page errors,
 frames, dialogs, popups, downloads, file choosers, workers, WebSockets,
 navigations, lifecycle events, DOM mutations, HAR, and trace references. Action
 scopes correlate asynchronous effects with the interaction that caused them.
+Correlation uses an append-time action index rather than repeatedly scanning
+the complete event and network journals. Long explorations also release full
+captured element trees after their durable state is recorded, retaining only
+state summaries and incremental coverage counters needed for finalization.
 Sensitive header, URL, body, console, and HAR fields are redacted before they
 enter the evidence store. This includes OTP/CSRF name-value patterns and
 security-related HTML metadata. Trace archives are retained as explicitly
@@ -424,16 +498,25 @@ Such a package preserves its source limitation and must not be treated as full
 portal coverage. `--skip-integrity-check` is also intended only for diagnostics;
 normal handoffs verify the crawl store before normalization.
 
-## Repository and MCP grounding
+## AI-directed repository and MCP grounding
 
-Ground a normalized package against the integration repository and the MCP
-documentation server before sending anything to an LLM:
+Ground a normalized package with a bounded LiteLLM retrieval agent. The model
+sees compact testcase batches and decides whether it needs repository search,
+MCP, or both. MCP supplies tools and evidence; it does not make the testcase
+decision:
 
 ```bash
 export CZ_MCP_URL="http://10.200.3.108:8000/mcp"
+export CZ_LITELLM_URL="https://litellm.example.test/v1/chat/completions"
+export CZ_LITELLM_MODEL="your-proxy-model-name"
+# Inject CZ_LITELLM_API_KEY with the shell or secret manager.
+
 python -m grounding \
   --run-id portal-baseline \
-  --repo-path /path/to/integration-repository
+  --repo-path /path/to/integration-repository \
+  --response-format json_object \
+  --agent-cases-per-batch 16 \
+  --agent-concurrency 2
 ```
 
 The repository scanner reads only an explicit extension allowlist for schemas,
@@ -444,13 +527,42 @@ contain a relative path, raw file SHA-256, line range, and excerpt digest; the
 absolute repository path is not exported.
 
 The MCP client performs a standard JSON-RPC initialize and tool-discovery
-handshake. Automatic grounding can invoke only the advertised `search_docs` and
-`search_documents` tools. Testcases are grouped by semantic API identity so a
-portal with many scenarios for one API does not issue one remote query per row.
-Every retained MCP excerpt records the server/protocol identity, tool,
-argument/response digests, retrieval time, and document/chunk references.
-Payload-generation, sandbox execution, validation, and other side-effecting or
-generative MCP tools are never called by this phase.
+handshake. The model may select any advertised tool that is also present in the
+code-owned read-only retrieval allowlist, and it must construct arguments from
+that tool's advertised input schema. Payload generation, sandbox execution,
+validation, and mutation tools are not exposed. Every retained MCP excerpt
+records the server/protocol identity, tool, argument/response digests,
+retrieval time, and document/chunk references.
+
+The agent groups semantically related testcases, deduplicates shared evidence,
+and shows only short evidence previews in model turns. The default batch is 16
+cases with two concurrent model requests; both are configurable. It requires a
+second `final` decision that selects only snippet IDs actually returned by a
+bounded tool. Invented IDs, non-target testcase IDs, unsafe MCP tools, invalid
+arguments, oversized prompts, and excess turns are rejected locally. Prompts
+and raw responses are never persisted; `grounding.json` retains only hashes,
+token metrics, selected cited evidence, and sanitized errors. Safe progress is
+written to `artifacts/grounding/<run-id>/progress.log`.
+
+Inspect the model-call bounds without credentials or network access:
+
+```bash
+python -m grounding \
+  --run-id portal-baseline \
+  --repo-path /path/to/integration-repository \
+  --plan-only
+```
+
+The previous deterministic retriever remains available for diagnostics and
+backward compatibility:
+
+```bash
+python -m grounding \
+  --run-id portal-baseline \
+  --repo-path /path/to/integration-repository \
+  --strategy deterministic \
+  --mcp-tool search_docs
+```
 
 The default output under `artifacts/grounding/<run-id>/` contains:
 
@@ -460,10 +572,13 @@ The default output under `artifacts/grounding/<run-id>/` contains:
   the next structured LLM phase; and
 - `manifest.json`, containing output hashes and the `grounding_complete` gate.
 
-Grounding is complete only when Phase 7 testcase context is complete, every
-testcase has repository or MCP context, and configured MCP retrieval completed.
-Repository-only diagnostics can use `--no-mcp`. Incomplete output returns exit
-code 2 unless `--allow-incomplete-grounding` is explicitly supplied.
+Agentic grounding is complete only when Phase 7 testcase context is complete
+and every testcase has at least one model-selected repository or MCP citation.
+MCP is optional evidence: configuring it makes its safe tools available, but
+does not force one MCP call per testcase. Legacy deterministic mode retains its
+configured-MCP completion gate. Repository-only runs can use `--no-mcp`.
+Incomplete output returns exit code 2 unless
+`--allow-incomplete-grounding` is explicitly supplied.
 
 ## Repository-wide campaign mode
 
@@ -620,7 +735,7 @@ contents, then continue through the existing synthesis and Postman boundaries:
 python -m grounding \
   --run-id "$RUN_ID" \
   --repo-path "$REPO_PATH" \
-  --mcp-tool search_docs \
+  --response-format json_object \
   --overwrite
 
 python -m synthesis \

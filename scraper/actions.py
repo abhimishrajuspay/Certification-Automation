@@ -1038,16 +1038,8 @@ class ActionExecutor:
         tuple[BrowserEvent, ...],
         tuple[NetworkExchange, ...],
     ]:
-        events = tuple(
-            event
-            for event in self.store.iter_records(BrowserEvent)
-            if event.action_id == action_id
-        )
-        exchanges = tuple(
-            exchange
-            for exchange in self.store.iter_records(NetworkExchange)
-            if exchange.action_id == action_id
-        )
+        events = self.store.browser_events_for_action(action_id)
+        exchanges = self.store.network_exchanges_for_action(action_id)
         return (
             tuple(event.event_id for event in events),
             tuple(exchange.exchange_id for exchange in exchanges),
