@@ -61,7 +61,14 @@ def main() -> int:
     ap.add_argument("--only", default=None, help="substring filter on item name")
     ap.add_argument("--folder", default=None, help="substring filter on folder name")
     ap.add_argument("--timeout", type=float, default=25.0)
-    ap.add_argument("--base-url", default="http://127.0.0.1:18012")
+    ap.add_argument(
+        "--base-url",
+        default=None,
+        help=(
+            "explicit gateway override; when omitted the environment's"
+            " BASE_URL wins (fails loudly when neither provides one)"
+        ),
+    )
     ap.add_argument("--api-version", default="x2")
     ap.add_argument("--merchant-id", default="TESTMERCHANT")
     ap.add_argument("--channel-id", default="TESTMERCHANT")
@@ -79,7 +86,14 @@ def main() -> int:
     for kv in args.set:
         k, _, v = kv.partition("=")
         env[k] = v
-    env["BASE_URL"] = args.base_url
+    if args.base_url:
+        # Explicit operator override always wins over the environment file.
+        env["BASE_URL"] = args.base_url
+    if not env.get("BASE_URL"):
+        sys.exit(
+            "replay_local: no BASE_URL resolved — pass --base-url or set a"
+            " non-empty BASE_URL value in the environment file"
+        )
     env["API_VERSION"] = args.api_version
     env.setdefault("MERCHANT_ID", args.merchant_id)
     env.setdefault("MERCHANT_CHANNEL_ID", args.channel_id)
