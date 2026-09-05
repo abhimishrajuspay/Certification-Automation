@@ -14,8 +14,8 @@ from typing import Optional
 
 from grounding.models import GroundingSnippet
 from grounding.repository import (
+    CODE_SUFFIXES,
     DEFAULT_EXCLUDED_DIRECTORIES,
-    DEFAULT_SUFFIXES,
     RepositoryIndex,
     RepositoryIndexConfig,
 )
@@ -32,46 +32,6 @@ from scraper.models import CapturePolicy
 from scraper.redaction import redact_text
 
 
-CODE_SUFFIXES = tuple(
-    sorted(
-        set(DEFAULT_SUFFIXES)
-        | {
-            ".c",
-            ".cc",
-            ".conf",
-            ".cpp",
-            ".cs",
-            ".css",
-            ".go",
-            ".gradle",
-            ".groovy",
-            ".h",
-            ".hpp",
-            ".hs",
-            ".html",
-            ".ini",
-            ".java",
-            ".js",
-            ".jsx",
-            ".kt",
-            ".kts",
-            ".lhs",
-            ".cabal",
-            ".dhall",
-            ".nix",
-            ".php",
-            ".py",
-            ".rb",
-            ".rs",
-            ".scala",
-            ".sh",
-            ".sql",
-            ".toml",
-            ".ts",
-            ".tsx",
-        }
-    )
-)
 _SENSITIVE_FILE_NAMES = {
     ".env",
     ".env.local",

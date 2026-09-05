@@ -116,6 +116,9 @@ class MCPToolResult:
     text_blocks: tuple[str, ...]
 
 
+MCP_SESSION_SENTINEL = "__cz_mcp_session_id__"
+
+
 class MCPTransport(Protocol):
     """Injectable JSON transport used by production and fixture tests."""
 
@@ -126,6 +129,7 @@ class MCPTransport(Protocol):
         *,
         timeout_seconds: float,
         maximum_response_bytes: int,
+        session_id: Optional[str] = None,
     ) -> dict[str, object]: ...
 
 
@@ -139,6 +143,7 @@ class UrllibMCPTransport:
         *,
         timeout_seconds: float,
         maximum_response_bytes: int,
+        session_id: Optional[str] = None,
     ) -> dict[str, object]:
         return await asyncio.to_thread(
             self._post_json,
@@ -146,6 +151,7 @@ class UrllibMCPTransport:
             payload,
             timeout_seconds,
             maximum_response_bytes,
+            session_id,
         )
 
     @staticmethod
@@ -154,16 +160,20 @@ class UrllibMCPTransport:
         payload: dict[str, object],
         timeout_seconds: float,
         maximum_response_bytes: int,
+        session_id: Optional[str] = None,
     ) -> dict[str, object]:
         data = _canonical_json(payload)
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        }
+        if session_id:
+            headers["Mcp-Session-Id"] = session_id
         request = Request(
             endpoint,
             data=data,
             method="POST",
-            headers={
-                "Accept": "application/json, text/event-stream",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
         )
         try:
             # Do not silently send integration context through process-global
@@ -193,14 +203,22 @@ class UrllibMCPTransport:
             raise MCPRetryableTransportError(f"MCP request failed: {exc}") from exc
 
         text = body.decode("utf-8", errors="replace")
+        if getattr(response, "status", 200) == 202 and not text.strip():
+            # MCP streamable-HTTP notifications are acknowledged with 202 and
+            # no body; there is nothing to parse.
+            return {}
         try:
             if "text/event-stream" in content_type.casefold():
-                return _json_from_event_stream(text)
-            value = json.loads(text)
+                value = _json_from_event_stream(text)
+            else:
+                value = json.loads(text)
         except json.JSONDecodeError as exc:
             raise MCPTransportError("MCP response was not valid JSON") from exc
         if not isinstance(value, dict):
             raise MCPTransportError("MCP response root must be an object")
+        response_session = response.headers.get("Mcp-Session-Id")
+        if isinstance(response_session, str) and response_session:
+            value = {**value, MCP_SESSION_SENTINEL: response_session}
         return value
 
 
@@ -218,6 +236,7 @@ class MCPClient:
         self.tools: tuple[MCPTool, ...] = ()
         self._request_id = 0
         self._id_lock = threading.Lock()
+        self._session_id: Optional[str] = None
 
     async def connect(self) -> tuple[MCPServerIdentity, tuple[MCPTool, ...]]:
         """Initialize the endpoint and discover its callable tools."""
@@ -243,6 +262,7 @@ class MCPClient:
             raise MCPProtocolError("MCP serverInfo name/version must be strings")
         identity = MCPServerIdentity(protocol, name, version)
 
+        await self._notify_initialized()
         listed = await self._request("tools/list", {})
         raw_tools = listed.get("tools")
         if not isinstance(raw_tools, list):
@@ -273,6 +293,27 @@ class MCPClient:
         self.identity = identity
         self.tools = tuple(sorted(tools, key=lambda item: item.name))
         return identity, self.tools
+
+    async def _notify_initialized(self) -> None:
+        """Best-effort MCP initialized notification for session-bound servers.
+
+        Sessionless deployments accept the subsequent requests immediately, so
+        any failure of this notification is intentionally ignored.
+        """
+
+        try:
+            await self.transport.post_json(
+                self.config.endpoint,
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                },
+                timeout_seconds=self.config.timeout_seconds,
+                maximum_response_bytes=self.config.maximum_response_bytes,
+                session_id=self._session_id,
+            )
+        except MCPError:
+            pass
 
     async def call_tool(
         self,
@@ -393,12 +434,17 @@ class MCPClient:
         response: dict[str, object] | None = None
         for attempt in range(1, self.config.maximum_attempts + 1):
             try:
-                response = await self.transport.post_json(
+                raw = await self.transport.post_json(
                     self.config.endpoint,
                     payload,
                     timeout_seconds=self.config.timeout_seconds,
                     maximum_response_bytes=self.config.maximum_response_bytes,
+                    session_id=self._session_id,
                 )
+                response_session = raw.pop(MCP_SESSION_SENTINEL, None)
+                if isinstance(response_session, str) and response_session:
+                    self._session_id = response_session
+                response = raw
                 break
             except MCPRetryableTransportError:
                 if attempt == self.config.maximum_attempts:

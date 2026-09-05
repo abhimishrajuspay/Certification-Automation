@@ -7,7 +7,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Type
+from typing import Optional, Type
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -26,10 +26,13 @@ from grounding.cli import _configure_progress_logging, main as grounding_main
 from grounding.exporter import GroundingExportError, export_grounding
 from grounding.mcp import (
     AGENT_READ_ONLY_TOOLS,
+    MCP_SESSION_SENTINEL,
     MCPClient,
     MCPClientConfig,
     MCPProtocolError,
     MCPRetryableTransportError,
+    MCPServerIdentity,
+    MCPToolResult,
 )
 from grounding.models import (
     GroundingAgentAction,
@@ -70,13 +73,16 @@ class _FakeMCPTransport:
         *,
         timeout_seconds: float,
         maximum_response_bytes: int,
+        session_id: Optional[str] = None,
     ) -> dict[str, object]:
         assert endpoint == "https://mcp.example.test/mcp"
         assert timeout_seconds > 0
         assert maximum_response_bytes > 0
         self.requests.append(payload)
-        request_id = payload["id"]
         method = payload["method"]
+        if method == "notifications/initialized":
+            return {}
+        request_id = payload["id"]
         if method == "initialize":
             result: dict[str, object] = {
                 "protocolVersion": "2025-06-18",
@@ -128,6 +134,37 @@ class _FakeMCPTransport:
         return {"jsonrpc": "2.0", "result": result, "id": request_id}
 
 
+class _SessionMCPTransport(_FakeMCPTransport):
+    """Session-bound server: hands out an id on initialize and requires it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.observed_session_ids: list[Optional[str]] = []
+
+    async def post_json(
+        self,
+        endpoint: str,
+        payload: dict[str, object],
+        *,
+        timeout_seconds: float,
+        maximum_response_bytes: int,
+        session_id: Optional[str] = None,
+    ) -> dict[str, object]:
+        if payload["method"] != "initialize":
+            assert session_id == "session-1"
+        self.observed_session_ids.append(session_id)
+        response = await super().post_json(
+            endpoint,
+            payload,
+            timeout_seconds=timeout_seconds,
+            maximum_response_bytes=maximum_response_bytes,
+            session_id=session_id,
+        )
+        if payload["method"] == "initialize":
+            response = {**response, MCP_SESSION_SENTINEL: "session-1"}
+        return response
+
+
 class _FlakyMCPTransport(_FakeMCPTransport):
     def __init__(self) -> None:
         super().__init__()
@@ -140,6 +177,7 @@ class _FlakyMCPTransport(_FakeMCPTransport):
         *,
         timeout_seconds: float,
         maximum_response_bytes: int,
+        session_id: Optional[str] = None,
     ) -> dict[str, object]:
         if self.failures_remaining:
             self.failures_remaining -= 1
@@ -160,6 +198,7 @@ class _AgentMCPTransport(_FakeMCPTransport):
         *,
         timeout_seconds: float,
         maximum_response_bytes: int,
+        session_id: Optional[str] = None,
     ) -> dict[str, object]:
         if payload["method"] != "tools/list":
             return await super().post_json(
@@ -430,6 +469,85 @@ def test_repository_index_excludes_generated_build_trees_and_requires_api_anchor
 
 
 @pytest.mark.asyncio
+async def test_mcp_client_echoes_server_session_id() -> None:
+    transport = _SessionMCPTransport()
+    client = MCPClient(
+        MCPClientConfig(endpoint="https://mcp.example.test/mcp"),
+        transport=transport,
+    )
+    identity, tools = await client.connect()
+    assert identity.name == "fixture-mcp"
+    assert {"search_docs", "search_documents"}.issubset({t.name for t in tools})
+    result = await client.call_tool("search_docs", {"query": "x", "limit": 1})
+    assert result.text_blocks
+    methods = [payload["method"] for payload in transport.requests]
+    assert methods == [
+        "initialize",
+        "notifications/initialized",
+        "tools/list",
+        "tools/call",
+    ]
+    # The session id adopted during initialize is echoed on every later call.
+    assert transport.observed_session_ids[0] is None
+    assert all(
+        observed == "session-1" for observed in transport.observed_session_ids[1:]
+    )
+
+
+def test_mcp_to_snippets_splits_real_keyword_output_and_round_trips() -> None:
+    transport = _FakeMCPTransport()
+    client = MCPClient(
+        MCPClientConfig(endpoint="https://mcp.example.test/mcp"),
+        transport=transport,
+    )
+    client.identity = MCPServerIdentity(
+        "2025-06-18", "merchant-integration-mcp", "3.4.7"
+    )
+    text = (
+        '# Keyword Search Results for: "ReqValAdd Validate VPA payload"\n'
+        "\n### Result 1\n"
+        "**Source:** s2s_api_docs / post-api-apiversion-merchants-vpas-validity.md\n"
+        "**Document ID:** `s2s_api_docs__post_api_apiversion_merchants_vpas_validity`\n"
+        "**Chunk:** `0`\n"
+        "term matches: 3\n"
+        "\n```\n# VPA Validity API Integration Guide\n"
+        "Newton calls NPCI `ReqValAdd` for off-us VPAs.\n```\n"
+        "\n### Result 2\n"
+        "**Source:** s2s_api_docs / other.md\n"
+        "**Document ID:** `other_doc`\n"
+        "**Chunk:** `15`\n"
+        "term matches: 1\n"
+        "\n```\nother body\n```\n"
+        "\n### Result 3\n"
+        "**Source:** guides / faq.md\n"
+        "\n```\nno doc refs here\n```\n"
+    )
+    result = MCPToolResult(
+        tool_name="search_docs",
+        query="q",
+        arguments_sha256="a" * 64,
+        response_sha256="b" * 64,
+        retrieved_at=datetime.now(timezone.utc),
+        text_blocks=(text,),
+    )
+    snippets = client.to_snippets(result)
+    assert len(snippets) == 3
+    assert snippets[0].mcp and snippets[0].mcp.documents[0].document_id == (
+        "s2s_api_docs__post_api_apiversion_merchants_vpas_validity"
+    )
+    assert snippets[0].mcp.documents[0].chunk_id == "0"
+    assert snippets[1].mcp and snippets[1].mcp.documents[0].chunk_id == "15"
+    assert snippets[2].mcp and snippets[2].mcp.documents[0].document_id is None
+    # The digest validator must accept a full dump/reload round-trip.
+    from grounding.models import GroundingSnippet
+
+    for snippet in snippets:
+        reloaded = GroundingSnippet.model_validate(
+            json.loads(snippet.model_dump_json())
+        )
+        assert reloaded.snippet_id == snippet.snippet_id
+
+
 async def test_mcp_client_discovers_allowlists_and_cites_results() -> None:
     transport = _FakeMCPTransport()
     client = MCPClient(
@@ -705,3 +823,167 @@ def test_agentic_validation_errors_do_not_persist_model_input() -> None:
     sanitized = _safe_validation_error(captured.value)
     assert secret_marker not in sanitized
     assert "unexpected" in sanitized
+
+
+def test_repository_suffix_resolution_defaults_merges_and_validates() -> None:
+    from grounding.repository import (
+        CODE_SUFFIXES,
+        DEFAULT_SUFFIXES,
+        resolve_repository_suffixes,
+    )
+
+    assert set(resolve_repository_suffixes()) == set(DEFAULT_SUFFIXES)
+    assert resolve_repository_suffixes() == tuple(sorted(DEFAULT_SUFFIXES))
+    assert resolve_repository_suffixes(include_code=True) == tuple(CODE_SUFFIXES)
+    assert tuple(CODE_SUFFIXES) == tuple(sorted(CODE_SUFFIXES))
+    assert {".hs", ".lhs", ".py", ".java", ".sh"} <= set(CODE_SUFFIXES)
+
+    merged = resolve_repository_suffixes([".hs", " .LHS "])
+    assert ".hs" in merged and ".lhs" in merged
+    assert len(merged) == len(set(merged))
+    assert merged == tuple(sorted(merged))
+
+    for invalid in ("hs", "", ".hs hs", "hs.", ".hs,.lhs"):
+        with pytest.raises(ValueError, match="dotted extension"):
+            resolve_repository_suffixes([invalid])
+
+
+def test_repository_include_code_indexes_haskell_sources(tmp_path: Path) -> None:
+    from grounding.repository import RepositoryIndexConfig, resolve_repository_suffixes
+
+    repository_root = tmp_path / "newton-hs"
+    handlers = repository_root / "handlers"
+    handlers.mkdir(parents=True)
+    (handlers / "ValAdd.hs").write_text(
+        "module ValAdd (handler) where\n"
+        "-- reqValAdd validates a payee VPA for P2P transfers\n"
+        "validatePayeeVpa :: Vpa -> IO (Either ApiError RespValAdd)\n"
+    )
+    (repository_root / "changelog.md").write_text("unrelated portal notes\n")
+
+    default_index = RepositoryIndex.build(repository_root)
+    assert default_index.summary.files_indexed == 1
+    assert default_index.summary.files_skipped == 1
+    assert not default_index.search(
+        "reqValAdd validate payee VPA P2P", limit=5, anchor_terms=("reqValAdd",)
+    )
+
+    code_index = RepositoryIndex.build(
+        repository_root,
+        RepositoryIndexConfig(
+            suffixes=resolve_repository_suffixes([".lhs"], include_code=True)
+        ),
+    )
+    assert code_index.summary.files_indexed == 2
+    matches = code_index.search(
+        "reqValAdd validate payee VPA P2P", limit=5, anchor_terms=("reqValAdd",)
+    )
+    assert [item.repository.path for item in matches if item.repository] == [
+        "handlers/ValAdd.hs"
+    ]
+
+
+def test_grounding_and_synthesis_cli_expose_repository_suffix_flags() -> None:
+    from grounding.cli import build_parser as grounding_parser
+    from synthesis.cli import build_parser as synthesis_parser
+
+    grounding_args = grounding_parser().parse_args(
+        [
+            "--knowledge",
+            "knowledge.json",
+            "--repo-path",
+            "repo",
+            "--plan-only",
+            "--repo-include-code",
+            "--repo-suffix",
+            ".hs",
+        ]
+    )
+    assert grounding_args.repo_include_code is True
+    assert grounding_args.repo_suffix == [".hs"]
+
+    synthesis_args = synthesis_parser().parse_args(
+        [
+            "--grounding",
+            "package",
+            "--strategy",
+            "bulk",
+            "--plan-only",
+            "--repo-path",
+            "repo",
+            "--repo-suffix",
+            ".lhs",
+        ]
+    )
+    assert synthesis_args.repo_include_code is False
+    assert synthesis_args.repo_suffix == [".lhs"]
+
+
+def test_repository_search_diversifies_results_across_directories(
+    tmp_path: Path,
+) -> None:
+    from grounding.repository import RepositoryIndexConfig
+
+    repository_root = tmp_path / "newton-hs"
+    flow = repository_root / "src" / "product" / "reqvaladd"
+    flow.mkdir(parents=True)
+    payload = "reqValAdd validates a payee VPA for P2P transfers\n"
+    for name in ("Controller.hs", "Customer.hs", "Helper.hs", "DynamicVpa.hs"):
+        (flow / name).write_text(f"module {name} where\n{payload * 4}")
+    routes = repository_root / "src" / "app" / "routes"
+    routes.mkdir(parents=True)
+    (routes / "Npci.hs").write_text(
+        'module Npci where\n-- route "reqvaladd" XML POST reqValAdd\n'
+    )
+    api_types = repository_root / "src" / "npci"
+    api_types.mkdir(parents=True)
+    (api_types / "ApiTypes.hs").write_text(
+        "module ApiTypes where\n-- reqValAdd ReqBody XML Post AckContract\n"
+    )
+    index = RepositoryIndex.build(
+        repository_root,
+        RepositoryIndexConfig(suffixes=(".hs",)),
+    )
+
+    matches = index.search("reqValAdd route", limit=5, anchor_terms=("reqValAdd",))
+    directories = {
+        item.repository.path.rsplit("/", 1)[0] for item in matches if item.repository
+    }
+    assert "src/product/reqvaladd" in directories
+    assert "src/app/routes" in directories
+    assert "src/npci" in directories
+
+
+def test_repository_read_around_match_centers_on_first_hit(tmp_path: Path) -> None:
+    from grounding.repository import RepositoryIndexConfig
+
+    repository_root = tmp_path / "newton-hs"
+    routes = repository_root / "routes"
+    routes.mkdir(parents=True)
+    lines = ["module Routes where"]
+    lines += [f"-- filler {index}" for index in range(2, 55)]
+    lines.append('"ReqValAdd" :> ReqBody XML Post Ack')
+    lines += [f"-- tail {index}" for index in range(2, 40)]
+    (routes / "Npc.hs").write_text("\n".join(lines))
+    elsewhere = repository_root / "types"
+    elsewhere.mkdir()
+    (elsewhere / "Common.hs").write_text(
+        'module Common where\n-- "ReqValAdd" :> also referenced here\n'
+    )
+    index = RepositoryIndex.build(
+        repository_root,
+        RepositoryIndexConfig(suffixes=(".hs",)),
+    )
+
+    snippet = index.read_around_match("routes/Npc.hs", '"ReqValAdd" :>')
+    assert snippet.repository is not None
+    assert '"ReqValAdd" :> ReqBody XML Post Ack' in snippet.content
+    assert snippet.repository.line_start <= 55 - 4
+    assert snippet.repository.line_end >= 56 >= snippet.repository.line_start
+
+    with pytest.raises(Exception, match=r"not found.*types/Common\.hs"):
+        index.read_around_match("routes/Npc.hs", '"ReqValAdd" :> also')
+    with pytest.raises(Exception, match="not found"):
+        index.read_around_match("routes/Npc.hs", "missing-anchor-xyz")
+    with pytest.raises(Exception, match="anchor"):
+        index.read_around_match("routes/Npc.hs", "  ")

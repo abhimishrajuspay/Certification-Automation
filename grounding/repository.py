@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from grounding.models import (
     GroundingSnippet,
@@ -36,6 +36,67 @@ DEFAULT_SUFFIXES = (
     ".yaml",
     ".yml",
 )
+CODE_SUFFIXES = tuple(
+    sorted(
+        set(DEFAULT_SUFFIXES)
+        | {
+            ".c",
+            ".cabal",
+            ".cc",
+            ".conf",
+            ".cpp",
+            ".cs",
+            ".css",
+            ".dhall",
+            ".go",
+            ".gradle",
+            ".groovy",
+            ".h",
+            ".hpp",
+            ".hs",
+            ".html",
+            ".ini",
+            ".java",
+            ".js",
+            ".jsx",
+            ".kt",
+            ".kts",
+            ".lhs",
+            ".nix",
+            ".php",
+            ".py",
+            ".rb",
+            ".rs",
+            ".scala",
+            ".sh",
+            ".sql",
+            ".toml",
+            ".ts",
+            ".tsx",
+        }
+    )
+)
+_SUFFIX_PATTERN = re.compile(r"\.[0-9a-z]+")
+
+
+def resolve_repository_suffixes(
+    extra_suffixes: Optional[Sequence[str]] = None,
+    *,
+    include_code: bool = False,
+) -> tuple[str, ...]:
+    """Merge user-requested file extensions into the retrieval allowlist."""
+
+    merged = set(CODE_SUFFIXES if include_code else DEFAULT_SUFFIXES)
+    for value in extra_suffixes or ():
+        normalized = value.strip().casefold()
+        if not _SUFFIX_PATTERN.fullmatch(normalized):
+            raise ValueError(
+                f"repository suffix must be one dotted extension like .hs: {value!r}"
+            )
+        merged.add(normalized)
+    return tuple(sorted(merged))
+
+
 DEFAULT_EXCLUDED_DIRECTORIES = (
     ".deprecated",
     ".git",
@@ -345,11 +406,27 @@ class RepositoryIndex:
             if score > 0:
                 scored.append((score, document.path, best_line, document))
 
+        ordered = sorted(scored, key=lambda item: (-item[0], item[1], item[2]))
+        # Directory-diverse first round: one representative per directory keeps a
+        # large feature tree (for example a whole module hierarchy named after
+        # the query) from consuming every result slot ahead of route/schema
+        # definition files. Leftovers then fill remaining slots by score.
+        diverse: list[tuple[int, str, int, _IndexedDocument]] = []
+        leftovers: list[tuple[int, str, int, _IndexedDocument]] = []
+        seen_directories: set[str] = set()
+        for item in ordered:
+            directory = item[1].rsplit("/", 1)[0]
+            if directory in seen_directories:
+                leftovers.append(item)
+                continue
+            seen_directories.add(directory)
+            diverse.append(item)
+            if len(diverse) >= limit:
+                break
+        diverse.extend(leftovers[: limit - len(diverse)])
+
         snippets: list[GroundingSnippet] = []
-        for score, _, center, document in sorted(
-            scored,
-            key=lambda item: (-item[0], item[1], item[2]),
-        )[:limit]:
+        for score, _, center, document in diverse[:limit]:
             start_index = max(0, center - self.config.excerpt_context_lines)
             end_index = min(
                 len(document.lines), center + self.config.excerpt_context_lines + 1
@@ -388,6 +465,328 @@ class RepositoryIndex:
                 )
             )
         return tuple(snippets)
+
+    def read_lines(
+        self,
+        path: str,
+        line_start: int,
+        line_end: int,
+        *,
+        maximum_lines: int = 200,
+        maximum_characters: Optional[int] = None,
+    ) -> GroundingSnippet:
+        """Read a bounded, citable window from one indexed repository file."""
+
+        normalized = path.strip()
+        if (
+            not normalized
+            or normalized.startswith(("/", "\\"))
+            or any(sep in normalized for sep in ("..", "//", "\\"))
+        ):
+            raise RepositoryIndexError(
+                "repository read path must be a clean relative path"
+            )
+        if maximum_lines <= 0:
+            raise ValueError("read window limits must be positive")
+        if line_start < 1 or line_end < line_start:
+            raise RepositoryIndexError(
+                "repository read requires 1 <= line_start <= line_end"
+            )
+        document = next(
+            (item for item in self._documents if item.path == normalized),
+            None,
+        )
+        if document is None:
+            raise RepositoryIndexError(
+                f"repository path is not an indexed document: {normalized}"
+            )
+        total = len(document.lines)
+        if line_start > total:
+            raise RepositoryIndexError(
+                f"line_start {line_start} exceeds document length {total}"
+            )
+        limit = maximum_characters or self.config.maximum_excerpt_characters
+        if limit <= 0:
+            raise ValueError("read excerpt character limit must be positive")
+
+        # Trim complete lines until the window fits the excerpt cap; the
+        # returned window is what the citation hashes. A single overlong line
+        # (for example minified assets admitted by CODE_SUFFIXES) is
+        # character-trimmed with an explicit elision marker so consumers can
+        # never mistake a cut payload for the file's own text.
+        capped_end = min(line_end, line_start + maximum_lines - 1, total)
+        while capped_end > line_start:
+            raw = "\n".join(document.lines[line_start - 1 : capped_end]).strip()
+            if len(raw) <= limit:
+                break
+            capped_end -= 1
+        excerpt = "\n".join(document.lines[line_start - 1 : capped_end]).strip()
+        if len(excerpt) > limit:
+            excerpt = (
+                excerpt[:limit]
+                + "\n... [single line exceeded the excerpt cap; truncated]"
+            )
+        if not excerpt:
+            raise RepositoryIndexError("repository read window produced no content")
+
+        citation = RepositoryCitation(
+            repository_id=self.summary.repository_id,
+            path=document.path,
+            file_sha256=document.file_sha256,
+            line_start=line_start,
+            line_end=capped_end,
+            excerpt_sha256=hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+            redacted=document.redacted,
+        )
+        return GroundingSnippet(
+            snippet_id=_hash_json(
+                {
+                    "source": GroundingSourceKind.REPOSITORY.value,
+                    "citation": citation.model_dump(mode="json"),
+                    "content": excerpt,
+                }
+            ),
+            source_kind=GroundingSourceKind.REPOSITORY,
+            title=f"{document.path}:{line_start}-{capped_end}",
+            content=excerpt,
+            relevance_score=0,
+            repository=citation,
+        )
+
+    def read_around_match(
+        self,
+        path: str,
+        anchor: str,
+        *,
+        context_lines: int = 10,
+        maximum_lines: int = 200,
+        maximum_characters: Optional[int] = None,
+    ) -> GroundingSnippet:
+        """Read a window centered on the first line containing ``anchor``.
+
+        Targeted evidence reads (for example a route declaration or a field
+        binder) should not require guessing line numbers in large modules: the
+        caller supplies the exact term to locate and receives the cited window
+        that contains its first case-insensitive match.
+        """
+
+        needle = anchor.strip()
+        if not needle:
+            raise RepositoryIndexError("repository anchor must not be empty")
+        if context_lines < 1:
+            raise ValueError("anchor context lines must be positive")
+        normalized = path.strip()
+        document = next(
+            (item for item in self._documents if item.path == normalized),
+            None,
+        )
+        if document is None:
+            raise RepositoryIndexError(
+                f"repository path is not an indexed document: {normalized}"
+            )
+        lowered = needle.casefold()
+        match_index = next(
+            (
+                index
+                for index, line in enumerate(document.lines)
+                if lowered in line.casefold()
+            ),
+            None,
+        )
+        if match_index is None:
+            candidates = sorted(
+                document.path
+                for document in self._documents
+                if document.path != normalized
+                and any(lowered in line.casefold() for line in document.lines)
+            )[:5]
+            hint = (
+                f"; other indexed files containing it: {', '.join(candidates)}"
+                if candidates
+                else ""
+            )
+            raise RepositoryIndexError(
+                f"anchor {needle!r} not found in {normalized}{hint}"
+            )
+        center = match_index + 1
+        return self.read_lines(
+            normalized,
+            max(1, center - context_lines),
+            center + context_lines,
+            maximum_lines=maximum_lines,
+            maximum_characters=maximum_characters,
+        )
+
+    def record_accessor_types(self, relative_path: str) -> tuple[str, ...]:
+        """Capitalized field types named inside an already-read record file.
+
+        Accessor lines like ``__Txn :: Txn`` or ``_payee :: Maybe Payees``
+        name the declarations that define the record's serialized shape, so a
+        declaration cascade can read them deterministically instead of asking
+        the model to discover the nesting on its own.
+        """
+
+        normalized = relative_path.strip()
+        document = next(
+            (item for item in self._documents if item.path == normalized),
+            None,
+        )
+        if document is None:
+            return ()
+        pattern = re.compile(r"::\s*(?:Maybe\s+)?([A-Z][A-Za-z0-9'’]*)")
+        skip = {
+            "Text",
+            "Bool",
+            "Int",
+            "Integer",
+            "Double",
+            "Float",
+            "String",
+            "Maybe",
+            "Value",
+            "Object",
+            "UTCTime",
+            "Natural",
+            "Char",
+            "Generic",
+        }
+        names: list[str] = []
+        for line in document.lines:
+            for match in pattern.finditer(line):
+                name = match.group(1)
+                if name in skip or name in names:
+                    continue
+                names.append(name)
+        return tuple(names)
+
+    def find_data_declaration_paths(
+        self, type_name: str, *, reference_path: str = ""
+    ) -> tuple[str, ...]:
+        """Indexed files whose text declares ``data <type_name>``.
+
+        Type declarations are where serialized wire elements are named; the
+        returned paths are ordered with the reference file's directory family
+        first so a declaration cascade reads from the same module cluster
+        instead of an unrelated package that happens to declare the same name.
+        """
+
+        pattern = re.compile(rf"^data\s+{re.escape(type_name)}\b")
+        hits = sorted(
+            document.path
+            for document in self._documents
+            if any(pattern.match(line.lstrip()) for line in document.lines)
+        )
+        reference_dirs = reference_path.split("/")
+
+        def _family_distance(path: str) -> tuple[int, bool, str]:
+            shared = 0
+            for left, right in zip(path.split("/"), reference_dirs):
+                if left != right:
+                    break
+                shared += 1
+            return (-shared, "/Types/" not in path, path)
+
+        hits.sort(key=_family_distance)
+        return tuple(hits)
+
+    def api_type_alias_names(self, relative_path: str) -> tuple[str, ...]:
+        """Servant-style ``type XAPIs =`` alias names declared in one file.
+
+        Route modules declare the API skeleton as a type alias; the mount
+        prefix lives wherever that alias is referenced via ``:> Alias`` in
+        another module. Generic alias parsing is bounded to API-suffixed
+        names so unrelated local type aliases never mislead the cascade.
+        """
+
+        normalized = relative_path.strip()
+        document = next(
+            (item for item in self._documents if item.path == normalized),
+            None,
+        )
+        if document is None:
+            return ()
+        pattern = re.compile(r"^type\s+([A-Z][A-Za-z0-9]*(?:APIs|Apis|API))\s*=")
+        names: list[str] = []
+        for line in document.lines:
+            match = pattern.match(line.strip())
+            if match and match.group(1) not in names:
+                names.append(match.group(1))
+        return tuple(names)
+
+    def mount_reference_paths(
+        self,
+        alias: str,
+        *,
+        exclude_path: str = "",
+        reference_path: str = "",
+    ) -> tuple[str, ...]:
+        """Indexed files whose text mounts ``:> <qualifier?>.alias``.
+
+        Module qualifiers (``NPCI.NpciAPIs``) are matched loosely on purpose:
+        anchoring on the same alias string recovers the mount window, and the
+        strongly typed mount site is then evidenced from the read content.
+        """
+
+        pattern = re.compile(rf":>\s+[A-Z][A-Za-z0-9.]*\.?{re.escape(alias)}\b")
+        hits = sorted(
+            document.path
+            for document in self._documents
+            if document.path != exclude_path
+            and any(pattern.search(line) for line in document.lines)
+        )
+        reference_dirs = reference_path.split("/")
+
+        def _family_distance(path: str) -> tuple[int, bool, str]:
+            shared = 0
+            for left, right in zip(path.split("/"), reference_dirs):
+                if left != right:
+                    break
+                shared += 1
+            return (-shared, "/Routes/" not in path, path)
+
+        hits.sort(key=_family_distance)
+        return tuple(hits)
+
+    def instance_declaration_targets(
+        self, type_name: str, *, reference_path: str = ""
+    ) -> tuple[tuple[str, str], ...]:
+        """Indexed ``instance <Class> <type_name>`` declarations and anchors.
+
+        Serialization instances (``FromXml``/``ToXml``/``FromJSON``/``ToJSON``)
+        decide element-vs-attribute wire naming; the declaration cascade reads
+        them so the model does not have to infer wire names from record field
+        names. Each hit is ``(path, anchor)`` where ``anchor`` is the instance
+        head line usable with :meth:`read_around_match`. Hits are ordered with
+        XML classes first, then by the reference file's directory family.
+        """
+
+        pattern = re.compile(
+            rf"^instance\s+(FromXml|ToXml|FromJSON|ToJSON)\s+"
+            rf"{re.escape(type_name)}\b"
+        )
+        class_order = {"FromXml": 0, "ToXml": 1, "FromJSON": 2, "ToJSON": 3}
+        raw: list[tuple[int, int, str, str]] = []
+        reference_dirs = reference_path.split("/")
+        for document in self._documents:
+            for line in document.lines:
+                match = pattern.match(line.lstrip())
+                if match is None:
+                    continue
+                shared = 0
+                for left, right in zip(document.path.split("/"), reference_dirs):
+                    if left != right:
+                        break
+                    shared += 1
+                raw.append(
+                    (
+                        class_order[match.group(1)],
+                        -shared,
+                        document.path,
+                        line.lstrip().rstrip(),
+                    )
+                )
+        raw.sort()
+        return tuple((path, anchor) for _, _, path, anchor in raw)
 
 
 def _tokenize(value: str) -> tuple[str, ...]:
@@ -429,9 +828,11 @@ def _hash_json(value: object) -> str:
 
 
 __all__ = [
+    "CODE_SUFFIXES",
     "DEFAULT_EXCLUDED_DIRECTORIES",
     "DEFAULT_SUFFIXES",
     "RepositoryIndex",
     "RepositoryIndexConfig",
     "RepositoryIndexError",
+    "resolve_repository_suffixes",
 ]

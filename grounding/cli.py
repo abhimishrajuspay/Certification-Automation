@@ -39,6 +39,7 @@ from grounding.repository import (
     RepositoryIndex,
     RepositoryIndexConfig,
     RepositoryIndexError,
+    resolve_repository_suffixes,
 )
 
 
@@ -89,6 +90,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="repository to index for schemas, templates, examples, and docs",
+    )
+    parser.add_argument(
+        "--repo-include-code",
+        action="store_true",
+        help="also index source-code files such as .hs/.java/.py (or use --repo-suffix)",
+    )
+    parser.add_argument(
+        "--repo-suffix",
+        action="append",
+        default=None,
+        metavar=".EXT",
+        help="extra indexed repository file extension (repeatable), for example "
+        "--repo-suffix .hs",
     )
     parser.add_argument(
         "--strategy",
@@ -364,6 +378,9 @@ async def _run(args: argparse.Namespace) -> int:
     repository = RepositoryIndex.build(
         args.repo_path,
         RepositoryIndexConfig(
+            suffixes=resolve_repository_suffixes(
+                args.repo_suffix, include_code=args.repo_include_code
+            ),
             maximum_file_bytes=args.maximum_repo_file_bytes,
             maximum_total_bytes=args.maximum_repo_total_bytes,
             maximum_excerpt_characters=repository_excerpt_limit,
