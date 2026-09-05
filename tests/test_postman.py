@@ -31,6 +31,8 @@ from synthesis.models import (
     SynthesisCoverage,
     SynthesisDisposition,
     SynthesisPackage,
+    SignatureAlgorithm,
+    SignatureBinding,
     TemplateVariableBinding,
     TemplateVariableSource,
     TestCaseExecutionSpec as ExecutionSpec,
@@ -204,6 +206,219 @@ def test_renderer_builds_dependency_ordered_secret_safe_collection(
     for item in exported.manifest.files:
         data = (exported.output_directory / item.name).read_bytes()
         assert hashlib.sha256(data).hexdigest() == item.sha256
+
+
+def test_signature_recipe_renders_deterministic_hmac_prerequest() -> None:
+    spec = ExecutionSpec(
+        test_case_id="TC_SIG",
+        title="Signed call",
+        disposition=SynthesisDisposition.READY,
+        request=HTTPRequestSpec(
+            method=HTTPMethod.POST,
+            path="/api/{{API_VERSION}}/merchants/vpas/validity",
+            headers=(
+                NamedValue(name="Content-Type", value="application/json"),
+                NamedValue(name="x-merchant-id", value="{{MERCHANT_ID}}"),
+                NamedValue(name="x-merchant-channel-id", value="{{CHANNEL_ID}}"),
+                NamedValue(
+                    name="x-merchant-signature", value="{{X_MERCHANT_SIGNATURE}}"
+                ),
+            ),
+            body=RequestBodySpec(
+                mode=RequestBodyMode.JSON,
+                content_type="application/json",
+                template='{"customerVpa":"{{CUSTOMER_VPA}}"}',
+            ),
+            signature=SignatureBinding(
+                algorithm=SignatureAlgorithm.MERCHANT_HMAC_SHA256,
+                header_name="x-merchant-signature",
+                key_binding_name="API_KEY",
+                component_binding_names=("MERCHANT_ID", "CHANNEL_ID"),
+            ),
+        ),
+        variable_bindings=(
+            TemplateVariableBinding(
+                name="API_KEY",
+                source=TemplateVariableSource.ENVIRONMENT,
+                sensitive=True,
+                description="Signing key",
+            ),
+            TemplateVariableBinding(
+                name="X_MERCHANT_SIGNATURE",
+                source=TemplateVariableSource.ENVIRONMENT,
+                sensitive=True,
+                description="Computed at request time by the signature recipe",
+            ),
+            TemplateVariableBinding(
+                name="MERCHANT_ID",
+                source=TemplateVariableSource.ENVIRONMENT,
+                description="Merchant id",
+            ),
+            TemplateVariableBinding(
+                name="CHANNEL_ID",
+                source=TemplateVariableSource.ENVIRONMENT,
+                description="Channel id",
+            ),
+            TemplateVariableBinding(
+                name="API_VERSION",
+                source=TemplateVariableSource.EVIDENCE_LITERAL,
+                value="1",
+                description="Evidence-cited api version",
+            ),
+            TemplateVariableBinding(
+                name="CUSTOMER_VPA",
+                source=TemplateVariableSource.ENVIRONMENT,
+                description="Cert VPA",
+            ),
+        ),
+        assertions=(
+            ResponseAssertion(
+                source=AssertionSource.HTTP_STATUS,
+                operator=AssertionOperator.EQUALS,
+                expected="200",
+                description="Signed request succeeds",
+            ),
+        ),
+        evidence_snippet_ids=("b" * 64,),
+        confidence=Confidence.HIGH,
+        rationale="S2S spec documents the HMAC recipe.",
+        human_review_required=False,
+    )
+    package = PostmanBuilder(_package((spec,)), "e" * 64).build()
+    prerequest = "\n".join(package.collection.item[0].event[0].script.exec)
+    assert "CryptoJS.HmacSHA256(" in prerequest
+    assert '(pm.variables.get("MERCHANT_ID") || "")' in prerequest
+    assert '(pm.variables.get("CHANNEL_ID") || "")' in prerequest
+    assert 'pm.variables.replaceIn(pm.request.body.raw || "")' in prerequest
+    assert "CryptoJS.enc.Hex" in prerequest
+    assert 'pm.request.headers.upsert({ key: "x-merchant-signature"' in prerequest
+    # The signature env placeholder stays empty and secret-free
+    keys = {value.key for value in package.environment.values}
+    assert "API_KEY" in keys
+
+
+def test_signature_recipe_rejects_undeclared_or_nonsensitive_key() -> None:
+    base = ExecutionSpec(
+        test_case_id="TC_SIG2",
+        title="Signed call",
+        disposition=SynthesisDisposition.READY,
+        request=HTTPRequestSpec(
+            method=HTTPMethod.POST,
+            path="/signed",
+            headers=(NamedValue(name="x-sign", value="{{X_SIGN}}"),),
+            body=RequestBodySpec(
+                mode=RequestBodyMode.JSON,
+                content_type="application/json",
+                template="{}",
+            ),
+            signature=SignatureBinding(
+                algorithm=SignatureAlgorithm.MERCHANT_HMAC_SHA256,
+                header_name="x-sign",
+                key_binding_name="API_KEY",
+                component_binding_names=("MERCHANT_ID",),
+            ),
+        ),
+        variable_bindings=(
+            TemplateVariableBinding(
+                name="MERCHANT_ID",
+                source=TemplateVariableSource.ENVIRONMENT,
+                description="Merchant id",
+            ),
+            TemplateVariableBinding(
+                name="X_SIGN",
+                source=TemplateVariableSource.ENVIRONMENT,
+                sensitive=True,
+                description="Computed at request time by the signature recipe",
+            ),
+            # Deliberately NOT marked sensitive: the signature recipe must
+            # reject a key binding that is not a sensitive environment value.
+            TemplateVariableBinding(
+                name="API_KEY",
+                source=TemplateVariableSource.ENVIRONMENT,
+                description="Signing key (wrongly non-secret)",
+            ),
+        ),
+        evidence_snippet_ids=("b" * 64,),
+        confidence=Confidence.HIGH,
+        assertions=(
+            ResponseAssertion(
+                source=AssertionSource.HTTP_STATUS,
+                operator=AssertionOperator.EQUALS,
+                expected="200",
+                description="ok",
+            ),
+        ),
+        rationale="x",
+        human_review_required=False,
+    )
+    with pytest.raises(PostmanBuildError, match="sensitive environment"):
+        PostmanBuilder(_package((base,)), "e" * 64).build()
+
+
+def test_include_needs_review_renders_marked_drafts_and_skips_requestless() -> None:
+    parent, child = _specifications()
+    parent_data = parent.model_dump(mode="json")
+    parent_data.update(
+        {
+            "disposition": SynthesisDisposition.NEEDS_REVIEW,
+            "human_review_required": True,
+            "unresolved_requirements": ["confirm the endpoint"],
+        }
+    )
+    needs_review = ExecutionSpec.model_validate(parent_data)
+    package = _package(
+        (needs_review, child),
+        synthesis_complete=True,
+        execution_ready=False,
+    )
+
+    draft = PostmanBuilder(
+        package,
+        "e" * 64,
+        config=PostmanBuildConfig(include_needs_review=True),
+    ).build()
+
+    assert draft.report.coverage.rendered == 2
+    assert draft.report.coverage.rendered_needs_review == 1
+    assert draft.report.coverage.generation_complete is False
+    assert any("DRAFT" in line for line in draft.report.coverage.limitations)
+    parent_item = next(
+        item
+        for item in draft.collection.item
+        if item.id == draft.report.rendered_test_cases[0].item_id
+    )
+    assert parent_item.name.startswith("[REVIEW REQUIRED] ")
+    assert "DRAFT — REVIEW REQUIRED" in (parent_item.request.description or "")
+    assert "confirm the endpoint" in (parent_item.request.description or "")
+    child_item = next(
+        item
+        for item in draft.collection.item
+        if not item.name.startswith("[REVIEW REQUIRED]")
+    )
+    assert "[REVIEW]" not in child_item.name
+
+    # A needs_review spec without a request is skipped honestly, never rendered.
+    no_request_data = needs_review.model_dump(mode="json")
+    no_request_data["request"] = None
+    requestless = ExecutionSpec.model_validate(no_request_data)
+    blocked_package = _package(
+        (requestless, child),
+        synthesis_complete=True,
+        execution_ready=False,
+    )
+    empty = PostmanBuilder(
+        blocked_package,
+        "e" * 64,
+        config=PostmanBuildConfig(include_needs_review=True),
+    ).build()
+    assert empty.report.coverage.rendered == 0
+    assert empty.report.coverage.skipped == 2
+    skip_reasons = {
+        item.test_case_id: item.reason for item in empty.report.skipped_test_cases
+    }
+    assert "no request to render" in skip_reasons[parent.test_case_id]
+    # A READY child whose draft parent could not render is evicted, never orphaned.
+    assert "dependency is unavailable" in skip_reasons[child.test_case_id]
 
 
 def test_partial_render_skips_nonready_cases_and_their_descendants() -> None:

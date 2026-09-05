@@ -17,6 +17,7 @@ from synthesis.models import (
     AssertionOperator,
     AssertionSource,
     GeneratedValueKind,
+    SignatureAlgorithm,
     RequestBodyMode,
     ResponseAssertion,
     SynthesisDisposition,
@@ -60,6 +61,10 @@ class PostmanBuildError(RuntimeError):
 class PostmanBuildConfig:
     base_url_variable: str = "base_url"
     allow_partial: bool = False
+    # Explicit operator opt-in: render needs_review specifications as draft
+    # requests. Marking is per-item and cumulative in the audit report; the
+    # collection never claims execution readiness for them.
+    include_needs_review: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -101,9 +106,8 @@ class PostmanBuilder:
         }
 
     def build(self) -> PostmanBuildResult:
-        if (
-            not self.synthesis.coverage.execution_ready
-            and not self.config.allow_partial
+        if not self.synthesis.coverage.execution_ready and not (
+            self.config.allow_partial or self.config.include_needs_review
         ):
             raise PostmanBuildError(
                 "Postman generation requires execution_ready Phase 9 output; use "
@@ -111,7 +115,9 @@ class PostmanBuilder:
             )
 
         ordered_specs, skip_reasons = self._resolve_renderable_specs()
-        if skip_reasons and not self.config.allow_partial:
+        if skip_reasons and not (
+            self.config.allow_partial or self.config.include_needs_review
+        ):
             first = next(iter(skip_reasons.items()))
             raise PostmanBuildError(
                 f"cannot render all testcases: {first[0]}: {first[1]}"
@@ -210,12 +216,22 @@ class PostmanBuilder:
             spec.disposition == SynthesisDisposition.READY
             for spec in self.synthesis.specifications
         )
+        rendered_needs_review = sum(
+            spec.disposition == SynthesisDisposition.NEEDS_REVIEW
+            for spec in ordered_specs
+        )
         total = self.synthesis.coverage.test_cases
         limitations: list[str] = []
         if not self.synthesis.coverage.synthesis_complete:
             limitations.append("source Phase 9 synthesis is incomplete")
         if not self.synthesis.coverage.execution_ready:
             limitations.append("source Phase 9 package requires review or is blocked")
+        if rendered_needs_review:
+            limitations.append(
+                f"{rendered_needs_review} testcases were rendered as DRAFT "
+                "(needs_review) under the explicit include_needs_review opt-in; "
+                "review before execution"
+            )
         if skipped_records:
             limitations.append(
                 f"{len(skipped_records)} testcases were omitted from the collection"
@@ -240,6 +256,7 @@ class PostmanBuilder:
                 test_cases=total,
                 ready_source_cases=ready_source_cases,
                 rendered=len(rendered_records),
+                rendered_needs_review=rendered_needs_review,
                 skipped=len(skipped_records),
                 generation_complete=generation_complete,
                 limitations=tuple(limitations),
@@ -260,7 +277,18 @@ class PostmanBuilder:
         }
         candidates: dict[str, TestCaseExecutionSpec] = {}
         for spec in self.synthesis.specifications:
-            if spec.disposition == SynthesisDisposition.READY:
+            if (
+                spec.disposition == SynthesisDisposition.NEEDS_REVIEW
+                and self.config.include_needs_review
+                and spec.request is None
+            ):
+                skip_reasons[spec.test_case_id] = (
+                    "needs_review specification has no request to render"
+                )
+            elif spec.disposition == SynthesisDisposition.READY or (
+                self.config.include_needs_review
+                and spec.disposition == SynthesisDisposition.NEEDS_REVIEW
+            ):
                 candidates[spec.test_case_id] = spec
             else:
                 skip_reasons[spec.test_case_id] = (
@@ -350,7 +378,7 @@ class PostmanBuilder:
     ) -> PostmanItem:
         if spec.request is None:
             raise PostmanBuildError(
-                f"ready testcase {spec.test_case_id} has no request"
+                f"{spec.disposition.value} testcase {spec.test_case_id} has no request"
             )
         item_id = str(
             uuid5(
@@ -406,6 +434,19 @@ class PostmanBuilder:
                 f"{quote(parameter.value, safe='{}[]:/,')}"
                 for parameter in enabled_query
             )
+        is_draft = spec.disposition == SynthesisDisposition.NEEDS_REVIEW
+        description = f"{spec.rationale}\n\nEvidence snippets: " + ", ".join(
+            spec.evidence_snippet_ids
+        )
+        if is_draft:
+            unresolved = "\n".join(
+                f"- {requirement}" for requirement in spec.unresolved_requirements
+            )
+            description = (
+                "DRAFT — REVIEW REQUIRED before execution. Phase 9 disposition "
+                f"is needs_review (operator opt-in rendering). Rationale: {description}"
+                + (f"\n\nUnresolved requirements:\n{unresolved}" if unresolved else "")
+            )
         request = PostmanRequest(
             method=spec.request.method.value,
             header=tuple(headers),
@@ -420,10 +461,7 @@ class PostmanBuilder:
                 ),
                 query=query,
             ),
-            description=(
-                f"{spec.rationale}\n\nEvidence snippets: "
-                + ", ".join(spec.evidence_snippet_ids)
-            ),
+            description=description,
         )
         prerequest = _prerequest_script(
             spec,
@@ -439,7 +477,11 @@ class PostmanBuilder:
             dependency_names=dependency_names,
         )
         return PostmanItem(
-            name=f"{spec.test_case_id} - {spec.title}",
+            name=(
+                f"[REVIEW REQUIRED] {spec.test_case_id} - {spec.title}"
+                if is_draft
+                else f"{spec.test_case_id} - {spec.title}"
+            ),
             id=item_id,
             event=(
                 PostmanEvent(
@@ -673,8 +715,67 @@ def _prerequest_script(
                 f"  pm.variables.set({_js(binding.name)}, "
                 f"pm.variables.replaceIn({_js(dynamic)}));"
             )
+    lines.extend(_signature_lines(spec))
     lines.append("}")
     return lines
+
+
+def _signature_lines(spec: TestCaseExecutionSpec) -> list[str]:
+    """Render the deterministic request-time signature recipe, if declared.
+
+    The recipe is structural only: ordered variable bindings whose values are
+    concatenated (optionally followed by the substituted raw body) and hashed
+    with HMAC-SHA256 using the declared sensitive environment key.
+    """
+
+    binding = spec.request.signature
+    if binding is None:
+        return []
+    if binding.algorithm != SignatureAlgorithm.MERCHANT_HMAC_SHA256:
+        raise PostmanBuildError(f"unsupported signature algorithm: {binding.algorithm}")
+    by_name = {item.name: item for item in spec.variable_bindings}
+    key = by_name.get(binding.key_binding_name)
+    if (
+        key is None
+        or key.source != TemplateVariableSource.ENVIRONMENT
+        or not key.sensitive
+    ):
+        raise PostmanBuildError(
+            f"signature key binding {binding.key_binding_name} must be a "
+            "sensitive environment variable"
+        )
+    component_sources = {
+        TemplateVariableSource.ENVIRONMENT,
+        TemplateVariableSource.GENERATED,
+        TemplateVariableSource.PORTAL_FIELD,
+        TemplateVariableSource.EVIDENCE_LITERAL,
+    }
+    for name in binding.component_binding_names:
+        component = by_name.get(name)
+        if component is None or component.source not in component_sources:
+            raise PostmanBuildError(
+                f"signature component {name} must be a declared environment, "
+                "generated, portal, or evidence-literal binding"
+            )
+    parts = " + ".join(
+        f'(pm.variables.get({_js(name)}) || "")'
+        for name in binding.component_binding_names
+    )
+    if binding.raw_body_component:
+        parts += ' + (pm.variables.replaceIn(pm.request.body.raw || ""))'
+    return [
+        "  // signature: merchant_hmac_sha256 (deterministic recipe)",
+        "  try {",
+        f"    const __czSigned = {parts};",
+        "    const __czSignature = CryptoJS.HmacSHA256(__czSigned, "
+        f'pm.variables.get({_js(binding.key_binding_name)}) || ""'
+        ").toString(CryptoJS.enc.Hex);",
+        f"    pm.request.headers.upsert({{ key: {_js(binding.header_name)}, "
+        "value: __czSignature });",
+        "  } catch (__czSignatureError) {",
+        '    console.error("signature generation failed", __czSignatureError);',
+        "  }",
+    ]
 
 
 def _test_script(

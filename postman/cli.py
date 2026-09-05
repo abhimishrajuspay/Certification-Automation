@@ -59,6 +59,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="render only dependency-closed ready cases when Phase 9 needs review",
     )
     parser.add_argument(
+        "--include-needs-review",
+        action="store_true",
+        help=(
+            "explicit operator opt-in: additionally render needs_review specs as "
+            "DRAFT requests marked REVIEW REQUIRED with their unresolved "
+            "requirements; blocked specs remain skipped; implies --allow-partial"
+        ),
+    )
+    parser.add_argument(
         "--skip-synthesis-manifest-check",
         action="store_true",
         help="skip the Phase 9 package hash check for diagnostics",
@@ -88,7 +97,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             loaded.sha256,
             config=PostmanBuildConfig(
                 base_url_variable=args.base_url_variable,
-                allow_partial=args.allow_partial or args.plan_only,
+                allow_partial=(
+                    args.allow_partial or args.include_needs_review or args.plan_only
+                ),
+                include_needs_review=args.include_needs_review,
             ),
         ).build()
         summary = {
@@ -100,6 +112,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "test_cases": result.report.coverage.test_cases,
             "ready_source_cases": result.report.coverage.ready_source_cases,
             "rendered": result.report.coverage.rendered,
+            "rendered_needs_review": result.report.coverage.rendered_needs_review,
             "skipped": result.report.coverage.skipped,
             "generation_complete": result.report.coverage.generation_complete,
         }

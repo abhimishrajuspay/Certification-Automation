@@ -192,6 +192,7 @@ class PostmanCoverage(PostmanModel):
     test_cases: int = Field(ge=0)
     ready_source_cases: int = Field(ge=0)
     rendered: int = Field(ge=0)
+    rendered_needs_review: int = Field(ge=0, default=0)
     skipped: int = Field(ge=0)
     generation_complete: bool
     limitations: tuple[str, ...] = ()
