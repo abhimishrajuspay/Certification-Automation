@@ -35,3 +35,6 @@ logs/
 # User-provided dummy portal; intentionally outside crawler source and tests
 dummy-portal/
 dummy_portal/
+
+# User-provided local MCP server clone + database/env assets (contains credentials)
+mcp/
