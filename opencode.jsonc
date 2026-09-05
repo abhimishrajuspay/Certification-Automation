@@ -1,0 +1,50 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "model": "litellm/kimi-latest",
+
+  "provider": {
+    "litellm": {
+      "options": {
+        "baseURL": "{env:CZ_LITELLM_URL}",
+        "apiKey": "{env:CZ_LITELLM_API_KEY}"
+      }
+    }
+  },
+
+  "agent": {
+    "certify": {
+      "description": "Certification run operator (see .opencode/agents/certify.md)",
+      "model": "litellm/kimi-latest",
+      "tools": {
+        "write": true,
+        "edit": true,
+        "bash": true,
+        "task": true,
+        "webfetch": true,
+        "glob": true,
+        "grep": true,
+        "read": true,
+        "skill": true
+      }
+    }
+  },
+
+  "permission": {
+    "edit": "allow",
+    "bash": {
+      "*": "ask",
+      "python3 -*": "allow",
+      "python3 .opencode/skills/certification-automation/scripts/*": "allow",
+      "psql *": "ask",
+      "redis-cli *": "ask",
+      "curl -s -m * http://127.0.0.1:8012/*": "allow",
+      "curl -s -m * http://localhost:8089/*": "allow",
+      "pip install *": "ask",
+      "pipx install *": "ask",
+      "brew install *": "ask",
+      "rm *": "ask",
+      "mv *": "ask"
+    }
+  }
+}

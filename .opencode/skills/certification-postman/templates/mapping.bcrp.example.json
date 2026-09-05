@@ -1,0 +1,255 @@
+{
+  "name": "BCRP Comfort Certification v1",
+  "description": "Hand-built certification collection for the 82 BCRP Comfort test cases. S2S envelope: plain JSON + x-merchant-signature (HMAC-SHA256 hex; see collection pre-request script). Import the environment template and fill the operator values before running.",
+  "endpoints": {
+    "VALIDITY": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/vpas/validity",
+      "spec": "newton.s2s.post.merchants.vpas.validity",
+      "body": {
+        "customerVpa": "__TEST_DATA_AS_VPA__",
+        "payerVpa": "{{PAYER_VPA}}",
+        "merchantCustomerId": "{{MERCHANT_CUSTOMER_ID}}",
+        "iat": "{{IAT}}"
+      }
+    },
+    "COLLECT": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/transactions/collect",
+      "spec": "newton.s2s.post.merchants.transactions.collect",
+      "body": {
+        "merchantCustomerId": "{{MERCHANT_CUSTOMER_ID}}",
+        "deviceFingerPrint": "{{DEVICE_FINGERPRINT}}",
+        "merchantRequestId": "{{REQUEST_ID}}",
+        "payerVpa": "{{PAYER_VPA}}",
+        "payeeVpa": "{{PAYEE_VPA}}",
+        "amount": "{{AMOUNT}}",
+        "upiRequestId": "{{REQUEST_ID}}",
+        "requestType": "APPROVE",
+        "credBlock": "{{UPI_CRED_BLOCK}}",
+        "currency": "INR",
+        "iat": "{{IAT}}"
+      }
+    },
+    "PUSH_TO_VPA": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/transactions/pushToVpa",
+      "spec": "newton.s2s.post.merchants.transactions.pushtovpa",
+      "body": {
+        "merchantRequestId": "{{REQUEST_ID}}",
+        "customerVpa": "{{PAYEE_VPA}}",
+        "amount": "{{AMOUNT}}",
+        "merchantVpa": "{{MERCHANT_VPA}}",
+        "remarks": "BCRP certification __TC_ID__",
+        "upiRequestId": "{{REQUEST_ID}}",
+        "iat": "{{IAT}}"
+      }
+    },
+    "STATUS360": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/transactions/status360",
+      "spec": "newton.s2s.post.merchants.transactions.status360",
+      "body": {
+        "merchantRequestId": "{{MERCHANT_REQUEST_ID}}",
+        "transactionType": "{{TRANSACTION_TYPE}}",
+        "checkWithUdir": "false",
+        "npciStatusCheck": "true",
+        "iat": "{{IAT}}"
+      }
+    },
+    "BALANCE": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/accounts/balance",
+      "spec": "newton.s2s.post.merchants.accounts.balance",
+      "body": {
+        "merchantCustomerId": "{{MERCHANT_CUSTOMER_ID}}",
+        "deviceFingerPrint": "{{DEVICE_FINGERPRINT}}",
+        "upiRequestId": "{{REQUEST_ID}}",
+        "bankAccountUniqueId": "{{BANK_ACCOUNT_UNIQUE_ID}}",
+        "customerVpa": "__TEST_DATA_AS_VPA__",
+        "credBlock": "{{UPI_CRED_BLOCK}}",
+        "iat": "{{IAT}}"
+      }
+    },
+    "SET_MPIN": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/accounts/setMpin",
+      "spec": "newton.s2s.post.merchants.accounts.setmpin",
+      "body": {
+        "merchantCustomerId": "{{MERCHANT_CUSTOMER_ID}}",
+        "deviceFingerPrint": "{{DEVICE_FINGERPRINT}}",
+        "upiRequestId": "{{REQUEST_ID}}",
+        "bankAccountUniqueId": "{{BANK_ACCOUNT_UNIQUE_ID}}",
+        "customerVpa": "__TEST_DATA_AS_VPA__",
+        "credBlock": "{{UPI_CRED_BLOCK}}",
+        "card": "{{CARD_LAST6}}",
+        "expiry": "{{CARD_EXPIRY_MMYY}}",
+        "type": "PIN",
+        "subType": "MPIN",
+        "data": {
+          "code": "NPCI",
+          "encryptedBase64String": "{{MPIN_CRED_ENCRYPTED_BASE64}}",
+          "ki": "{{MPIN_CRED_KEY_ID}}"
+        },
+        "iat": "{{IAT}}"
+      }
+    },
+    "CHANGE_MPIN": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/accounts/changeMpin",
+      "spec": "newton.s2s.post.merchants.accounts.changempin",
+      "body": {
+        "merchantCustomerId": "{{MERCHANT_CUSTOMER_ID}}",
+        "deviceFingerPrint": "{{DEVICE_FINGERPRINT}}",
+        "upiRequestId": "{{REQUEST_ID}}",
+        "bankAccountUniqueId": "{{BANK_ACCOUNT_UNIQUE_ID}}",
+        "customerVpa": "__TEST_DATA_AS_VPA__",
+        "credBlock": "{{UPI_CRED_BLOCK}}",
+        "iat": "{{IAT}}"
+      }
+    },
+    "UPI_NUMBER_CREATE": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/upiNumber/create",
+      "spec": "newton.s2s.post.merchants.upinumber.create",
+      "body": {
+        "merchantCustomerId": "{{MERCHANT_CUSTOMER_ID}}",
+        "deviceFingerPrint": "{{DEVICE_FINGERPRINT}}",
+        "upiRequestId": "{{REQUEST_ID}}",
+        "upiNumber": "{{MOBILE_NUMBER}}",
+        "vpa": "{{CUSTOMER_VPA}}",
+        "iat": "{{IAT}}"
+      }
+    },
+    "UPI_NUMBER_UPDATE": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/upiNumber/update",
+      "spec": "newton.s2s.post.merchants.upinumber.update",
+      "body": {
+        "merchantCustomerId": "{{MERCHANT_CUSTOMER_ID}}",
+        "deviceFingerPrint": "{{DEVICE_FINGERPRINT}}",
+        "upiRequestId": "{{REQUEST_ID}}",
+        "upiNumber": "{{MOBILE_NUMBER}}",
+        "vpa": "{{CUSTOMER_VPA}}",
+        "existingVpa": "{{EXISTING_VPA}}",
+        "action": "PORT",
+        "iat": "{{IAT}}"
+      }
+    },
+    "LIST_PSP": {
+      "method": "GET",
+      "path": "/api/{{API_VERSION}}/npci/listPsp",
+      "spec": "newton.s2s.get.npci.listpsp",
+      "body": null
+    },
+    "REGISTRATION_INIT": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/customer/registration/init",
+      "spec": "newton.s2s.post.merchants.customer.registration.init",
+      "body": {
+        "merchantCustomerId": "{{MERCHANT_CUSTOMER_ID}}",
+        "mobileNumber": "{{MOBILE_NUMBER}}",
+        "packageName": "{{APP_PACKAGE_NAME}}",
+        "deviceId": "{{DEVICE_FINGERPRINT}}",
+        "registrationFlow": "ONBOARDING",
+        "iat": "{{IAT}}"
+      }
+    },
+    "ACCOUNTS_FETCH": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/accounts/fetch",
+      "spec": "newton.s2s.post.merchants.accounts.fetch",
+      "body": {
+        "merchantCustomerId": "{{MERCHANT_CUSTOMER_ID}}",
+        "deviceFingerPrint": "{{DEVICE_FINGERPRINT}}",
+        "upiRequestId": "{{REQUEST_ID}}",
+        "bankCode": "{{BANK_CODE}}",
+        "iat": "{{IAT}}"
+      }
+    },
+    "ACCOUNTS_OTP": {
+      "method": "POST",
+      "path": "/api/{{API_VERSION}}/merchants/accounts/otp",
+      "spec": "newton.s2s.post.merchants.accounts.otp",
+      "body": {
+        "merchantCustomerId": "{{MERCHANT_CUSTOMER_ID}}",
+        "deviceFingerPrint": "{{DEVICE_FINGERPRINT}}",
+        "upiRequestId": "{{REQUEST_ID}}",
+        "bankAccountUniqueId": "{{BANK_ACCOUNT_UNIQUE_ID}}",
+        "customerVpa": "{{CUSTOMER_VPA}}",
+        "card": "{{CARD_LAST6}}",
+        "expiry": "{{CARD_EXPIRY_MMYY}}",
+        "iat": "{{IAT}}"
+      }
+    }
+  },
+  "families": [
+    {"api_names": ["ReqValAdd", "ReqGetAdd"], "folder": "01 - Validate Address (ReqValAdd / ReqGetAdd)", "endpoint": "VALIDITY"},
+    {"api_names": ["ReqBalEnq"], "folder": "02 - Balance Enquiry (ReqBalEnq)", "endpoint": "BALANCE"},
+    {
+      "api_names": ["ReqSetCre"],
+      "routes": [
+        {"when": {"description_all": ["chang"], "description_none": ["reset"]}, "folder": "03 - Change UPI PIN (ReqSetCre)", "endpoint": "CHANGE_MPIN"},
+        {"folder": "03 - Set/Reset UPI PIN (ReqSetCre)", "endpoint": "SET_MPIN"}
+      ]
+    },
+    {"api_names": ["ReqChkTxn"], "folder": "04 - Check Transaction (ReqChkTxn)", "endpoint": "STATUS360"},
+    {
+      "api_names": ["ReqPay"],
+      "routes": [
+        {"when": {"test_case_id_prefix": ["TC_PR"]}, "folder": "05b - Pay / Push to VPA (ReqPay)", "endpoint": "PUSH_TO_VPA"},
+        {"folder": "05a - Collect (ReqPay)", "endpoint": "COLLECT"}
+      ]
+    },
+    {"api_names": ["ReqRegMapper"], "folder": "06 - Register Mapper (ReqRegMapper)", "endpoint": "UPI_NUMBER_CREATE"},
+    {"api_names": ["ReqMapperConfirmation"], "folder": "07 - Mapper Port/Modify (ReqMapperConfirmation)", "endpoint": "UPI_NUMBER_UPDATE"},
+    {"api_names": ["ReqListAccPvd"], "folder": "08 - List Account Provider (ReqListAccPvd)", "endpoint": "LIST_PSP"},
+    {"api_names": ["ReqRegMob"], "folder": "09 - Mobile Registration (ReqRegMob)", "endpoint": "REGISTRATION_INIT"},
+    {"api_names": ["ReqListAccount"], "folder": "10 - List Account (ReqListAccount)", "endpoint": "ACCOUNTS_FETCH"},
+    {"api_names": ["ReqOTP"], "folder": "11 - OTP (ReqOTP)", "endpoint": "ACCOUNTS_OTP"}
+  ],
+  "row_overrides": {
+    "MT_02": {"body": {"customerVpa": "{{MOBILE_NUMBER}}@mapper.npci"}},
+    "CM_03": {"body": {"customerVpa": "{{MOBILE_NUMBER}}@mapper.npci"}},
+    "CM_08": {"body": {"customerVpa": "{{MOBILE_NUMBER}}@mapper.npci"}},
+    "CM_09": {"body": {"customerVpa": "{{MOBILE_NUMBER}}@mapper.npci"}},
+    "CM_10": {"body": {"customerVpa": "{{MOBILE_NUMBER}}@mapper.npci"}},
+    "CM_13": {"body": {"customerVpa": "{{MOBILE_NUMBER}}@mapper.npci"}},
+    "CM_14": {"body": {"customerVpa": "{{MOBILE_NUMBER}}@mapper.npci"}},
+    "PE_04": {"body": {"requestType": "DECLINE"}}
+  },
+  "environment": [
+    ["BASE_URL", "", "Newton UAT base URL, e.g. https://uat.example/"],
+    ["API_VERSION", "v1", "apiVersion path segment for the S2S routes"],
+    ["MERCHANT_ID", "", "Merchant id shared during onboarding"],
+    ["MERCHANT_CHANNEL_ID", "", "Merchant channel id shared during onboarding"],
+    ["SUB_MERCHANT_ID", "", "Sub-merchant id (leave empty if not configured)"],
+    ["SUB_MERCHANT_CHANNEL_ID", "", "Sub-merchant channel id (leave empty if not configured)"],
+    ["MERCHANT_API_KEY", "", "SECRET: merchant apiKey used as the HMAC key — never commit"],
+    ["MERCHANT_CUSTOMER_ID", "", "Merchant customer profile id for the test customer"],
+    ["DEVICE_FINGERPRINT", "", "Registered device fingerprint from device binding"],
+    ["FALLBACK_DEVICE_FINGERPRINT", "", "Alternate fingerprint (migration/fallback flows)"],
+    ["CUSTOMER_VPA", "", "Test customer's primary VPA (account-linked)"],
+    ["PAYER_VPA", "", "Payer VPA for P2P flows"],
+    ["PAYEE_VPA", "", "Payee VPA/account for P2P pay/collect flows"],
+    ["MERCHANT_VPA", "", "Merchant settlement VPA for P2M pay flows"],
+    ["MOBILE_NUMBER", "", "12-digit mobile number with country code (91XXXXXXXXXX)"],
+    ["UPI_NUMBER", "", "Existing UPI number for mapper flows"],
+    ["EXISTING_VPA", "", "Existing mapper VPA (CHANGE_VPA/PORT flows)"],
+    ["BANK_ACCOUNT_UNIQUE_ID", "", "Linked account hash/id from account APIs"],
+    ["ACCOUNT_REFERENCE_ID", "", "Newton account reference id"],
+    ["IFSC", "", "IFSC for migrated-account flows"],
+    ["BANK_CODE", "", "Bank code for accounts/fetch"],
+    ["CARD_LAST6", "", "Last 6 digits of test debit card"],
+    ["CARD_EXPIRY_MMYY", "", "Test debit-card expiry MMYY"],
+    ["UPI_CRED_BLOCK", "", "SECRET: UPI common-library credential block (captured in-app)"],
+    ["MPIN_CRED_ENCRYPTED_BASE64", "", "SECRET: set/reset MPIN data.encryptedBase64String (common library)"],
+    ["MPIN_CRED_KEY_ID", "", "Key identifier (data.ki) returned by the common library"],
+    ["CL_VERSION", "", "UPI common-library version (biometric flows)"],
+    ["AMOUNT", "1.00", "Transaction amount string"],
+    ["TRANSACTION_TYPE", "UPI", "Transaction type enum for status360"],
+    ["MERCHANT_REQUEST_ID", "", "Known order/request id for status checks"],
+    ["APP_PACKAGE_NAME", "", "App package name for registration/init"]
+  ],
+  "notes_markdown": "## Operator notes\n\n- Rows expecting app-captured credential blocks (balance, set/change MPIN, collect approve) need `UPI_CRED_BLOCK` (plus `MPIN_CRED_ENCRYPTED_BASE64`/`MPIN_CRED_KEY_ID` for set/reset) pasted from the certified app's UPI common library — these cannot be fabricated server-side.\n- MT_27..MT_29 may need `ACCOUNTS_OTP` first when the bank path requires OTP.\n- PE_* collect rows approve/decline an existing pending collect at API level; drive the pending state from the test app where the scenario requires it.\n- Confirm with the onboarding team: `upiNumber/update` action enum for PORT (CM_04), `status360` `transactionType` enum, and whether `pushToVpa` is the intended certification variant for TC_PR rows.\n"
+}

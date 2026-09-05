@@ -30,7 +30,12 @@ Phase 7 is the LLM-free normalization boundary in `knowledge/`: generic tables,
 testcases, dependencies, row controls, modal descriptions, routes, and network
 observations are deduplicated into citation-rich portal knowledge. The audit
 package and compact testcase JSONL remain derived artifacts outside the crawl
-evidence store.
+evidence store. Phase 0 is the optional external-source boundary in `ingest/`:
+an externally scraped testcase CSV (strict header contract) becomes the same
+Phase 7 contract marked `source_kind: external_csv`, with the raw file and rows
+content-addressed under `artifacts/ingest/` and honest external-source
+limitations; evidence pointers cite CSV-row digests, never fabricated browser
+states.
 Phase 8 is the external grounding boundary in `grounding/`: a bounded LiteLLM
 retrieval agent decides which redacted, line-cited repository searches and
 advertised, explicitly allowlisted read-only MCP tools are useful for compact
@@ -151,7 +156,7 @@ for recovery and comparison only and is intentionally ignored by Git.
 - Real browser test:
   `CZ_RUN_BROWSER_TESTS=1 venv/bin/python3 -m pytest -q tests/test_browser_integration.py tests/test_snapshot_integration.py tests/test_explorer_integration.py tests/test_runner_integration.py`
 - Compile check:
-  `venv/bin/python3 -m py_compile scraper/*.py knowledge/*.py grounding/*.py synthesis/*.py postman/*.py`
+  `venv/bin/python3 -m py_compile scraper/*.py knowledge/*.py ingest/*.py grounding/*.py synthesis/*.py postman/*.py pipeline/*.py`
 - Full checks when development tools are installed: `ruff check .`,
   `ruff format --check .`, and `mypy .`
 

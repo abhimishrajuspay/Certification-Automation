@@ -23,8 +23,16 @@ artifacts/
 logs/
 *.log
 
-# Local tooling state
-.opencode/
+# Local tooling state (branch context stays private, harness assets are tracked)
+!.opencode/
+.opencode/*
+!.opencode/agents/**/*.md
+!.opencode/commands/**/*.md
+!.opencode/skills/**/*.md
+!.opencode/skills/**/*.py
+!.opencode/skills/**/*.sh
+!.opencode/skills/**/*.json
+!.opencode/skills/**/*.example
 
 # Recoverable legacy archive; intentionally local-only
 .deprecated/
@@ -38,3 +46,8 @@ dummy_portal/
 
 # User-provided local MCP server clone + database/env assets (contains credentials)
 mcp/
+
+# OpenCode harness assets tracked; branch context stays local
+!.opencode/agents/
+!.opencode/commands/
+!.opencode/skills/

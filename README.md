@@ -67,6 +67,12 @@ knowledge/
   exporter.py        # Atomic audit JSON and compact testcase JSONL export
   cli.py             # Crawl-to-knowledge command
   __main__.py        # python -m knowledge entrypoint
+ingest/
+  models.py          # Strict external CSV rows and import manifest contracts
+  builder.py         # CSV header/row validation and knowledge-package mapping
+  exporter.py        # Immutable source copy, row records, and hashed manifest
+  cli.py             # CSV-to-knowledge command with testcase selection
+  __main__.py        # python -m ingest entrypoint
 grounding/
   models.py          # Strict repository/MCP citations and coverage gates
   repository.py      # Bounded, redacted, line-cited local retrieval
@@ -133,8 +139,8 @@ CZ_RUN_BROWSER_TESTS=1 python -m pytest -q \
   tests/test_browser_integration.py tests/test_snapshot_integration.py \
   tests/test_explorer_integration.py tests/test_runner_integration.py
 python -m py_compile \
-  scraper/*.py knowledge/*.py grounding/*.py synthesis/*.py postman/*.py \
-  remediation/*.py campaign/*.py
+  scraper/*.py knowledge/*.py ingest/*.py grounding/*.py synthesis/*.py \
+  postman/*.py remediation/*.py campaign/*.py
 ```
 
 ## Running a crawl
@@ -498,6 +504,84 @@ Such a package preserves its source limitation and must not be treated as full
 portal coverage. `--skip-integrity-check` is also intended only for diagnostics;
 normal handoffs verify the crawl store before normalization.
 
+## External CSV testcase import (optional)
+
+When the scraped testcase catalog already exists as a spreadsheet export rather
+than a portal crawl, the `ingest` boundary turns it into the same strict Phase 7
+knowledge contract so grounding, synthesis, and Postman generation can proceed
+without a browser:
+
+```bash
+python -m ingest \
+  --csv "BCRP cases.csv" \
+  --run-id bcrp-import-01
+```
+
+The CSV must contain the columns `TC ID`, `API Type`, `API Name`, `Test Data`,
+`Version`, `RC`, `Description`, `Steps` (matching is trim/case tolerant; extra
+columns become additional cited fields). Rows require a unique TC ID and a
+non-empty API Type, API Name, and Description; the checker reports every row
+problem at once instead of failing on the first one. `--plan-only` validates and
+summarizes without writing; `--test-case` selects a repeatable subset so a
+single case can be pushed through the whole downstream chain.
+
+The import keeps every audit invariant: the raw file plus one normalized record
+per selected row persist content-addressed under `artifacts/ingest/<run-id>/`,
+the knowledge package is emitted through the unchanged Phase 7 exporter, and no
+overwrite happens unless `--overwrite` is explicit. The package is marked
+`source_kind: external_csv`; its evidence pointers cite deterministic CSV-row
+digests and the imported file digest rather than browser states, and its
+coverage lists exactly what an external sheet cannot prove (no portal controls,
+routes, modals, network observations, or dependencies). The narrower
+`testcase_context_complete` gate still applies: selected rows must all parse,
+carry descriptions, and reconcile with the declared count.
+
+Downstream phases consume the imported package like any other, including their
+existing single-source `--<package>` flags and gates; for example, for the
+selected one-case run:
+
+```bash
+python -m grounding \
+  --run-id bcrp-import-01 \
+  --repo-path /path/to/integration-repository \
+  --plan-only
+
+python -m synthesis --run-id bcrp-import-01 --plan-only
+```
+
+### One-command flow
+
+When phase-by-phase control is unnecessary, a single driver runs the whole
+chain — ingest, then grounding, then synthesis, then Postman — through each
+phase's own CLI (never duplicated logic), stopping at the first phase that
+returns a nonzero exit code:
+
+```bash
+python -m pipeline \
+  --csv "BCRP cases.csv" \
+  --repo-path /path/to/integration-repository \
+  --test-case MT_01 \
+  --repo-include-code \
+  --response-format json_object
+```
+
+Without `--run-id` the driver derives `<csv-stem>-<UTC-timestamp>`, so every
+invocation is a fresh run; re-do a known run with `--run-id X --overwrite`.
+`--plan-only` validates the CSV and prints the staged phases without writing or
+calling models. Configuration overrides (`--litellm-url`, `--model`,
+`--api-key-env`, `--no-api-key`, `--mcp-url`, `--no-mcp`, `--mcp-tool`,
+`--quiet`) and diagnostic relaxations (`--allow-incomplete-grounding`,
+`--allow-incomplete-source`, `--allow-partial`) are threaded into the phases
+that accept them; a failing phase stops the flow with that phase's exit code
+and a JSON summary names the stopping point.
+
+For full agentic grounding/synthesis the same LiteLLM/MCP environment and flags
+apply as for crawled packages (`CZ_LITELLM_URL`, `CZ_LITELLM_MODEL`,
+`CZ_LITELLM_API_KEY`, optional `CZ_MCP_URL`, `--response-format json_object`).
+Synthesis decides each case as `ready`/`needs_review`/`blocked` with reasons —
+that is where the model's suggested corrections surface — and Postman then
+renders only execution-ready, dependency-closed specifications.
+
 ## AI-directed repository and MCP grounding
 
 Ground a normalized package with a bounded LiteLLM retrieval agent. The model
@@ -795,15 +879,23 @@ The tested route returned ordinary JSON reliably while its strict
 the correction loop remain active in either mode.
 
 Agentic synthesis is the default. A small decision call starts with exactly one
-testcase's portal fields, description, dependency IDs, and state citations. It
-either selects `search_repository`, `search_mcp`, or `read_evidence`, or signals
-that evidence is complete. Only then does a separate call receive the full
-execution-specification schema. Searches return metadata plus short previews;
+testcase's portal fields, description, dependency IDs, state citations, and a
+deterministically prefetched preview battery (the bare operation name plus its
+request/response/route/declaration variants, deduplicated and
+directory-diverse), so route and type-definition files are visible as snippet
+previews from the first turn.
+The agent then either selects `search_repository`, `search_mcp`, or
+`read_evidence`, or signals that evidence is complete. Only then does a separate
+call receive the full execution-specification schema. Searches return metadata
+plus short previews;
 the model must explicitly read a result before its content can enter context or
-its snippet ID can be cited. Retrieved content is capped at 2,000 characters by
-default. Generated build trees such as `dist-newstyle`, caches, artifacts,
-virtual environments, and package dependencies are excluded from repository
-indexing.
+its snippet ID can be cited. When a preview reveals the right file but the
+wrong lines, `read_repository_file` opens a bounded line window (at most 200
+lines, complete lines only, excerpt-capped) from that exact index path; each
+such read produces its own cited, content-hashed snippet. Retrieved content is
+capped at 2,000 characters by default. Generated build trees such as
+`dist-newstyle`, caches, artifacts, virtual environments, and package
+dependencies are excluded from repository indexing.
 
 `portal_field` bindings are exact whole-field copies. Description/payload
 substrings are `evidence_literal` bindings. The validator safely normalizes this
