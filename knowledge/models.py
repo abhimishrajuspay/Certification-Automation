@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -12,6 +13,13 @@ from scraper.models import ActionKind, ActionRisk, ActionStatus, ScrapeRunStatus
 
 KNOWLEDGE_SCHEMA_VERSION = "1.0"
 SHA256_PATTERN = r"^[a-f0-9]{64}$"
+
+
+class KnowledgeSourceKind(str, Enum):
+    """Where the normalized testcase content originally came from."""
+
+    CRAWL = "crawl"
+    EXTERNAL_CSV = "external_csv"
 
 
 class KnowledgeModel(BaseModel):
@@ -219,6 +227,7 @@ class PortalKnowledge(KnowledgeModel):
     """Deterministic handoff from browser evidence to retrieval and LLM phases."""
 
     schema_version: str = KNOWLEDGE_SCHEMA_VERSION
+    source_kind: KnowledgeSourceKind = KnowledgeSourceKind.CRAWL
     source_run_id: str = Field(min_length=1)
     source_root_url: str = Field(min_length=1)
     source_started_at: datetime
@@ -274,6 +283,7 @@ class KnowledgeExportManifest(KnowledgeModel):
     """Small manifest for an exported portal-knowledge package."""
 
     schema_version: str = KNOWLEDGE_SCHEMA_VERSION
+    source_kind: KnowledgeSourceKind = KnowledgeSourceKind.CRAWL
     source_run_id: str = Field(min_length=1)
     normalized_at: datetime
     files: tuple[KnowledgeFile, ...]
@@ -294,6 +304,7 @@ __all__ = [
     "EvidencePointer",
     "KNOWLEDGE_SCHEMA_VERSION",
     "KnowledgeCoverage",
+    "KnowledgeSourceKind",
     "KnowledgeExportManifest",
     "KnowledgeField",
     "KnowledgeFile",

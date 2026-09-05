@@ -67,6 +67,7 @@ def export_knowledge(
         _knowledge_file(testcases_path.name, testcase_data),
     )
     manifest = KnowledgeExportManifest(
+        source_kind=knowledge.source_kind,
         source_run_id=knowledge.source_run_id,
         normalized_at=knowledge.normalized_at,
         files=files,

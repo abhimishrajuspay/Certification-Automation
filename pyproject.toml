@@ -16,11 +16,13 @@ dependencies = [
 [project.scripts]
 cz-crawl = "scraper.cli:entrypoint"
 cz-normalize = "knowledge.cli:entrypoint"
+cz-ingest = "ingest.cli:entrypoint"
 cz-ground = "grounding.cli:entrypoint"
 cz-synthesize = "synthesis.cli:entrypoint"
 cz-postman = "postman.cli:entrypoint"
 cz-remediate = "remediation.cli:entrypoint"
 cz-campaign = "campaign.cli:entrypoint"
+cz-flow = "pipeline.cli:entrypoint"
 
 [project.optional-dependencies]
 dev = [
@@ -34,7 +36,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["scraper*", "knowledge*", "grounding*", "synthesis*", "postman*", "remediation*", "campaign*"]
+include = ["scraper*", "knowledge*", "ingest*", "grounding*", "synthesis*", "postman*", "remediation*", "campaign*", "pipeline*"]
 exclude = ["tests*"]
 
 [tool.pytest.ini_options]
@@ -45,6 +47,9 @@ asyncio_mode = "auto"
 [tool.black]
 line-length = 100
 target-version = ["py310"]
+
+[tool.ruff]
+extend-exclude = ["mcp/**"]
 
 [tool.mypy]
 python_version = "3.10"
