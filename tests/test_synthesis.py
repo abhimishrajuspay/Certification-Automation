@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime as _dt
+
 import asyncio
 import hashlib
 import json
@@ -22,7 +24,11 @@ from grounding.models import (
     RepositoryCitation,
     RepositoryIndexSummary,
 )
-from grounding.repository import RepositoryIndex, RepositoryIndexConfig
+from grounding.repository import (
+    RepositoryIndex,
+    RepositoryIndexConfig,
+    resolve_repository_suffixes,
+)
 from knowledge.models import KnowledgeField
 from synthesis.builder import (
     SynthesisBuildConfig,
@@ -34,12 +40,15 @@ from synthesis.agentic import (
     AgenticSynthesisBuilder,
     AgenticSynthesisConfig,
     SynthesisEvidenceTools,
+    _budgeted_catalog,
+    _budgeted_read_payloads,
 )
 from synthesis.cli import _configure_progress_logging, main as synthesis_main
 from synthesis.client import (
     LiteLLMClient,
     LiteLLMCompletion,
     LiteLLMConfig,
+    LiteLLMError,
     LiteLLMRetryableError,
     LiteLLMTransportResponse,
     normalize_litellm_endpoint,
@@ -329,6 +338,8 @@ class _AgentLLM:
         self.response_models.append(response_model)
         self.maximum_output_tokens.append(maximum_output_tokens)
         response = self.responses[len(self.prompts) - 1]
+        if isinstance(response, LiteLLMError):
+            raise response
         assert isinstance(response, response_model)
         content = response.model_dump_json()
         return LiteLLMCompletion(
@@ -736,6 +747,25 @@ async def test_agent_rejects_resumed_specification_with_unread_evidence() -> Non
     assert resumed.coverage.synthesis_complete is True
     assert resumed.agent_observations == (read_observation,)
 
+    file_read_observation = read_observation.model_copy(
+        update={"action": SynthesisAgentAction.READ_REPOSITORY_FILE}
+    )
+    resumed_via_file_read = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        _AgentLLM([]),
+        SynthesisEvidenceTools(grounding),
+    ).build(
+        initial_specifications=(
+            _ready_spec(case),
+            _portal_ready_spec("TC_02", "state-2"),
+        ),
+        initial_retrieved_snippets=(snippet,),
+        initial_observations=(file_read_observation,),
+    )
+
+    assert resumed_via_file_read.coverage.synthesis_complete is True
+
 
 @pytest.mark.parametrize(
     "provider_error",
@@ -756,7 +786,9 @@ async def test_agent_opens_provider_circuit_after_transport_failure(
         config=AgenticSynthesisConfig(concurrency=1, maximum_turns_per_case=2),
     ).build()
 
-    assert llm.calls == 1
+    # Decision transport failure forces one specification attempt before the
+    # circuit opens, so the provider sees the decision call plus that fallback.
+    assert llm.calls == 2
     assert package.coverage.synthesized == 0
     assert any("provider circuit opened" in error for error in package.provider.errors)
 
@@ -1033,3 +1065,1196 @@ def test_grounding_loader_and_plan_only_cli_verify_phase_boundary(
     exported.grounding_path.write_bytes(exported.grounding_path.read_bytes() + b"\n")
     with pytest.raises(SynthesisBuildError, match="does not match"):
         load_grounding(exported.output_directory)
+
+
+def test_decision_validates_read_repository_file_payload() -> None:
+    with pytest.raises(ValueError, match="lacks its required payload"):
+        SynthesisAgentDecision.model_validate(
+            {
+                "action": "read_repository_file",
+                "rationale": "open the window",
+                "repository_path": "api/apitypes.md",
+                "line_start": 80,
+                "line_end": 79,
+            }
+        )
+    with pytest.raises(ValueError, match="lacks its required payload"):
+        SynthesisAgentDecision.model_validate(
+            {"action": "read_repository_file", "rationale": "open the window"}
+        )
+    with pytest.raises(ValueError, match="valid only for read_repository_file"):
+        SynthesisAgentDecision.model_validate(
+            {
+                "action": "search_repository",
+                "rationale": "search instead",
+                "query": "ReqValAdd",
+                "repository_path": "api/apitypes.md",
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_reads_repository_file_window_and_cites_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    (root / "api").mkdir(parents=True)
+    payload_lines = (
+        ["# API contract"]
+        + [f"context line {index}" for index in range(2, 88)]
+        + ["ReqValAdd POST /upi/2/{path} XML payload contract"]
+        + [f"tail line {index}" for index in range(1, 60)]
+    )
+    (root / "api" / "apitypes.md").write_text("\n".join(payload_lines))
+    repository = RepositoryIndex.build(
+        root,
+        RepositoryIndexConfig(maximum_excerpt_characters=2_000),
+    )
+    expected = repository.read_lines("api/apitypes.md", 80, 90)
+    assert "ReqValAdd POST /upi/2/{path} XML" in expected.content
+
+    grounding = _grounding()
+    case = {
+        "test_case_id": "TC_01",
+        "dependency_case_ids": [],
+        "available_evidence_snippet_ids": [expected.snippet_id],
+    }
+    llm = _AgentLLM(
+        [
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.READ_REPOSITORY_FILE,
+                rationale="Open the revealed contract window in the indexed file",
+                repository_path="api/apitypes.md",
+                line_start=80,
+                line_end=90,
+            ),
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.FINAL,
+                rationale="The contract window answers the missing facts",
+            ),
+            _ready_spec(case),
+        ]
+    )
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(maximum_turns_per_case=3),
+    )
+
+    package = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        tools,
+        config=tools.config,
+    ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    assert [item.action for item in package.agent_observations] == [
+        SynthesisAgentAction.READ_REPOSITORY_FILE
+    ]
+    assert package.retrieved_snippets == (expected,)
+    assert package.specifications[0].disposition == SynthesisDisposition.READY
+    assert package.specifications[0].evidence_snippet_ids == (expected.snippet_id,)
+
+
+@pytest.mark.asyncio
+async def test_agent_rejects_repeated_evidence_action_then_finalizes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    (root / "contract.md").write_text(
+        "BillFetchRequest contract line 42. "
+        + "BillFetchRequest supporting context. " * 12
+    )
+    repository = RepositoryIndex.build(
+        root,
+        RepositoryIndexConfig(maximum_excerpt_characters=2_000),
+    )
+    grounding = _grounding()
+    decision = SynthesisAgentDecision(
+        action=SynthesisAgentAction.SEARCH_REPOSITORY,
+        rationale="Search the contract",
+        query="BillFetchRequest contract line",
+    )
+    repeated = SynthesisAgentDecision(
+        action=SynthesisAgentAction.SEARCH_REPOSITORY,
+        rationale="Search the contract again",
+        query="BillFetchRequest contract line",
+    )
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(maximum_turns_per_case=4),
+    )
+    grounded_case = grounding.test_cases[0]
+    first_result, first_ids, first_error = await tools.execute(grounded_case, decision)
+    assert first_error is None
+    assert first_ids
+    second_result, second_ids, second_error = await tools.execute(
+        grounded_case, repeated
+    )
+    assert second_error is None
+    assert second_ids == ()
+    assert "Duplicate action rejected" in second_result
+
+
+@pytest.mark.asyncio
+async def test_agent_forces_specification_after_turn_exhaustion(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    (root / "api").mkdir(parents=True)
+    lines = ["# XML API contract"] + [
+        f"context line {index}" for index in range(2, 240)
+    ]
+    lines[87] = "ReqValAdd -> ReqBody '[XML] (Payload ReqValAdd) :> Post '[XML] Ack"
+    (root / "api" / "apitypes.md").write_text("\n".join(lines))
+    repository = RepositoryIndex.build(
+        root,
+        RepositoryIndexConfig(maximum_excerpt_characters=2_000),
+    )
+    grounding = _grounding()
+    first_window = repository.read_lines("api/apitypes.md", 1, 60)
+    second_window = repository.read_lines("api/apitypes.md", 61, 120)
+    assert "ReqValAdd" in second_window.content
+    case = {
+        "test_case_id": "TC_01",
+        "dependency_case_ids": [],
+        "available_evidence_snippet_ids": [second_window.snippet_id],
+    }
+    llm = _AgentLLM(
+        [
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.READ_REPOSITORY_FILE,
+                rationale="Open the contract window",
+                repository_path="api/apitypes.md",
+                line_start=1,
+                line_end=60,
+            ),
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.READ_REPOSITORY_FILE,
+                rationale="Open the neighboring window",
+                repository_path="api/apitypes.md",
+                line_start=61,
+                line_end=120,
+            ),
+            _ready_spec(case),
+        ]
+    )
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(maximum_turns_per_case=2),
+    )
+
+    package = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        tools,
+        config=tools.config,
+    ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    actions = [item.action for item in package.agent_observations]
+    assert actions == [
+        SynthesisAgentAction.READ_REPOSITORY_FILE,
+        SynthesisAgentAction.READ_REPOSITORY_FILE,
+    ]
+    assert package.specifications[0].disposition == SynthesisDisposition.READY
+    assert len(package.specifications) == 2
+    assert {item.snippet_id for item in package.retrieved_snippets} == {
+        first_window.snippet_id,
+        second_window.snippet_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_agent_prefetch_surfaces_route_definitions_in_first_prompt(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    flow = root / "src" / "product" / "billfetchrequest"
+    flow.mkdir(parents=True)
+    (flow / "Flow.hs").write_text(
+        "module Flow where\n-- BillFetchRequest validates bills\n" * 4
+    )
+    routes = root / "src" / "app" / "routes"
+    routes.mkdir(parents=True)
+    (routes / "Bill.hs").write_text(
+        "module Bill where\n-- BillFetchRequest route POST /bill/fetch JSON\n"
+    )
+    repository = RepositoryIndex.build(
+        root,
+        RepositoryIndexConfig(
+            maximum_excerpt_characters=2_000,
+            suffixes=resolve_repository_suffixes(include_code=True),
+        ),
+    )
+    grounding = _grounding()
+    llm = _AgentLLM(
+        [
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.FINAL,
+                rationale="Preview already shows the route definition",
+            ),
+            _portal_ready_spec("TC_01", "state-1"),
+        ]
+    )
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(maximum_turns_per_case=3),
+    )
+
+    package = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        tools,
+        config=tools.config,
+    ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    assert "src/app/routes/Bill.hs" in llm.prompts[0]
+    assert package.specifications[0].disposition == SynthesisDisposition.READY
+
+
+def test_prefetch_auto_anchor_reads_make_contract_tiles_citable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    routes = root / "src" / "App" / "Routes"
+    routes.mkdir(parents=True)
+    (routes / "Bill.hs").write_text(
+        "module Bill where\n\nroutes :: Proxy BillAPI\n"
+        '"BillFetchRequest" :> Capture "version" Text :> ReqBody \'[JSON] Body :> Post \'[JSON] Ack\n'
+        "handler = undefined\n"
+    )
+    types = root / "src" / "product" / "billfetchrequest"
+    types.mkdir(parents=True)
+    (types / "Types.hs").write_text(
+        "module Types where\n\ndata BillFetchRequest = BillFetchRequest\n"
+        "  { _head :: Head, _txn :: Txn }\n  deriving (Show, Eq)\n\n"
+        "data Head = Head { _ver :: Text } deriving (Show)\n\n"
+        "data Txn = Txn { _txnId :: Text } deriving (Show)\n"
+    )
+    repository = RepositoryIndex.build(
+        root,
+        RepositoryIndexConfig(
+            maximum_excerpt_characters=2_000,
+            suffixes=resolve_repository_suffixes(include_code=True),
+        ),
+    )
+    grounding = _grounding()
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(),
+    )
+    case = grounding.test_cases[0]
+
+    tools.initialize_case(case)
+    read_title_keys = set()
+    for snippet_id in tools.read_ids(case):
+        citation = tools.catalog[snippet_id].repository
+        assert citation is not None
+        read_title_keys.add(citation.path)
+    read_content = "\n".join(
+        tools.catalog[snippet_id].content for snippet_id in tools.read_ids(case)
+    )
+    assert {
+        "src/App/Routes/Bill.hs",
+        "src/product/billfetchrequest/Types.hs",
+    } == read_title_keys
+    assert '"BillFetchRequest" :>' in read_content
+    assert "data BillFetchRequest" in read_content
+    assert "data Head = Head" in read_content
+    assert "data Txn = Txn" in read_content
+
+
+@pytest.mark.asyncio
+async def test_resume_accepts_completed_spec_citing_turn0_auto_reads(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    routes = root / "src" / "App" / "Routes"
+    routes.mkdir(parents=True)
+    (routes / "Bill.hs").write_text(
+        "module Bill where\n\nroutes :: Proxy BillAPI\n"
+        '"BillFetchRequest" :> Capture "version" Text :> ReqBody \'[JSON] Body :> Post \'[JSON] Ack\n'
+        "handler = undefined\n"
+    )
+    types = root / "src" / "product" / "billfetchrequest"
+    types.mkdir(parents=True)
+    (types / "Types.hs").write_text(
+        "module Types where\n\ndata BillFetchRequest = BillFetchRequest\n"
+        "  { _head :: Head, _txn :: Txn }\n  deriving (Show, Eq)\n\n"
+        "data Head = Head { _ver :: Text } deriving (Show)\n\n"
+        "data Txn = Txn { _txnId :: Text } deriving (Show)\n"
+    )
+
+    def build_tools(grounding: GroundingPackage) -> SynthesisEvidenceTools:
+        repository = RepositoryIndex.build(
+            root,
+            RepositoryIndexConfig(
+                maximum_excerpt_characters=2_000,
+                suffixes=resolve_repository_suffixes(include_code=True),
+            ),
+        )
+        return SynthesisEvidenceTools(
+            grounding,
+            repository=repository,
+            config=AgenticSynthesisConfig(),
+        )
+
+    grounding = _grounding()
+    tools = build_tools(grounding)
+    case = grounding.test_cases[0]
+    tools.initialize_case(case)
+    read_ids = list(tools.read_ids(case))
+    assert read_ids
+
+    completed = _ready_spec(
+        {
+            "test_case_id": case.context.test_case_id,
+            "dependency_case_ids": [],
+            "available_evidence_snippet_ids": read_ids,
+        }
+    )
+    snippets = tools.case_snippets(case)
+
+    # Cold resume: no observation records the turn-0 anchor reads; acceptance
+    # must come from the deterministic auto-read rebuild union.
+    resumed = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        _AgentLLM([]),
+        build_tools(grounding),
+        config=AgenticSynthesisConfig(),
+    ).build(
+        initial_specifications=(completed, _portal_ready_spec("TC_02", "state-2")),
+        initial_retrieved_snippets=tuple(snippets),
+        initial_observations=(),
+    )
+
+    assert resumed.coverage.synthesis_complete is True
+    assert len(resumed.specifications) == 2
+
+
+def test_auto_cascade_reads_route_return_type_and_xml_instances(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    routes = root / "src" / "App" / "Routes"
+    routes.mkdir(parents=True)
+    (routes / "Bill.hs").write_text(
+        "module Bill where\n\nroutes :: Proxy BillAPI\n"
+        '"BillFetchRequest" :> Capture "version" Text :> ReqBody \'[JSON] Body :> Post \'[XML] Ack\n'
+        "handler = undefined\n"
+    )
+    types = root / "src" / "product" / "billfetchrequest"
+    types.mkdir(parents=True)
+    (types / "Types.hs").write_text(
+        "module Types where\n\ndata BillFetchRequest = BillFetchRequest\n"
+        "  { _head :: Head, _txn :: Txn }\n  deriving (Show, Eq)\n\n"
+        "data Head = Head { _ver :: Text } deriving (Show)\n\n"
+        'instance ToXml Head where\n  toXml h = [XAttr "ver" (_ver h)]\n\n'
+        "data Txn = Txn { _txnId :: Text } deriving (Show)\n"
+    )
+    (types / "Ack.hs").write_text(
+        "module Ack where\n\ndata Ack = Ack { code :: Text, err :: Maybe Text }\n"
+        "  deriving (Show)\n\ninstance FromXml Ack where\n  fromXml = undefined\n"
+    )
+
+    repository = RepositoryIndex.build(
+        root,
+        RepositoryIndexConfig(
+            maximum_excerpt_characters=2_000,
+            suffixes=resolve_repository_suffixes(include_code=True),
+        ),
+    )
+    grounding = _grounding()
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(),
+    )
+    case = grounding.test_cases[0]
+
+    tools.initialize_case(case)
+    read_content = "\n".join(
+        tools.catalog[snippet_id].content for snippet_id in tools.read_ids(case)
+    )
+    read_paths = {
+        tools.catalog[snippet_id].repository.path for snippet_id in tools.read_ids(case)
+    }
+    assert "data Ack = Ack" in read_content  # cascade C: route return type
+    assert "instance FromXml Ack where" in read_content  # cascade D: instance
+    assert "instance ToXml Head where" in read_content
+    assert "src/product/billfetchrequest/Ack.hs" in read_paths
+
+
+def test_auto_route_context_reads_mount_prefix_and_handler_body(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    routes = root / "src" / "App" / "Routes"
+    routes.mkdir(parents=True)
+    (routes / "Bill.hs").write_text(
+        "module Bill where\n\ntype BillAPI =\n"
+        '  "BillFetchRequest" :> Capture "version" Text :> Capture "path" Text\n'
+        "    :> Vault :> ReqBody '[XML] Body :> Post '[XML] Ack\n\n"
+        "billFetchRequest :: V.Key (KM.KeyMap Text) -> Text -> Text -> Vault -> Body -> Handler Ack\n"
+        "billFetchRequest key version path vault reqBody = do\n"
+        '  logAPIEnc "BillFetch API called." reqBody\n'
+        "  handleBillRequest reqBody version\n"
+    )
+    (routes / "Core.hs").write_text(
+        "module Core where\n\ntype RootAPIs =\n"
+        '  "health" :> Get \'[JSON] Head :<|> "upi" :> Bill.BillAPI\n'
+        "rootServer = undefined\n"
+    )
+    types = root / "src" / "product" / "billfetchrequest"
+    types.mkdir(parents=True)
+    (types / "Types.hs").write_text(
+        "module Types where\n\ndata BillFetchRequest = BillFetchRequest\n"
+        "  { _head :: Head, _txn :: Txn }\n  deriving (Show, Eq)\n\n"
+        "data Head = Head { _ver :: Text } deriving (Show)\n\n"
+        "data Txn = Txn { _txnId :: Text } deriving (Show)\n"
+    )
+    repository = RepositoryIndex.build(
+        root,
+        RepositoryIndexConfig(
+            maximum_excerpt_characters=2_000,
+            suffixes=resolve_repository_suffixes(include_code=True),
+        ),
+    )
+    grounding = _grounding()
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(),
+    )
+    case = grounding.test_cases[0]
+
+    tools.initialize_case(case)
+    read_content = "\n".join(
+        tools.catalog[snippet_id].content for snippet_id in tools.read_ids(case)
+    )
+    assert '"upi" :> Bill.BillAPI' in read_content  # mount prefix (cascade A)
+    assert (
+        "billFetchRequest key version path vault" in read_content
+    )  # handler body (cascade B)
+
+
+@pytest.mark.asyncio
+async def test_complete_turn0_evidence_goes_straight_to_specification(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    routes = root / "src" / "App" / "Routes"
+    routes.mkdir(parents=True)
+    (routes / "Bill.hs").write_text(
+        "module Bill where\n\ntype BillAPI =\n"
+        '  "BillFetchRequest" :> Capture "version" Text :> Capture "path" Text\n'
+        "    :> Vault :> ReqBody '[XML] Body :> Post '[XML] Ack\n\n"
+        "billFetchRequest :: V.Key (KM.KeyMap Text) -> Text -> Text -> Vault -> Body -> Handler Ack\n"
+        "billFetchRequest key version path vault reqBody = handleBill reqBody version\n"
+    )
+    (routes / "Core.hs").write_text(
+        "module Core where\n\ntype RootAPIs =\n"
+        '  "health" :> Get \'[JSON] Head :<|> "upi" :> Bill.BillAPI\n'
+        "rootServer = undefined\n"
+    )
+    types = root / "src" / "product" / "billfetchrequest"
+    types.mkdir(parents=True)
+    (types / "Types.hs").write_text(
+        "module Types where\n\ndata BillFetchRequest = BillFetchRequest\n"
+        "  { _head :: Head, _txn :: Txn }\n  deriving (Show, Eq)\n\n"
+        "data Head = Head { _ver :: Text } deriving (Show)\n\n"
+        'instance ToXml Head where\n  toXml h = [XAttr "ver" (_ver h)]\n\n'
+        "data Txn = Txn { _txnId :: Text } deriving (Show)\n"
+    )
+    (types / "Ack.hs").write_text(
+        "module Ack where\n\ndata Ack = Ack { code :: Text, err :: Maybe Text }\n"
+        "  deriving (Show)\n\ninstance FromXml Ack where\n  fromXml = undefined\n"
+    )
+    repository = RepositoryIndex.build(
+        root,
+        RepositoryIndexConfig(
+            maximum_excerpt_characters=2_000,
+            suffixes=resolve_repository_suffixes(include_code=True),
+        ),
+    )
+    grounding = _grounding()
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(),
+    )
+    case = grounding.test_cases[0]
+    tools.initialize_case(case)
+    completeness = tools.evidence_completeness(case)
+    assert all(completeness.values()), completeness
+
+    read_ids = list(tools.read_ids(case))
+    spec = _ready_spec(
+        {
+            "test_case_id": case.context.test_case_id,
+            "dependency_case_ids": [],
+            "available_evidence_snippet_ids": read_ids,
+        }
+    )
+    llm = _AgentLLM([spec])
+    builder = AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        SynthesisEvidenceTools(
+            grounding,
+            repository=repository,
+            config=AgenticSynthesisConfig(),
+        ),
+        config=AgenticSynthesisConfig(),
+    )
+    package = await builder.build(
+        initial_specifications=(_portal_ready_spec("TC_02", "state-2"),)
+    )
+
+    assert len(llm.prompts) == 1  # ONE model call: the specification, no decision turns
+    assert package.specifications[0].disposition == SynthesisDisposition.READY
+
+
+def test_completeness_gate_requires_read_mcp_docs_when_grounding_selected_them() -> (
+    None
+):
+    from grounding.mcp import (
+        MCPClient,
+        MCPClientConfig,
+        MCPServerIdentity,
+        MCPToolResult,
+    )
+
+    mcp_client = MCPClient(MCPClientConfig(endpoint="https://mcp.example.test/mcp"))
+    mcp_client.identity = MCPServerIdentity(
+        "2025-06-18", "merchant-integration-mcp", "3.4.7"
+    )
+    mcp_result = MCPToolResult(
+        tool_name="search_docs",
+        query="q",
+        arguments_sha256="a" * 64,
+        response_sha256="b" * 64,
+        retrieved_at=_dt.datetime(2026, 8, 31, tzinfo=_dt.timezone.utc),
+        text_blocks=(
+            "### Result 1\n**Source:** s2s_api_docs / vpas-validity.md\n"
+            "**Document ID:** `vpa_doc`\n**Chunk:** `0`\n\n```\nPOST /api/{apiVersion}/merchants/vpas/validity JSON body customerVpa.\n```\n",
+        ),
+    )
+    mcp_snippet = mcp_client.to_snippets(mcp_result)[0]
+
+    grounding = _grounding()
+    case0 = grounding.test_cases[0]
+    case = case0.model_copy(update={"mcp_snippet_ids": (mcp_snippet.snippet_id,)})
+    grounding2 = grounding.model_copy(
+        update={
+            "snippets": grounding.snippets + (mcp_snippet,),
+            "test_cases": (case,) + grounding.test_cases[1:],
+        }
+    )
+    config = AgenticSynthesisConfig(prefetch_repository_evidence=False)
+    tools = SynthesisEvidenceTools(grounding2, config=config)
+    markers = tools.evidence_completeness(case)
+    assert "mcp_documentation_read" in markers
+    assert markers["mcp_documentation_read"] is False
+    assert not all(markers.values())
+
+    # A case whose grounding selected no MCP docs carries no MCP marker.
+    markers2 = tools.evidence_completeness(grounding2.test_cases[1])
+    assert "mcp_documentation_read" not in markers2
+
+
+def test_search_mcp_arguments_are_bounded_to_the_advertised_schema() -> None:
+    base = {
+        "action": SynthesisAgentAction.SEARCH_MCP,
+        "rationale": "Fetch the endpoint spec",
+        "query": "vpas validity endpoint spec",
+        "tool_name": "get_api_spec",
+    }
+    SynthesisAgentDecision.model_validate(
+        {
+            **base,
+            "arguments": {"endpoint_id": "newton.s2s.post.merchants.vpas.validity"},
+        }
+    )
+    with pytest.raises(ValidationError):
+        SynthesisAgentDecision.model_validate({**base, "arguments": {"bad-key!": "x"}})
+    with pytest.raises(ValidationError):
+        SynthesisAgentDecision.model_validate(
+            {**base, "arguments": {"endpoint_id": "v" * 513}}
+        )
+    with pytest.raises(ValidationError):
+        SynthesisAgentDecision.model_validate(
+            {**base, "arguments": {f"k{i}": "x" for i in range(7)}}
+        )
+    with pytest.raises(ValidationError):
+        SynthesisAgentDecision.model_validate(
+            {
+                "action": SynthesisAgentAction.READ_EVIDENCE,
+                "rationale": "wrong action carries arguments",
+                "snippet_id": "f" * 64,
+                "arguments": {"a": "b"},
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_mcp_honours_model_constructed_arguments() -> None:
+    from grounding.mcp import (
+        MCPClient,
+        MCPClientConfig,
+        MCPServerIdentity,
+        MCPTool,
+        MCPToolResult,
+    )
+
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    class _SpecClient(MCPClient):
+        async def call_tool(self, name, arguments):  # type: ignore[override]
+            captured.append((name, dict(arguments)))
+            return MCPToolResult(
+                tool_name=name,
+                query=str(arguments.get("endpoint_id", "")),
+                arguments_sha256="a" * 64,
+                response_sha256="b" * 64,
+                retrieved_at=_dt.datetime(2026, 8, 31, tzinfo=_dt.timezone.utc),
+                text_blocks=(
+                    "### Result 1\n**Document ID:** `vpa-spec`\n\n```\n"
+                    "POST /api/{apiVersion}/merchants/vpas/validity JSON body "
+                    "customerVpa and payerVpa.\n```\n",
+                ),
+            )
+
+    client = _SpecClient(
+        MCPClientConfig(
+            endpoint="https://mcp.example.test/mcp",
+            allowed_tools=("get_api_spec",),
+        )
+    )
+    client.identity = MCPServerIdentity(
+        "2025-06-18", "merchant-integration-mcp", "3.4.7"
+    )
+    client.tools = (
+        MCPTool(
+            name="get_api_spec",
+            description="Get complete API specification for an endpoint",
+            input_schema={
+                "type": "object",
+                "properties": {"endpoint_id": {"type": "string"}},
+                "required": ["endpoint_id"],
+            },
+        ),
+    )
+    grounding = _grounding()
+    tools = SynthesisEvidenceTools(grounding, mcp=client)
+    assert tools.available_mcp_tools == ("get_api_spec",)
+    descriptors = tools.advertised_mcp_tool_descriptors()
+    assert descriptors[0]["name"] == "get_api_spec"
+    assert "endpoint_id" in str(descriptors[0]["input_schema"])
+
+    decision = SynthesisAgentDecision(
+        action=SynthesisAgentAction.SEARCH_MCP,
+        rationale="Pull the endpoint specification",
+        query="vpas validity endpoint specification",
+        tool_name="get_api_spec",
+        arguments={"endpoint_id": "newton.s2s.post.merchants.vpas.validity"},
+    )
+    result, snippet_ids, error = await tools.execute(grounding.test_cases[0], decision)
+    assert error is None
+    assert captured == [
+        ("get_api_spec", {"endpoint_id": "newton.s2s.post.merchants.vpas.validity"})
+    ]
+    assert len(snippet_ids) == 1
+    assert snippet_ids[0] in tools.catalog
+    assert "customerVpa" in result
+
+    # Same tool+query with different arguments is NOT a duplicate.
+    decision2 = decision.model_copy(
+        update={"arguments": {"endpoint_id": "newton.s2s.other.endpoint"}}
+    )
+    result2, _, error2 = await tools.execute(grounding.test_cases[0], decision2)
+    assert error2 is None
+    assert "Duplicate action rejected" not in result2
+
+
+def test_specification_catalog_is_id_preserved_under_budget() -> None:
+    catalog = [
+        {"snippet_id": f"id-{index}", "title": f"t{index}", "content": "x" * 500}
+        for index in range(20)
+    ]
+    budgeted = _budgeted_catalog(catalog, budget_characters=40_000)
+    assert [item["snippet_id"] for item in budgeted] == [
+        item["snippet_id"] for item in catalog
+    ]
+    full = [item for item in budgeted if "title" in item]
+    id_only = [item for item in budgeted if set(item) == {"snippet_id"}]
+    assert full and id_only
+    serialized = json.dumps(full)
+    assert len(serialized) <= int(40_000 * 0.25) + 4_000
+    small = [{"snippet_id": "a", "title": "t"}]
+    assert _budgeted_catalog(small, budget_characters=40_000) == small
+
+
+def test_specification_read_payloads_are_budget_shaped() -> None:
+    payloads = [
+        {"snippet_id": str(index), "content": "x" * 2_000, "title": f"t{index}"}
+        for index in range(15)
+    ]
+    budgeted = _budgeted_read_payloads(payloads, 40_000)
+    assert sum(len(item["content"]) for item in budgeted) <= int(40_000 * 0.45) + 4_000
+    assert any(
+        "characters elided for prompt budget" in item["content"] for item in budgeted
+    )
+    small = [{"snippet_id": "a", "content": "y" * 100}]
+    assert _budgeted_read_payloads(small, 40_000) == small
+
+
+def test_case_snippets_persist_reads_from_static_prefetch() -> None:
+    grounding = _grounding()
+    tools = SynthesisEvidenceTools(grounding, config=AgenticSynthesisConfig())
+    case = grounding.test_cases[0]
+
+    tools.initialize_case(case)
+    outcome_ids = {snippet.snippet_id for snippet in tools.case_snippets(case)}
+    # Completed specs may cite ANY read evidence, including static prefetch
+    # battery snippets; the persisted store must therefore cover read union.
+    assert set(tools.read_ids(case)).issubset(outcome_ids)
+
+
+class _FlakyEmptyContentTransport:
+    def __init__(self, empties: int) -> None:
+        self.empties = empties
+        self.calls = 0
+
+    async def post_json(
+        self,
+        endpoint: str,
+        payload: bytes,
+        *,
+        api_key: SecretStr | None,
+        timeout_seconds: float,
+        maximum_response_bytes: int,
+    ) -> LiteLLMTransportResponse:
+        del endpoint, payload, api_key, timeout_seconds, maximum_response_bytes
+        self.calls += 1
+        content: object = (
+            None if self.calls <= self.empties else '{"specifications":[]}'
+        )
+        body = json.dumps(
+            {"choices": [{"message": {"content": content}}], "usage": {}}
+        ).encode()
+        return LiteLLMTransportResponse(
+            payload=json.loads(body),
+            response_sha256=hashlib.sha256(body).hexdigest(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_litellm_client_retries_transient_empty_assistant_content() -> None:
+    transport = _FlakyEmptyContentTransport(empties=1)
+    client = LiteLLMClient(
+        LiteLLMConfig(
+            endpoint="https://llm.example.test/v1",
+            model="fixture-model",
+            api_key=SecretStr("token"),
+            retry_backoff_seconds=0.01,
+        ),
+        transport=transport,
+    )
+
+    completion = await client.complete(
+        system_prompt="system",
+        user_prompt="user",
+        response_model=SynthesisBatchResponse,
+        schema_name="test_schema",
+    )
+
+    assert completion.content == '{"specifications":[]}'
+    assert transport.calls == 2
+
+    exhausted = _FlakyEmptyContentTransport(empties=99)
+    client = LiteLLMClient(
+        LiteLLMConfig(
+            endpoint="https://llm.example.test/v1",
+            model="fixture-model",
+            api_key=SecretStr("token"),
+            retry_backoff_seconds=0.01,
+        ),
+        transport=exhausted,
+    )
+    with pytest.raises(LiteLLMRetryableError, match="assistant content is empty"):
+        await client.complete(
+            system_prompt="system",
+            user_prompt="user",
+            response_model=SynthesisBatchResponse,
+            schema_name="test_schema",
+        )
+    assert exhausted.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_agent_memory_compaction_keeps_prompts_bounded(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    (root / "api").mkdir(parents=True)
+    lines: list[str] = []
+    for window in range(4):
+        lines.append(f"MARKER_WINDOW_{window + 1}_START")
+        lines.extend(f"filler {window + 1}.{index}" for index in range(55))
+    (root / "api" / "contract.md").write_text("\n".join(lines))
+    repository = RepositoryIndex.build(
+        root,
+        RepositoryIndexConfig(maximum_excerpt_characters=2_000),
+    )
+    grounding = _grounding()
+    last_window = repository.read_lines("api/contract.md", 169, 224)
+    case = {
+        "test_case_id": "TC_01",
+        "dependency_case_ids": [],
+        "available_evidence_snippet_ids": [last_window.snippet_id],
+    }
+    decisions: list[object] = [
+        SynthesisAgentDecision(
+            action=SynthesisAgentAction.READ_REPOSITORY_FILE,
+            rationale=f"Read window {window}",
+            repository_path="api/contract.md",
+            line_start=1 + 56 * window,
+            line_end=56 + 56 * window,
+        )
+        for window in range(4)
+    ]
+    decisions += [
+        SynthesisAgentDecision(
+            action=SynthesisAgentAction.FINAL,
+            rationale="Four windows read",
+        ),
+        _ready_spec(case),
+    ]
+    llm = _AgentLLM(decisions)
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(maximum_turns_per_case=6),
+    )
+
+    package = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        tools,
+        config=tools.config,
+    ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    assert package.specifications[0].disposition == SynthesisDisposition.READY
+    decision_prompts = llm.prompts[:5]
+    spec_prompt = llm.prompts[5]
+    assert max(map(len, llm.prompts)) < 40_000
+    final_decision = decision_prompts[-1]
+    assert "MARKER_WINDOW_1_START" not in final_decision
+    assert "MARKER_WINDOW_2_START" not in final_decision
+    assert "MARKER_WINDOW_4_START" in final_decision
+    assert "read_evidence_content" in spec_prompt
+    for window in range(1, 5):
+        assert f"MARKER_WINDOW_{window}_START" in spec_prompt
+    assert len(package.specifications) == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_decision_context_overflow_forces_specification(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    grounding = _grounding()
+    # GroundingSnippet content is whitespace-stripped on validation, so the
+    # digest must be taken over the normalized text.
+    big_content = (
+        "POST /bill/fetch accepts JSON. " + ("payload padding " * 320)
+    ).strip()
+    big_citation = RepositoryCitation(
+        repository_id="a" * 64,
+        path="docs/bill-fetch-big.md",
+        file_sha256="c" * 64,
+        line_start=1,
+        line_end=2,
+        excerpt_sha256=hashlib.sha256(big_content.encode()).hexdigest(),
+        redacted=False,
+    )
+    big_id = _hash_json(
+        {
+            "source": GroundingSourceKind.REPOSITORY.value,
+            "citation": big_citation.model_dump(mode="json"),
+            "content": big_content,
+        }
+    )
+    big_snippet = GroundingSnippet(
+        snippet_id=big_id,
+        source_kind=GroundingSourceKind.REPOSITORY,
+        title="docs/bill-fetch-big.md:1-2",
+        content=big_content,
+        relevance_score=10,
+        repository=big_citation,
+    )
+    case0 = grounding.test_cases[0].model_copy(
+        update={
+            "repository_snippet_ids": grounding.test_cases[0].repository_snippet_ids
+            + (big_id,)
+        }
+    )
+    grounding2 = grounding.model_copy(
+        update={
+            "snippets": grounding.snippets + (big_snippet,),
+            "test_cases": (case0,) + grounding.test_cases[1:],
+        }
+    )
+    case = {
+        "test_case_id": "TC_01",
+        "dependency_case_ids": [],
+        "available_evidence_snippet_ids": [big_id],
+    }
+    llm = _AgentLLM(
+        [
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.READ_EVIDENCE,
+                rationale="Read the oversized seeded snippet",
+                snippet_id=big_id,
+            ),
+            _ready_spec(case),
+        ]
+    )
+    # Turn 1: preview-only decision prompt fits under the cap and the model
+    # reads the oversized snippet. Turn 2: the raw 4KB read body in memory
+    # pushes the decision prompt well past 2_000 -> forced specification with
+    # the read evidence intact.
+    # 4_500 sits in the window between the oversized turn-2 decision prompt
+    # (~5_746 with the raw read body in memory) and the budgeted specification
+    # prompt (~4_322), so the overflow forces the spec stage without failing it.
+    tools = SynthesisEvidenceTools(
+        grounding2,
+        config=AgenticSynthesisConfig(
+            maximum_turns_per_case=4,
+            maximum_prompt_characters=4_500,
+            maximum_evidence_characters=4_000,
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        package = await AgenticSynthesisBuilder(
+            grounding2,
+            "d" * 64,
+            llm,
+            tools,
+            config=tools.config,
+        ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    assert "agent decision context exceeded" in caplog.text
+    assert package.specifications[0].test_case_id == "TC_01"
+    assert package.specifications[0].disposition == SynthesisDisposition.READY
+
+
+@pytest.mark.asyncio
+async def test_agent_decision_transport_failure_forces_specification(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    grounding = _grounding()
+    snippet_id = grounding.test_cases[0].repository_snippet_ids[0]
+    case = {
+        "test_case_id": "TC_01",
+        "dependency_case_ids": [],
+        "available_evidence_snippet_ids": [snippet_id],
+    }
+    llm = _AgentLLM(
+        [
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.READ_EVIDENCE,
+                rationale="Read the only seeded snippet",
+                snippet_id=snippet_id,
+            ),
+            LiteLLMError("LiteLLM assistant content is empty"),
+            _ready_spec(case),
+        ]
+    )
+    tools = SynthesisEvidenceTools(
+        grounding,
+        config=AgenticSynthesisConfig(maximum_turns_per_case=4),
+    )
+
+    with caplog.at_level("WARNING"):
+        package = await AgenticSynthesisBuilder(
+            grounding,
+            "d" * 64,
+            llm,
+            tools,
+            config=tools.config,
+        ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    assert "decision transport failed" in caplog.text
+    assert len(llm.prompts) == 3
+    assert package.specifications[0].test_case_id == "TC_01"
+    assert package.specifications[0].disposition == SynthesisDisposition.READY
+    assert package.specifications[0].evidence_snippet_ids == (snippet_id,)
+    assert len(package.specifications) == 2
+
+
+@pytest.mark.asyncio
+async def test_specification_prompt_excludes_unread_candidate_previews(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    root.mkdir()
+    read_text = (
+        "READ_TARGET_CONTENT BillFetchRequest accepts requestId field. "
+        + "padding " * 40
+    )
+    unseen_text = (
+        "UNREAD_PREVIEW_MARKER BillFetchRequest route placeholder. " + "trailer " * 40
+    )
+    (root / "a-read.md").write_text(read_text)
+    (root / "b-unread.md").write_text(unseen_text)
+    repository = RepositoryIndex.build(
+        root,
+        RepositoryIndexConfig(maximum_excerpt_characters=2_000),
+    )
+    search_hits = repository.search(
+        "BillFetchRequest requestId", limit=5, anchor_terms=("BillFetchRequest",)
+    )
+    assert len(search_hits) == 2
+    read_hit = next(hit for hit in search_hits if "read" in hit.title)
+    unseen_marker = "UNREAD_PREVIEW_MARKER"
+
+    grounding = _grounding()
+    case = {
+        "test_case_id": "TC_01",
+        "dependency_case_ids": [],
+        "available_evidence_snippet_ids": [read_hit.snippet_id],
+    }
+    llm = _AgentLLM(
+        [
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.SEARCH_REPOSITORY,
+                rationale="Locate the request documentation",
+                query="BillFetchRequest requestId",
+            ),
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.READ_EVIDENCE,
+                rationale="Read the marked request file",
+                snippet_id=read_hit.snippet_id,
+            ),
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.FINAL,
+                rationale="Request contract confirmed",
+            ),
+            _ready_spec(case),
+        ]
+    )
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(maximum_turns_per_case=5),
+    )
+
+    package = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        tools,
+        config=tools.config,
+    ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    assert package.specifications[0].disposition == SynthesisDisposition.READY
+    decision_prompts = llm.prompts[:3]
+    assert any(unseen_marker in prompt for prompt in decision_prompts)
+    spec_prompt = llm.prompts[3]
+    assert unseen_marker not in spec_prompt
+    assert "READ_TARGET_CONTENT" in spec_prompt
+
+
+def test_decision_validates_read_repository_file_anchor_mode() -> None:
+    anchor_only = SynthesisAgentDecision(
+        action=SynthesisAgentAction.READ_REPOSITORY_FILE,
+        rationale="Open the route declaration by its exact term",
+        repository_path="api/apitypes.md",
+        anchor="ReqValAdd :>",
+    )
+    assert anchor_only.anchor == "ReqValAdd :>"
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        SynthesisAgentDecision(
+            action=SynthesisAgentAction.READ_REPOSITORY_FILE,
+            rationale="Anchor plus explicit window",
+            repository_path="api/apitypes.md",
+            anchor="ReqValAdd :>",
+            line_start=80,
+            line_end=90,
+        )
+    with pytest.raises(ValueError, match="read_repository_file"):
+        SynthesisAgentDecision(
+            action=SynthesisAgentAction.SEARCH_REPOSITORY,
+            rationale="Anchor passed to a search",
+            query="ReqValAdd",
+            anchor="ReqValAdd :>",
+        )
+
+
+@pytest.mark.asyncio
+async def test_agent_reads_repository_file_by_anchor_and_cites_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repository"
+    (root / "api").mkdir(parents=True)
+    lines = ["# contract"] + [f"context {index}" for index in range(2, 55)]
+    lines.append('"ReqValAdd" :> Capture version :> ReqBody XML :> Post XML Ack')
+    lines += [f"tail {index}" for index in range(2, 120)]
+    (root / "api" / "routes.md").write_text("\n".join(lines))
+    repository = RepositoryIndex.build(
+        root,
+        RepositoryIndexConfig(maximum_excerpt_characters=2_000),
+    )
+    expected = repository.read_around_match("api/routes.md", '"ReqValAdd" :>')
+    grounding = _grounding()
+    case = {
+        "test_case_id": "TC_01",
+        "dependency_case_ids": [],
+        "available_evidence_snippet_ids": [expected.snippet_id],
+    }
+    llm = _AgentLLM(
+        [
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.READ_REPOSITORY_FILE,
+                rationale="Open the route declaration via its anchor",
+                repository_path="api/routes.md",
+                anchor='"ReqValAdd" :>',
+            ),
+            SynthesisAgentDecision(
+                action=SynthesisAgentAction.FINAL,
+                rationale="Route found by anchor",
+            ),
+            _ready_spec(case),
+        ]
+    )
+    tools = SynthesisEvidenceTools(
+        grounding,
+        repository=repository,
+        config=AgenticSynthesisConfig(maximum_turns_per_case=3),
+    )
+
+    package = await AgenticSynthesisBuilder(
+        grounding,
+        "d" * 64,
+        llm,
+        tools,
+        config=tools.config,
+    ).build(initial_specifications=(_portal_ready_spec("TC_02", "state-2"),))
+
+    assert package.retrieved_snippets == (expected,)
+    assert 'ReqValAdd"' in package.specifications[0].evidence_snippet_ids[0] or (
+        package.specifications[0].evidence_snippet_ids == (expected.snippet_id,)
+    )

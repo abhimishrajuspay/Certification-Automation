@@ -258,6 +258,7 @@ class LiteLLMClient:
         request_sha256 = hashlib.sha256(request_data).hexdigest()
 
         response: Optional[LiteLLMTransportResponse] = None
+        content = ""
         for attempt in range(1, self.config.maximum_transport_attempts + 1):
             started_at = time.monotonic()
             LOGGER.info(
@@ -277,6 +278,7 @@ class LiteLLMClient:
                     attempt=attempt,
                     started_at=started_at,
                 )
+                content = _completion_content(response.payload)
                 break
             except LiteLLMRetryableError as exc:
                 elapsed = time.monotonic() - started_at
@@ -319,16 +321,6 @@ class LiteLLMClient:
         if response is None:  # Defensive; retry loop either returns or raises.
             raise LiteLLMTransportError("LiteLLM transport produced no response")
 
-        try:
-            content = _completion_content(response.payload)
-        except LiteLLMProtocolError as exc:
-            LOGGER.error(
-                "model response rejected request=%s response=%s error=%s",
-                request_sha256[:12],
-                response.response_sha256[:12],
-                exc,
-            )
-            raise
         usage = _usage(response.payload)
         LOGGER.info(
             "model response received request=%s response=%s content_characters=%d "
@@ -432,6 +424,8 @@ def _completion_content(payload: dict[str, object]) -> str:
     content = message.get("content")
     if isinstance(content, str) and content.strip():
         return content
+    if content is None or isinstance(content, str):
+        raise LiteLLMRetryableError("LiteLLM assistant content is empty")
     if isinstance(content, list):
         blocks = [
             block.get("text")
@@ -441,7 +435,7 @@ def _completion_content(payload: dict[str, object]) -> str:
         combined = "\n".join(blocks).strip()
         if combined:
             return combined
-    raise LiteLLMProtocolError("LiteLLM assistant content is empty or unsupported")
+    raise LiteLLMProtocolError("LiteLLM assistant content type is unsupported")
 
 
 def _usage(payload: dict[str, object]) -> TokenUsage:

@@ -14,12 +14,18 @@ from typing import Optional, Sequence
 
 from pydantic import SecretStr
 
-from grounding.mcp import DEFAULT_READ_ONLY_TOOLS, MCPClient, MCPClientConfig
+from grounding.mcp import (
+    AGENT_READ_ONLY_TOOLS,
+    DEFAULT_READ_ONLY_TOOLS,
+    MCPClient,
+    MCPClientConfig,
+)
 from grounding.models import GroundingSnippet
 from grounding.repository import (
     RepositoryIndex,
     RepositoryIndexConfig,
     RepositoryIndexError,
+    resolve_repository_suffixes,
 )
 from synthesis.agentic import (
     AgenticSynthesisBuilder,
@@ -119,6 +125,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="repository exposed to the agent's bounded search tool",
     )
     parser.add_argument(
+        "--repo-include-code",
+        action="store_true",
+        help="also index source-code files such as .hs/.java/.py (or use --repo-suffix)",
+    )
+    parser.add_argument(
+        "--repo-suffix",
+        action="append",
+        default=None,
+        metavar=".EXT",
+        help="extra indexed repository file extension (repeatable), for example "
+        "--repo-suffix .hs",
+    )
+    parser.add_argument(
         "--mcp-url",
         default=os.environ.get("CZ_MCP_URL"),
         help="MCP endpoint exposed to the agent (or CZ_MCP_URL)",
@@ -131,8 +150,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mcp-tool",
         action="append",
-        choices=DEFAULT_READ_ONLY_TOOLS,
-        help="read-only MCP search tool exposed to the agent; may be repeated",
+        choices=AGENT_READ_ONLY_TOOLS,
+        help=(
+            "code-owned read-only MCP tool exposed to the agent; may be "
+            f"repeated (defaults: {', '.join(DEFAULT_READ_ONLY_TOOLS)})"
+        ),
     )
     parser.add_argument(
         "--mcp-timeout-seconds",
@@ -229,6 +251,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=90.0,
         help="timeout for each LiteLLM HTTP request",
+    )
+    parser.add_argument(
+        "--no-direct-specification",
+        action="store_true",
+        help=(
+            "always run the full decision loop even when turn-0 evidence is "
+            "already complete (route, types, response type, instances)"
+        ),
     )
     parser.add_argument(
         "--maximum-transport-attempts",
@@ -417,6 +447,9 @@ async def _run(args: argparse.Namespace) -> int:
             evidence_preview_characters=args.agent_evidence_preview_characters,
             maximum_evidence_characters=args.agent_maximum_evidence_characters,
             allow_incomplete_source=args.allow_incomplete_source,
+            direct_specification_on_complete_evidence=(
+                not args.no_direct_specification
+            ),
         )
         repository = None
         if args.repo_path is not None:
@@ -424,6 +457,9 @@ async def _run(args: argparse.Namespace) -> int:
             repository = RepositoryIndex.build(
                 args.repo_path,
                 RepositoryIndexConfig(
+                    suffixes=resolve_repository_suffixes(
+                        args.repo_suffix, include_code=args.repo_include_code
+                    ),
                     maximum_file_bytes=args.maximum_repo_file_bytes,
                     maximum_total_bytes=args.maximum_repo_total_bytes,
                     maximum_excerpt_characters=(args.agent_maximum_evidence_characters),

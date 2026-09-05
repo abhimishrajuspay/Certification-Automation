@@ -58,6 +58,12 @@ def export_synthesis(
             f"synthesis output already exists ({names}); use overwrite explicitly"
         )
     _ensure_directory(destination)
+    if overwrite and synthesis_path.exists():
+        # Preserve the previous best artifact before replacing it: an aborted
+        # or failed rerun must never destroy an already-validated package.
+        _atomic_write(
+            synthesis_path.with_suffix(".json.prev"), synthesis_path.read_bytes()
+        )
 
     synthesis_data = _json_bytes(package.model_dump(mode="json"), pretty=True)
     specifications_data = b"".join(

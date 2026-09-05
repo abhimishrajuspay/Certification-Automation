@@ -18,9 +18,10 @@ from knowledge.models import SHA256_PATTERN
 
 
 SYNTHESIS_SCHEMA_VERSION = "1.2"
-PROMPT_VERSION = "2.1"
+PROMPT_VERSION = "3.4"
 _ENVIRONMENT_VALUE = re.compile(r"^\{\{[A-Za-z_][A-Za-z0-9_]*\}\}$")
 _TEMPLATE_VALUE = re.compile(r"\{\{[A-Za-z_][A-Za-z0-9_]*\}\}")
+_MCP_ARGUMENT_KEY = re.compile(r"[A-Za-z0-9_]{1,64}\Z")
 _SENSITIVE_HEADER_NAMES = {
     "api-key",
     "apikey",
@@ -99,6 +100,7 @@ class SynthesisAgentAction(str, Enum):
     SEARCH_REPOSITORY = "search_repository"
     SEARCH_MCP = "search_mcp"
     READ_EVIDENCE = "read_evidence"
+    READ_REPOSITORY_FILE = "read_repository_file"
     FINAL = "final"
 
 
@@ -168,6 +170,29 @@ class RequestBodySpec(SynthesisModel):
         return self
 
 
+class SignatureAlgorithm(str, Enum):
+    """Deterministic request-time signature recipes rendered by Phase 10."""
+
+    MERCHANT_HMAC_SHA256 = "merchant_hmac_sha256"
+
+
+class SignatureBinding(SynthesisModel):
+    """Structured signature recipe; Phase 10 renders the exact script.
+
+    The model never emits script code. It names the header, the ordered
+    variable bindings that form the signed string, the sensitive binding that
+    holds the signing key, and whether the raw request body is the last
+    component. The deterministic builder renders and validates the recipe
+    against the spec's declared variable bindings.
+    """
+
+    algorithm: SignatureAlgorithm
+    header_name: str = Field(min_length=1, max_length=120)
+    key_binding_name: str = Field(min_length=1, max_length=160)
+    component_binding_names: tuple[str, ...] = Field(min_length=1)
+    raw_body_component: bool = True
+
+
 class HTTPRequestSpec(SynthesisModel):
     """Transport-neutral HTTP request definition for Phase 10 rendering."""
 
@@ -178,6 +203,7 @@ class HTTPRequestSpec(SynthesisModel):
     body: RequestBodySpec = Field(
         default_factory=lambda: RequestBodySpec(mode=RequestBodyMode.NONE)
     )
+    signature: Optional[SignatureBinding] = None
 
     @field_validator("path")
     @classmethod
@@ -211,6 +237,19 @@ class HTTPRequestSpec(SynthesisModel):
                 raise ValueError(
                     f"sensitive header {header.name!r} must use one environment "
                     "placeholder such as {{API_KEY}}"
+                )
+        if self.signature is not None:
+            header_names = {item.name.casefold() for item in self.headers}
+            if self.signature.header_name.casefold() not in header_names:
+                raise ValueError("signature header must be declared in request.headers")
+            value = next(
+                item
+                for item in self.headers
+                if item.name.casefold() == self.signature.header_name.casefold()
+            )
+            if not _ENVIRONMENT_VALUE.fullmatch(value.value):
+                raise ValueError(
+                    "signature header value must be one environment placeholder"
                 )
         return self
 
@@ -426,16 +465,23 @@ class TestCaseExecutionSpec(SynthesisModel):
             values.extend(item.value for item in self.request.query_parameters)
             if self.request.body.template:
                 values.append(self.request.body.template)
+        used = {
+            match.group(0)[2:-2]
+            for value in values
+            for match in _TEMPLATE_VALUE.finditer(value)
+        }
+        if self.request is not None and self.request.signature is not None:
+            # Signature components and the key are consumed by the recipe the
+            # Phase-10 renderer executes even when they never appear inside a
+            # {{PLACEHOLDER}} (for example the HMAC key never enters text).
+            used.add(self.request.signature.key_binding_name)
+            used.update(self.request.signature.component_binding_names)
         values.extend(
             assertion.expected
             for assertion in self.assertions
             if assertion.expected is not None
         )
-        return {
-            match.group(0)[2:-2]
-            for value in values
-            for match in _TEMPLATE_VALUE.finditer(value)
-        }
+        return used
 
 
 class SynthesisBatchResponse(SynthesisModel):
@@ -452,6 +498,14 @@ class SynthesisAgentDecision(SynthesisModel):
     query: Optional[str] = Field(default=None, min_length=1, max_length=2_000)
     tool_name: Optional[str] = Field(default=None, min_length=1, max_length=200)
     snippet_id: Optional[str] = Field(default=None, pattern=SHA256_PATTERN)
+    repository_path: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    line_start: Optional[int] = Field(default=None, ge=1, le=1_000_000)
+    line_end: Optional[int] = Field(default=None, ge=1, le=1_000_000)
+    anchor: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    # Optional model-constructed MCP tool arguments (for advertised tools whose
+    # input schema is not a plain query, for example get_api_spec(endpoint_id)).
+    # When absent the runner derives {"query": query} plus result limits.
+    arguments: Optional[dict[str, str]] = Field(default=None)
 
     @model_validator(mode="after")
     def validate_action_payload(self) -> "SynthesisAgentDecision":
@@ -461,6 +515,14 @@ class SynthesisAgentDecision(SynthesisModel):
             valid = self.query is not None and self.tool_name is not None
         elif self.action == SynthesisAgentAction.READ_EVIDENCE:
             valid = self.snippet_id is not None
+        elif self.action == SynthesisAgentAction.READ_REPOSITORY_FILE:
+            line_window = (
+                self.line_start is not None
+                and self.line_end is not None
+                and self.line_end >= self.line_start
+            )
+            anchor_window = self.anchor is not None
+            valid = self.repository_path is not None and (line_window or anchor_window)
         else:
             valid = True
         if not valid:
@@ -470,6 +532,16 @@ class SynthesisAgentDecision(SynthesisModel):
             and self.tool_name is not None
         ):
             raise ValueError("tool_name is valid only for search_mcp")
+        if self.arguments is not None:
+            if self.action != SynthesisAgentAction.SEARCH_MCP:
+                raise ValueError("arguments are valid only for search_mcp")
+            if len(self.arguments) > 6:
+                raise ValueError("search_mcp accepts at most 6 argument keys")
+            for key, value in self.arguments.items():
+                if not _MCP_ARGUMENT_KEY.fullmatch(key):
+                    raise ValueError(f"invalid MCP argument key: {key!r}")
+                if not value or len(value) > 512:
+                    raise ValueError("MCP argument values must be 1-512 characters")
         if (
             self.action
             not in {
@@ -484,6 +556,25 @@ class SynthesisAgentDecision(SynthesisModel):
             and self.snippet_id is not None
         ):
             raise ValueError("snippet_id is valid only for read_evidence")
+        if self.action != SynthesisAgentAction.READ_REPOSITORY_FILE and any(
+            value is not None
+            for value in (
+                self.repository_path,
+                self.line_start,
+                self.line_end,
+                self.anchor,
+            )
+        ):
+            raise ValueError(
+                "repository file fields are valid only for read_repository_file"
+            )
+        if self.action == SynthesisAgentAction.READ_REPOSITORY_FILE and (
+            self.anchor is not None
+            and (self.line_start is not None or self.line_end is not None)
+        ):
+            raise ValueError(
+                "line window and anchor are mutually exclusive for read_repository_file"
+            )
         return self
 
 
@@ -840,6 +931,8 @@ __all__ = [
     "PROMPT_VERSION",
     "RequestBodyMode",
     "RequestBodySpec",
+    "SignatureAlgorithm",
+    "SignatureBinding",
     "ResponseAssertion",
     "SYNTHESIS_SCHEMA_VERSION",
     "SynthesisBatchResponse",
