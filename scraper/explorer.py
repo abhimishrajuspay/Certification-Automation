@@ -809,6 +809,12 @@ class StateGraphExplorer:
             tuple(indexed_leaves[index :: len(workers)])
             for index in range(len(workers))
         )
+        # Generalized terminal controls routinely share their landing table:
+        # per-row action siblings (log/waiver buttons) all open the SAME page,
+        # so one table must be swept exactly once regardless of how many
+        # leaves reach it. Re-sweeping would also re-plan identical
+        # (state, element, kind) candidates and break append-only id uniqueness.
+        swept_fingerprints: set[str] = set()
 
         async def sweep_worker(
             worker: ExplorationWorker,
@@ -848,6 +854,16 @@ class StateGraphExplorer:
                 self._retain_capture(ledger, leaf_capture)
                 if context_tracker is not None:
                     testcase_context = context_tracker.observe(leaf_capture)
+                if leaf_capture.state.fingerprint in swept_fingerprints:
+                    LOGGER.warning(
+                        "guided terminal sweep skipped root=%d/%d: shared table "
+                        "already swept (%r)",
+                        leaf_index,
+                        len(leaves),
+                        _branch_element_key(leaf.action.element)[:120],
+                    )
+                    continue
+                swept_fingerprints.add(leaf_capture.state.fingerprint)
                 (
                     _,
                     _,

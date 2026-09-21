@@ -788,3 +788,171 @@ def test_knowledge_export_is_deterministic_and_requires_explicit_overwrite(
 def test_identifier_matching_does_not_confuse_prefixed_testcase_ids() -> None:
     assert _contains_identifier("TC_01: exact details", "TC_01") is True
     assert _contains_identifier("BillerTC_01: different case", "TC_01") is False
+
+
+def test_pagination_totals_add_up_across_case_tables(tmp_path: Path) -> None:
+    run = ScrapeRun(
+        run_id="additive-pages-run",
+        root_url="https://portal.example.test/cases/a",
+        allowed_origins=("https://portal.example.test",),
+    )
+    store = ArtifactStore.create(tmp_path / "additive-crawls", run)
+
+    def table_capture(sequence: int, url: str, prefix: str, ids: tuple[str, ...]):
+        headers = _headers(
+            CASE_TABLE,
+            ("#", "TC ID", "API Name", "Status"),
+            f"{prefix}-case",
+        )
+        cells = tuple(
+            cell
+            for index, test_case_id in enumerate(ids, start=1)
+            for cell in _cells(
+                CASE_TABLE,
+                index,
+                (str(index), test_case_id, "Payments", "pending"),
+                f"{prefix}-{index}",
+            )
+        )
+        controls = tuple(
+            control
+            for index, test_case_id in enumerate(ids, start=1)
+            for control in _case_controls(index, test_case_id)
+        )
+        showing = _element(
+            f"{prefix}-showing",
+            tag="div",
+            text=f"Showing 1 to {len(ids)} of {len(ids)} entries",
+            parent_css_path=ROOT,
+        )
+        elements = tuple([*headers, *cells, *controls, showing])
+        state = _state(
+            store,
+            state_id=f"state-{prefix}",
+            sequence=sequence,
+            url=url,
+            elements=elements,
+        )
+        return CapturedState(state, elements, cast(AppendReceipt, object()))
+
+    tracker = ContextTracker()
+    first = tracker.observe(
+        table_capture(
+            0, "https://portal.example.test/cases/a", "page-a", ("TC_A01", "TC_A02")
+        )
+    )
+    second = tracker.observe(
+        table_capture(
+            1,
+            "https://portal.example.test/cases/b",
+            "page-b",
+            ("TC_B01", "TC_B02", "TC_B03"),
+        )
+    )
+
+    assert first.declared_test_cases == 2
+    assert second.declared_test_cases == 5
+    assert second.test_cases_discovered == 5
+    assert second.declared_total_conflicts == ()
+
+
+def test_total_bar_on_caseless_page_does_not_inflate_declared(tmp_path: Path) -> None:
+    """An index page showing e.g. 'Showing 1 to 2 of 2 entries' for slot rows
+    must not count as testcase coverage; only its summary cells qualify."""
+
+    run = ScrapeRun(
+        run_id="barless-index-run",
+        root_url="https://portal.example.test/slots",
+        allowed_origins=("https://portal.example.test",),
+    )
+    store = ArtifactStore.create(tmp_path / "barless-crawls", run)
+    summary_headers = _headers(
+        SUMMARY_TABLE,
+        ("API Name", "Total TCs"),
+        "slot-summary",
+    )
+    summary_cells = _cells(SUMMARY_TABLE, 1, ("Payments", "12"), "slot-row")
+    slot_bar = _element(
+        "slot-showing",
+        tag="div",
+        text="Showing 1 to 1 of 1 entries",
+        parent_css_path=ROOT,
+    )
+    elements = tuple([*summary_headers, *summary_cells, slot_bar])
+    state = _state(
+        store,
+        state_id="slot-state",
+        sequence=0,
+        url=run.root_url,
+        elements=elements,
+    )
+    tracker = ContextTracker()
+
+    coverage = tracker.observe(
+        CapturedState(state, elements, cast(AppendReceipt, object()))
+    )
+
+    assert coverage.declared_test_cases == 12
+    assert coverage.test_cases_discovered == 0
+    assert coverage.context_complete is False
+
+
+def test_pagination_totals_take_precedence_over_summary_cells(tmp_path: Path) -> None:
+    """When per-table bars exist they are the swept denominator; summary cells
+    are fallback evidence and must not double-count alongside them."""
+
+    run = ScrapeRun(
+        run_id="precedence-run",
+        root_url="https://portal.example.test/cases",
+        allowed_origins=("https://portal.example.test",),
+    )
+    store = ArtifactStore.create(tmp_path / "precedence-crawls", run)
+    case_headers = _headers(
+        CASE_TABLE,
+        ("#", "TC ID", "API Name", "Status"),
+        "prec-case",
+    )
+    case_cells = _cells(
+        CASE_TABLE, 1, ("1", "TC_P01", "Payments", "pending"), "prec-row"
+    )
+    controls = _case_controls(1, "TC_P01")
+    bar = _element(
+        "prec-bar",
+        tag="div",
+        text="Showing 1 to 1 of 1 entries",
+        parent_css_path=ROOT,
+    )
+    case_elements = tuple([*case_headers, *case_cells, *controls, bar])
+    case_state = _state(
+        store,
+        state_id="prec-case-state",
+        sequence=0,
+        url=run.root_url,
+        elements=case_elements,
+    )
+    summary_headers = _headers(SUMMARY_TABLE, ("API Name", "Total TCs"), "prec-summary")
+    summary_cells = _cells(SUMMARY_TABLE, 1, ("Payments", "99"), "prec-summary-row")
+    summary_elements = tuple([*summary_headers, *summary_cells])
+    summary_state = _state(
+        store,
+        state_id="prec-summary-state",
+        sequence=1,
+        url="https://portal.example.test/apis",
+        elements=summary_elements,
+    )
+    tracker = ContextTracker()
+
+    tracker.observe(
+        CapturedState(case_state, case_elements, cast(AppendReceipt, object()))
+    )
+    coverage = tracker.observe(
+        CapturedState(summary_state, summary_elements, cast(AppendReceipt, object()))
+    )
+
+    assert coverage.declared_test_cases == 1
+    assert coverage.test_cases_discovered == 1
+    assert coverage.declared_total_conflicts == ()
+    # The gate remains honestly incomplete because no description was observed,
+    # not because the declared total disagrees with discovery.
+    assert coverage.missing_description_ids == ("TC_P01",)
+    assert coverage.context_complete is False

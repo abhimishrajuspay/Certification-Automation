@@ -78,6 +78,13 @@ class TestcaseContextTracker:
     normalizer: table headers and row structure, data attributes and links for
     identifier disambiguation, and dialog ancestry for descriptions. It never
     relies on a portal-specific selector or fixed testcase prefix.
+
+    Declared coverage is additive across case-bearing table pages: each distinct
+    listing page's own "showing X to Y of N" total counts once, keyed by its
+    logical (pagination-parameter-free) URL. A total-bar capture is trusted only
+    when the same capture also carries testcase rows, so index pages listing
+    slots or certification rounds cannot inflate the denominator. Summary-table
+    "total" cells remain the fallback for portals that never render a total bar.
     """
 
     def __init__(self, required_stable_observations: int = 2) -> None:
@@ -107,8 +114,9 @@ class TestcaseContextTracker:
 
         if capture.state.fingerprint not in self._observed_fingerprints:
             self._observed_fingerprints.add(capture.state.fingerprint)
-            self._collect_tables(capture.elements)
-            self._collect_pagination_total(capture)
+            cases_found = self._collect_tables(capture.elements)
+            if cases_found:
+                self._collect_pagination_total(capture)
             if capture.state.modal_count > 0:
                 self._collect_modal_text(
                     capture.elements,
@@ -159,7 +167,8 @@ class TestcaseContextTracker:
         *,
         declared_total_rows: Optional[set[str]] = None,
         collect_test_cases: bool = True,
-    ) -> None:
+    ) -> bool:
+        """Collect table evidence; return True when testcase rows were found."""
         headers_by_root: dict[tuple[str, str], list[ElementSnapshot]] = defaultdict(
             list
         )
@@ -179,6 +188,7 @@ class TestcaseContextTracker:
                 if row_path:
                     cells_by_row[(element.frame_id, root, row_path)].append(element)
 
+        cases_found = False
         for (frame_id, root), header_elements in headers_by_root.items():
             headers = tuple(
                 _element_text(element) or f"Column {index}"
@@ -214,12 +224,14 @@ class TestcaseContextTracker:
                 test_case_id = _test_case_id(fields, controls)
                 if test_case_id is None:
                     continue
+                cases_found = True
                 case = self._cases.setdefault(test_case_id, _CaseEvidence())
                 for key, value in fields:
                     normalized_value = (
                         test_case_id if key in _TEST_CASE_ID_KEYS else value
                     )
                     case.fields.setdefault(key, set()).add(normalized_value)
+        return cases_found
 
     def _collect_declared_total(
         self,
@@ -329,12 +341,10 @@ class TestcaseContextTracker:
                 conflicts.append(test_case_id)
 
         declared_total = (
-            sum(self._declared_totals.values())
-            if self._declared_totals
+            sum(self._pagination_totals.values())
+            if self._pagination_totals
             else (
-                sum(self._pagination_totals.values())
-                if self._pagination_totals
-                else None
+                sum(self._declared_totals.values()) if self._declared_totals else None
             )
         )
         context_complete = bool(
