@@ -230,7 +230,13 @@ FRAME_EXTRACTION_SCRIPT = r"""
         const form = element.form || (element.closest ? element.closest('form') : null);
         const table = element.closest ? element.closest('table') : null;
         const row = element.closest ? element.closest('tr') : null;
-        const rowHeading = row ? row.querySelector('th[scope=row], th, td') : null;
+        const rowCells = row
+            ? Array.from(row.querySelectorAll('th[scope=row], th, td'))
+            : [];
+        const rowHeading =
+            rowCells.find(
+                (cell) => normalized(cell.innerText || cell.textContent)
+            ) || null;
         const caption = table ? table.querySelector(':scope > caption') : null;
         return {
             sectionHeading: sectionHeading(element),

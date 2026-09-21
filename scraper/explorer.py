@@ -720,7 +720,22 @@ class StateGraphExplorer:
                 )[: rule.maximum_branches]
             )
             if not matches:
-                raise ExplorationError(f"branch rule {rule.name!r} matched no controls")
+                if level == 0:
+                    raise ExplorationError(
+                        f"branch rule {rule.name!r} matched no controls"
+                    )
+                # A generalized sibling can lead to a page outside the taught
+                # structure (for example a sidebar menu entry pointing at the
+                # dashboard). Such subtrees are dead ends for this guide, not
+                # crawl failures: skip them and keep fanning out.
+                LOGGER.warning(
+                    "guided branch rule %r matched no controls at level %d;"
+                    " skipping subtree reached via %r",
+                    rule.name,
+                    level + 1,
+                    (capture.state.url or "")[:120],
+                )
+                return
             LOGGER.info(
                 "guided branch controls discovered level=%d/%d controls=%d",
                 level + 1,
@@ -849,6 +864,7 @@ class StateGraphExplorer:
                     allow_early_stop=False,
                     coordinator=coordinator,
                     executor=worker.executor,
+                    allow_empty_terminal=True,
                 )
                 progress = context_tracker.snapshot() if context_tracker else None
                 LOGGER.info(
@@ -900,6 +916,7 @@ class StateGraphExplorer:
         allow_early_stop: bool = True,
         coordinator: Optional[_GuidedExecutionCoordinator] = None,
         executor: Optional[ActionExecutor] = None,
+        allow_empty_terminal: bool = False,
     ) -> tuple[
         Page,
         CapturedState,
@@ -907,6 +924,12 @@ class StateGraphExplorer:
         int,
     ]:
         """Sweep demonstrated row controls in place without restoring the root."""
+
+        # Generalized branch siblings can lead to page shapes the repeat rule
+        # was never taught (for example a waiver form beside a testcase list).
+        # Under branch fan-out such terminals are dead ends: skip them instead
+        # of failing the whole crawl. A standalone terminal with zero rows
+        # remains an honest hard error.
 
         current_page = active_page
         current_capture = capture
@@ -1033,6 +1056,19 @@ class StateGraphExplorer:
                         )
 
                 if not page_matched and not processed_rows:
+                    if allow_empty_terminal:
+                        LOGGER.warning(
+                            "repeat rule %r matched no row controls on %r;"
+                            " skipping dead-end terminal",
+                            rule.name,
+                            (current_capture.state.url or "")[:120],
+                        )
+                        return (
+                            current_page,
+                            current_capture,
+                            testcase_context,
+                            attempts,
+                        )
                     raise ExplorationError(
                         f"repeat rule {rule.name!r} matched no row controls"
                     )
@@ -1099,7 +1135,12 @@ class StateGraphExplorer:
         coordinator: Optional[_GuidedExecutionCoordinator] = None,
         executor: Optional[ActionExecutor] = None,
     ) -> tuple[Page, CapturedState, int]:
-        matches = target_elements(capture, rule.close_target, allow_many=False)
+        matches = target_elements(
+            capture,
+            rule.close_target,
+            allow_many=False,
+            require_visible=True,
+        )
         if len(matches) != 1:
             raise ExplorationError(
                 f"repeat rule {rule.name!r} close target did not resolve uniquely"
@@ -1328,6 +1369,7 @@ class StateGraphExplorer:
                             modal_capture,
                             rule.close_target,
                             allow_many=False,
+                            require_visible=True,
                         )
                         if len(close_matches) != 1:
                             raise ExplorationError(
@@ -1723,9 +1765,11 @@ class StateGraphExplorer:
             title = await page.title()
             actual_rows = await page.locator("tr").evaluate_all(
                 """rows => rows.map((row) => {
-                    const cell = row.querySelector('th[scope=row], th, td');
-                    return String(cell ? (cell.innerText || cell.textContent || '') : '')
-                        .replace(/\\s+/g, ' ').trim();
+                    const cells = Array.from(row.querySelectorAll('th[scope=row], th, td'));
+                    return cells
+                        .map((cell) => String(cell.innerText || cell.textContent || '')
+                            .replace(/\\s+/g, ' ').trim())
+                        .find(Boolean) || '';
                 }).filter(Boolean)"""
             )
             actual_table_count = await page.locator("table, [role=table]").count()

@@ -278,3 +278,192 @@ def test_target_matching_uses_css_to_disambiguate_repeated_roles(
 
     assert [element.context.row_label for element in repeated] == ["TC_01", "TC_02"]
     assert [element.element_id for element in unique] == ["info-2"]
+
+
+def test_close_target_resolves_uniquely_among_hidden_dialog_controls(
+    tmp_path: Path,
+) -> None:
+    """Only the opened dialog's close control is visible, so a close target
+    must disambiguate same-shaped hidden dialogs by visibility."""
+
+    store = ArtifactStore.create(
+        tmp_path / "crawls",
+        ScrapeRun(
+            run_id="close-run",
+            root_url="https://portal.test/cases",
+            allowed_origins=("https://portal.test",),
+        ),
+    )
+
+    def close_button(element_id: str, visible: bool) -> ElementSnapshot:
+        return ElementSnapshot(
+            element_id=element_id,
+            frame_id="main",
+            tag="button",
+            role="button",
+            accessible_name="×",
+            text="×",
+            visible=visible,
+            enabled=True,
+            interactive=True,
+            interaction_signals=("role:button",),
+            attributes=(ValueCapture(name="class", value="close"),),
+            locators=(
+                LocatorCandidate(
+                    strategy=LocatorStrategy.CSS,
+                    value=f"#{element_id}",
+                    confidence=0.5,
+                    unique_match_count=1,
+                    is_primary=True,
+                ),
+            ),
+        )
+
+    elements = (
+        close_button("close-hidden-1", False),
+        close_button("close-open", True),
+        close_button("close-hidden-2", False),
+    )
+    state = StateSnapshot(
+        state_id="modal",
+        run_id="close-run",
+        sequence=1,
+        fingerprint="b" * 64,
+        page_id="page",
+        url="https://portal.test/cases",
+        viewport=Viewport(width=1280, height=720),
+        frames=(
+            FrameSnapshot(
+                frame_id="main",
+                frame_path="main",
+                url="https://portal.test/cases",
+                is_main=True,
+                element_ids=tuple(item.element_id for item in elements),
+            ),
+        ),
+        element_ids=tuple(item.element_id for item in elements),
+    )
+    capture = CapturedState(
+        state=state,
+        elements=elements,
+        receipt=store.append_record(state),
+    )
+    target = GuideTarget(
+        tag="button",
+        role="button",
+        accessible_name="×",
+        text="×",
+        css_classes=("close",),
+    )
+
+    ambiguous = target_elements(capture, target, allow_many=False)
+    resolved = target_elements(
+        capture,
+        target,
+        allow_many=False,
+        require_visible=True,
+    )
+
+    assert ambiguous == ()
+    assert [item.element_id for item in resolved] == ["close-open"]
+
+
+def test_icon_only_row_target_compiles_and_resolves_via_class_membership(
+    tmp_path: Path,
+) -> None:
+    """A bare icon anchor carries only its class list; generalization and
+    matching must both work from that single signal."""
+
+    clicks = (
+        OperatorClick(
+            sequence=0,
+            target=GuideTarget(
+                tag="a",
+                role="link",
+                accessible_name="Manage Test",
+                css="aside > ul > li:nth-of-type(2) > a",
+            ),
+        ),
+        OperatorClick(
+            sequence=1,
+            target=GuideTarget(tag="a", css_classes=("getTestCaseDet",)),
+            row_label="MP_03",
+        ),
+        OperatorClick(
+            sequence=2,
+            target=GuideTarget(
+                tag="button",
+                role="button",
+                accessible_name="×",
+                text="×",
+                css_classes=("close",),
+            ),
+            inside_dialog=True,
+        ),
+    )
+    guide = compile_taught_guide(clicks, branch_depth=1)
+    repeat = guide.repeat_rules[0]
+    assert repeat.target.css_classes == ("getTestCaseDet",)
+    assert repeat.target.test_id is None
+    assert repeat.target.css_regex is None
+
+    elements = tuple(
+        ElementSnapshot(
+            element_id=element_id,
+            frame_id="main",
+            tag="a",
+            visible=True,
+            enabled=True,
+            interactive=True,
+            interaction_signals=("click",),
+            attributes=(ValueCapture(name="class", value=class_value),),
+            locators=(
+                LocatorCandidate(
+                    strategy=LocatorStrategy.CSS,
+                    value=f"#{element_id}",
+                    confidence=0.5,
+                    unique_match_count=1,
+                    is_primary=True,
+                ),
+            ),
+        )
+        for element_id, class_value in (
+            ("info-1", "getTestCaseDet"),
+            ("info-2", "getTestCaseDet fa"),
+            ("ready", "ready"),
+        )
+    )
+    store = ArtifactStore.create(
+        tmp_path / "crawls2",
+        ScrapeRun(
+            run_id="icon-run",
+            root_url="https://portal.test/cases",
+            allowed_origins=("https://portal.test",),
+        ),
+    )
+    state = StateSnapshot(
+        state_id="s",
+        run_id="icon-run",
+        sequence=2,
+        fingerprint="d" * 64,
+        page_id="page",
+        url="https://portal.test/cases",
+        viewport=Viewport(width=1280, height=720),
+        frames=(
+            FrameSnapshot(
+                frame_id="main",
+                frame_path="main",
+                url="https://portal.test/cases",
+                is_main=True,
+                element_ids=tuple(item.element_id for item in elements),
+            ),
+        ),
+        element_ids=tuple(item.element_id for item in elements),
+    )
+    capture = CapturedState(
+        state=state,
+        elements=elements,
+        receipt=store.append_record(state),
+    )
+    matches = target_elements(capture, repeat.target, allow_many=True)
+    assert [item.element_id for item in matches] == ["info-1", "info-2"]

@@ -69,7 +69,22 @@ class GuideTarget(GuideModel):
     text: Optional[str] = Field(default=None, max_length=2_000)
     css: Optional[str] = Field(default=None, max_length=4_000)
     css_regex: Optional[str] = Field(default=None, max_length=4_000)
+    css_classes: tuple[str, ...] = ()
     frame_path: Optional[str] = Field(default=None, max_length=1_000)
+
+    @field_validator("css_classes")
+    @classmethod
+    def validate_css_classes(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        tokens = sorted(
+            {
+                token.strip()[:200]
+                for token in value
+                if isinstance(token, str) and token.strip()
+            }
+        )
+        if len(tokens) > 20:
+            raise ValueError("guide target allows at most 20 CSS classes")
+        return tuple(tokens)
 
     @model_validator(mode="after")
     def require_locator(self) -> "GuideTarget":
@@ -83,6 +98,7 @@ class GuideTarget(GuideModel):
                 self.text,
                 self.css,
                 self.css_regex,
+                self.css_classes,
             )
         ):
             raise ValueError("guide target requires at least one locator signal")
@@ -269,7 +285,13 @@ TEACHING_INIT_SCRIPT = r"""
             : raw;
         if (!element || element.nodeType !== Node.ELEMENT_NODE) return;
         const row = element.closest ? element.closest('tr') : null;
-        const firstCell = row ? row.querySelector('th[scope=row], th, td') : null;
+        const rowCells = row
+            ? Array.from(row.querySelectorAll('th[scope=row], th, td'))
+            : [];
+        const firstCell =
+            rowCells.find(
+                (cell) => normalized(cell.innerText || cell.textContent)
+            ) || null;
         const table = element.closest ? element.closest('table') : null;
         const dialog = element.closest
             ? element.closest('dialog, [role=dialog], .modal, [aria-modal=true]')
@@ -294,6 +316,10 @@ TEACHING_INIT_SCRIPT = r"""
             css: cssPath(element),
             testId,
             testIdAttribute,
+            cssClasses: (element.getAttribute('class') || '')
+                .split(/\s+/)
+                .filter(Boolean)
+                .slice(0, 20),
             rowLabel: normalized(firstCell ? (firstCell.innerText || firstCell.textContent) : ''),
             tableId: normalized(table ? (table.id || '') : ''),
             insideDialog: Boolean(dialog),
@@ -362,6 +388,12 @@ class OperatorActionRecorder:
         if not role or not accessible_name:
             role = None
             accessible_name = None
+        raw_classes = payload.get("cssClasses")
+        css_classes = tuple(
+            token.strip()[:200]
+            for token in (raw_classes if isinstance(raw_classes, list) else [])
+            if isinstance(token, str) and token.strip()
+        )[:20]
         target = GuideTarget(
             test_id=safe("testId", 500),
             test_id_attribute=safe("testIdAttribute", 100) or "data-testid",
@@ -372,6 +404,7 @@ class OperatorActionRecorder:
             title=safe("title"),
             text=safe("text"),
             css=safe("css", 4_000),
+            css_classes=css_classes,
         )
         return OperatorClick(
             sequence=sequence,
@@ -550,6 +583,7 @@ def target_elements(
     target: GuideTarget,
     *,
     allow_many: bool,
+    require_visible: bool = False,
 ) -> tuple[ElementSnapshot, ...]:
     """Resolve ordered target fallbacks against immutable element evidence."""
 
@@ -565,6 +599,14 @@ def target_elements(
         for element in capture.elements
         if frame_ids is None or element.frame_id in frame_ids
     )
+    if require_visible:
+        # Pages routinely keep several same-shaped dialogs in the DOM with
+        # identical close controls; only the dialog that actually opened has
+        # a visible one. Visibility is the honest disambiguator for close
+        # targets.
+        elements = tuple(
+            element for element in elements if element.visible and element.enabled
+        )
     tiers: list[tuple[ElementSnapshot, ...]] = []
     if target.test_id:
         tiers.append(
@@ -580,6 +622,15 @@ def target_elements(
                 element
                 for element in elements
                 if _attribute(element, "id") == target.stable_id
+            )
+        )
+    if target.css_classes:
+        wanted_classes = set(target.css_classes)
+        tiers.append(
+            tuple(
+                element
+                for element in elements
+                if wanted_classes <= _element_classes(element)
             )
         )
     if target.role and target.accessible_name:
@@ -688,6 +739,13 @@ def _attribute(element: ElementSnapshot, name: str) -> Optional[str]:
     return None
 
 
+def _element_classes(element: ElementSnapshot) -> set[str]:
+    value = _attribute(element, "class")
+    if not value:
+        return set()
+    return {token for token in value.split() if token}
+
+
 def _generalize_repeat_target(target: GuideTarget, row_label: str) -> GuideTarget:
     """Remove exemplar-specific row tokens and CSS from a repeated control."""
 
@@ -703,6 +761,14 @@ def _generalize_repeat_target(target: GuideTarget, row_label: str) -> GuideTarge
     accessible_name = generic(target.accessible_name)
     title = generic(target.title)
     text = generic(target.text)
+    # Class tokens are shared across rows (e.g. a per-table info-button class),
+    # so they survive generalization unless the exemplar row label appears in
+    # the token itself.
+    css_classes = tuple(
+        token
+        for token in target.css_classes
+        if not (needle and needle in token.casefold())
+    )
     # A row exemplar's absolute CSS path points only to that row. Repetition is
     # instead grounded by row context plus the remaining semantic signature.
     return GuideTarget(
@@ -716,6 +782,7 @@ def _generalize_repeat_target(target: GuideTarget, row_label: str) -> GuideTarge
         text=text,
         css=None,
         css_regex=None,
+        css_classes=css_classes,
         frame_path=target.frame_path,
     )
 
@@ -726,20 +793,25 @@ def _generalize_branch_target(click: OperatorClick) -> GuideTarget:
     if click.row_label:
         return _generalize_repeat_target(click.target, click.row_label)
     css = click.target.css
-    if css:
-        matches = tuple(re.finditer(r":nth-(?:of-type|child)\(\d+\)", css))
-        if matches:
-            exemplar = matches[-1]
-            css_regex = (
-                re.escape(css[: exemplar.start()])
-                + r":nth-(?:of-type|child)\(\d+\)"
-                + re.escape(css[exemplar.end() :])
-            )
-            return GuideTarget(
-                tag=click.target.tag,
-                css_regex=css_regex,
-                frame_path=click.target.frame_path,
-            )
+    if css and re.search(r":nth-(?:of-type|child)\(\d+\)", css):
+        # Every positional index is generalized, not only the exemplar's own:
+        # sibling pages routinely differ in wrapper or panel counts, so the
+        # taught exemplar's intermediate positions are as accidental as its
+        # own index. The tag sequence keeps the pattern specific.
+        parts = re.split(r"(:nth-(?:of-type|child)\(\d+\))", css)
+        css_regex = "".join(
+            r":nth-(?:of-type|child)\(\d+\)"
+            if re.fullmatch(r":nth-(?:of-type|child)\(\d+\)", part)
+            else re.escape(part)
+            for part in parts
+            if part
+        )
+        return GuideTarget(
+            tag=click.target.tag,
+            css_regex=css_regex,
+            css_classes=click.target.css_classes,
+            frame_path=click.target.frame_path,
+        )
     raise GuidanceError(
         "a non-row branch exemplar requires a repeatable sibling CSS position"
     )
