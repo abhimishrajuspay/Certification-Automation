@@ -1,14 +1,34 @@
 ---
 name: certification-postman
-description: Use when generating a Postman certification collection from a testcase CSV (e.g. "Test-case-... Sheet1.csv") mapped onto an API platform whose endpoints are introspectable via a local MCP get_api_spec tool or equivalent spec docs. Parses the CSV, maps API families to wire endpoints, builds Collection v2.1 + secret-empty environment + NOTES, and audits everything. Not for one-off ad-hoc API requests.
+description: Plan, generate, and audit a Postman Collection v2.1 from a certification testcase CSV using evidence-backed endpoint mappings, prerequisite chains, MCP/API specs, and an optional reference collection. Use for complete certification suites, not one-off requests or live environment mutation.
 ---
 
 # Certification Postman
 
-Deterministic pipeline: **CSV → endpoint mapping (mapping.json) → build → audit → ship.**
-The only creative input is `mapping.json`. Scripts do everything else. Target
-runtime: minutes even for 1,000+ rows, because evidence amortizes per endpoint
-family, not per case.
+Deterministic build path: **CSV → endpoint mapping (mapping.json) → build → audit → ship.**
+Planning, semantic grouping, dependency classification, evidence selection, and
+`mapping.json` authoring require agent judgment; build and static audit are
+scripted. Work family-by-family so evidence amortizes across cases.
+
+## Operating modes and phase gate
+
+Determine the requested stopping point before acting:
+
+1. **Planning/inventory only (read-only):** validate and normalize the input,
+   group cases, classify every dependency, discover endpoint candidates, and
+   report missing/ambiguous families. Write the planning artifacts listed
+   below and STOP. Do not create a branch, edit a repository, mutate DB/Redis,
+   start services, or make merchant/API calls.
+2. **Offline build/audit:** perform planning, author `mapping.json`, fetch
+   read-only specs, build the collection/environment, and audit them. This mode
+   still does not modify the target repository, DB, or Redis and makes no live
+   merchant calls.
+3. **Implementation/local verification:** hand off to the
+   `certification-automation` skill after the plan identifies a real code,
+   mocker, platform-toggle, seed, or local replay requirement.
+
+When the user says "first perform only planning and inventory", mode 1 is a
+hard stop even if the same prompt describes later phases.
 
 ## When to use this skill
 
@@ -28,6 +48,10 @@ evidence exists for the target endpoints.
    server first: `cd mcp/merchant_mcp && .venv/bin/python src/server/mcp_sse.py`).
 3. Output directory (suggest `artifacts/manual/<slug>/`).
 4. Source repository path for semantic spot-checks (optional but preferred).
+5. Reference Postman collection when it contains known-good prerequisite or
+   credential-generation flows.
+6. Caller-supplied TSD/NPCI/BCRP/organisation documents when newer protocol
+   requirements may not yet exist in the repository or MCP catalog.
 
 Never ask about design; the contract below is the design.
 
@@ -40,24 +64,44 @@ Input may be XLSX: first convert with
 (sheet names are resolved via workbook relationships — id≠filename). If the
 sheet layout differs from the contract
 `TC ID,API Type,API Name,Test Data,Version,RC,Description,Steps`, write a
-small task-level normalizer that emits the contract CSV (keep it next to the
-output dir). Normalize the sheet's outcome column honestly — the RC holds the
+small task-level normalizer that emits the contract CSV inside the output
+directory; never overwrite the source. Record the source-to-canonical header
+mapping in the plan (for example, `RC-Upi -> RC`). Normalize the sheet's
+outcome column honestly — the RC holds the
 **wire expectation**, e.g. a payer-declining case is `00-DECLINED`, not
 `FAILURE`.
 
-Parse with `csv.DictReader`. Print: total rows, distinct `API Name` values
-with counts and first/last TC ID, distinct `RC` values. Every distinct
-`API Name` must resolve to exactly one endpoint family — list any unmapped
-families immediately.
+Parse with `csv.DictReader`. Reject missing/duplicate canonical columns and
+blank/duplicate testcase IDs. Print and persist: total rows, distinct
+`API Name` values with counts and first/last TC ID, distinct `RC` values, and
+the normalization performed. Group first by literal `API Name`, then by
+**semantic endpoint family**. Every row must belong to exactly one semantic
+family, but one API name may split into variants when wire semantics differ.
+
+For planning-only runs, write under the resolved output directory:
+
+- `plan.md`: inputs, source digests, row/header validation, family summary,
+  unresolved questions, phase gate, and recommended next command;
+- `normalized-testcases.csv`: canonical working copy when normalization was
+  needed;
+- `grouped-testcases.json`: row IDs grouped by API name and endpoint family;
+- `dependency-inventory.json`: one classification per testcase;
+- `endpoint-candidates.json`: candidate endpoint IDs, evidence, confidence,
+  and rejected candidates;
+- `missing-families.json`: missing/ambiguous families and required evidence.
+
+Do not write `mapping.json` during a planning-only run.
 
 ### 1.5. Dependency classification (REQUIRED before endpoint research)
 
-For every row, decide **who must act** for the case to pass and write it
-into `mapping.dependencies` (kind vocabulary is fixed):
+For every row, decide **who must act** for the case to pass and persist the
+classification in `dependency-inventory.json`. During build, copy non-default
+classifications into `mapping.dependencies` (`request` may be omitted there).
+The vocabulary is fixed:
 
 | kind | meaning | what the collection does |
 |---|---|---|
-| `request` | fully expressible in the S2S request body | normal request (default — omit) |
+| `request` | fully expressible in the S2S request body | normal request (default; omit only from `mapping.dependencies`) |
 | `env` | needs an operator value (VPA, account id, credBlock) | env placeholder + NOTES entry |
 | `bridge` | needs values from an async step (approval, callback UMN) | extraction / paste-bridge env + NOTES |
 | `external-simulator` | depends on NPCI/bank-sim/PSP-counterparty test data (INSUFFICIENT_LIMIT, blocked card, delayed/no response) | emit request; flag KIND in dependencies with the reason; never fake the outcome locally |
@@ -74,11 +118,10 @@ exists yet:
 
 1. Stop the collection pipeline for the affected family.
 2. Report the requirement table to the user (row, needed behavior, reason).
-3. With user confirmation, implement the toggle in the platform repo on a new
-   branch, **following the house pattern**: honor-only-when
-   `EnvKey /= "production"`, merchant/scoped storage (configuration row or
-   `/test/*` route family like `x-bypass-merchant-checksum`/`test/merchantAuth`).
-4. Fetch/spec-verify the new endpoint, then place its SET (and RESET) calls
+3. Hand the requirement to `certification-automation`; this skill does not
+   edit the platform repository or local data stores.
+4. After an explicitly approved implementation is verified, fetch/spec-verify
+   the new endpoint, then place its SET and RESET calls
    in the `00 - Test configuration` folder as ordinary families.
 
 Never invent a toggle endpoint, never guess its wire shape — build it,
@@ -88,20 +131,30 @@ know where the case's outcome really comes from.
 
 ### 2. Candidate endpoints (minutes)
 
-- Enumerate available endpoint ids. When the platform repo has a local MCP
-  postgres dump, query it directly (fastest, complete):
+- Enumerate advertised MCP tools and endpoint IDs. Prefer a full-spec tool
+  such as `get_api_spec`; discovery/search results are navigation aids only.
+  When the platform repo has a local MCP postgres dump, a read-only catalog
+  query is an optional fallback:
 
   `docker exec mcp-pg psql -U postgres -d mcp_product_context -c "SELECT endpoint_id, method, path FROM endpoint_specs ORDER BY endpoint_id"`
 
 - Map each CSV family to a candidate endpoint id, preferring endpoint specs
   whose description names the internal API (e.g. *"calls NPCI `ReqValAdd`"*).
-  Use repository grep evidence (`rg -n "<ApiName>" src/`) to disambiguate.
+  Consult supplied TSD/NPCI/BCRP documents for current protocol requirements.
+  Use repository grep evidence (`rg -n "<ApiName>" src/`) only to resolve
+  ambiguous endpoint semantics; do not bulk-ingest the repository.
 - Fetch the FULL spec per candidate (not chunked search results):
 
   `venv/bin/python3 <skill>/scripts/fetch_specs.py --mcp-url URL --endpoint-id <id> ... --out-dir <out>/specs/`
 
   A missing endpoint id must be replaced or the family must be flagged as
   unachievable — never proceed with a placeholder endpoint.
+- Record zero, one, or multiple candidates per family. Zero is `missing`;
+  multiple plausible candidates is `ambiguous`; neither may be silently mapped.
+
+The reference collection is evidence for sequencing, credential generation,
+headers, and variable names. It is not wire authority: reconcile it with the
+current full spec, source branch, and applicable TSD before copying a request.
 
 ### 3. Author mapping.json (the only creative step)
 
@@ -109,6 +162,8 @@ Copy `templates/mapping.bcrp.example.json` as the skeleton and edit:
 
 - One `endpoints` template per distinct wire contract. Build bodies from the
   spec's **Request Schema** section, not from example snippets.
+- Work one semantic family at a time and reuse its endpoint template for all
+  matching rows; do not synthesize each testcase independently.
 - Environment bindings only via `{{ENV_KEY}}`; special tokens
   `__TC_ID__`, `__TEST_DATA_AS_VPA__` (see `reference/mapping-schema.md`).
 - Route `when` blocks statically (`description_all` / `description_none` /
@@ -119,6 +174,19 @@ Copy `templates/mapping.bcrp.example.json` as the skeleton and edit:
   default + `SECRET:`-prefixed description.
 - Guess-grade decisions (enums, action verbs) go into `notes_markdown` as
   operator checkmarks. Mark them honestly; do not fabricate confidence.
+- Model prerequisite flows explicitly and topologically before dependent
+  cases. Examples include create-challenge, device binding,
+  registration/onboarding, credential-block creation, and response bridges
+  needed before balance enquiry, send-money, collect, or mandate calls. Add
+  only prerequisites proven by current spec/code/TSD evidence.
+- Put platform-toggle SET/RESET calls in `00 - Test configuration`, and list
+  every external-simulator requirement in NOTES.
+
+The current builder renders CSV-derived requests and does not yet provide a
+generic first-class prerequisite DAG. If independent setup/cleanup requests
+cannot be represented without pretending they are testcase rows, mark the
+build blocked and extend the mapping schema, builder, and auditor first. Never
+hide required API hits only inside opaque pre-request JavaScript.
 
 Read `reference/mapping-schema.md` before writing; it pins the exact contract
 and the review-learned authoring rules (e.g. never emit a conditional-empty
@@ -146,12 +214,28 @@ audits encode past review findings: row coverage, duplicate TC IDs,
 placeholder coverage (env + computed), mandatory-field conformance vs spec
 markdown, `node --check` on every script.
 
+Never edit generated collection or environment JSON manually. Repeat
+`mapping.json -> build_collection.py -> audit_collection.py` until the audit
+prints `AUDIT-PASS` or a family is honestly blocked.
+
 ### 6. Finalize and report
 
 - Fill the operator-TODO section of NOTES.md (values the operator must
   supply, sequencing notes, guess-grade flags).
 - Report: item count, folder count, env-key count, audit line, output paths,
   and the honest-unknowns list.
+- Write `final-result.json` with source/normalized row counts, semantic-family
+  count, rendered testcase count, prerequisite/config request count, blocked
+  testcase IDs and reasons, dependency-kind counts, candidate/fetched spec IDs,
+  collection/environment/mapping/spec/notes paths, and both gates:
+  `static_audit` (`PASS|FAIL`) and `runtime_validation`
+  (`PASS|BLOCKED|NOT_RUN`). Set `complete: true` only after `AUDIT-PASS` with
+  `rendered + explicitly_blocked == normalized_rows`, no missing/ambiguous
+  endpoint for a rendered case, and all required specs present. Because the
+  current auditor does not prove prerequisite DAG/reset coverage, secret-empty
+  defaults, or complete wire semantics, perform and record those supplemental
+  checks before setting `complete: true`. Claim "fully working locally" only
+  when the separate runtime gate is `PASS` with no unclassified failures.
 
 ## Hard rules
 
@@ -165,6 +249,10 @@ markdown, `node --check` on every script.
    family — flag it instead of guessing an endpoint.
 5. **Audit is the ship gate.** No audit, no delivery claim.
 6. Change `mapping.json`, never the generated output, when revising.
+7. Keep this skill offline and non-mutating: no target-repository edits, branch
+   creation, DB/Redis changes, service startup, or live merchant calls.
+8. Use testcase-sheet VPAs and scenario data exactly for request-visible
+   values. Never substitute convenient records discovered in a local DB.
 
 ## Row-oriented devices that already exist
 

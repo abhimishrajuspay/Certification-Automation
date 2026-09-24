@@ -51,3 +51,26 @@ mcp/
 !.opencode/agents/
 !.opencode/commands/
 !.opencode/skills/
+.opencode/context/current-branch.md
+.opencode/context/branches/*.md
+.opencode/context/subagents/
+.opencode/context/task-board.md
+.opencode/context/repo-knowledge.json
+.opencode/context/repo-knowledge.json.lock
+.opencode/index/
+.opencode/tasks/*/out/
+.opencode/tasks/*/worktrees/
+.opencode/logs/
+
+# Local certification inputs and generated validation state
+/out/
+/.pre-commit-config.yaml
+/APISpecs_*
+/*.csv
+/*.xlsx
+/*.postman_collection.json
+/clStore.cache
+/*.rdb
+
+# One-off machine-specific replay harness; not part of the generic skill
+/.opencode/skills/certification-automation/scripts/run_all.sh

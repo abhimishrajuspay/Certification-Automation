@@ -40,7 +40,7 @@
 
   "dependencies": [                                  // rendered as a requirement table in NOTES.md
     {"tc": "MA_CC_RE_8", "kind": "external-simulator", "reason": "Remitter bank sim must withhold RespMandate (timeout)"}
-  ],                                                // kinds: env | bridge | external-simulator | platform-toggle
+  ],                                                // kinds: request | env | bridge | external-simulator | platform-toggle (`request` is normally omitted as the default)
 
   "environment": [                                   // [key, default, description] — secrets stay empty strings
     ["MERCHANT_API_KEY", "", "SECRET: HMAC key — never commit"]
@@ -76,7 +76,13 @@
     JSON-escape backslashes: `\\s`, `\\d`.
   - `"extract": {"ENV_KEY": "json.dotted.path"}` — appends a capture test that
     persists a response field into the environment so later folders can use it
-    (create → lifecycle chains).
+    (create → lifecycle chains). Use the special path `"@text"` to capture the
+    whole response body; when the body itself is a JSON string (e.g.
+    `"NPCI,20150822,2.0|..."`), the parsed string value is captured instead of
+    the quoted JSON text.
+  - `"base_url_var": "CRED_SERVICE_URL"` — emit the request URL on top of a
+    different environment variable than `{{BASE_URL}}` (sidecar services such
+    as a local credBlock service; placeholder must exist in `environment`).
 - **Folders are emitted sorted by name** — always zero-pad prefixes
   ("01..".."11") so runtime order is pinned independent of CSV row order
   (mandate sheets list execution rows before creation rows!).

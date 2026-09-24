@@ -200,10 +200,14 @@ if (needsCredBlock && deviceRawFp && packageName) {
           };
         }
 
-        // When all types are done, set the assembled credBlock variables
+        // When all types are done, set the assembled credBlock variables.
+        // CONTRACT: the template embeds credBlock inside JSON-string quotes
+        // ("credBlock": "{{UPI_CRED_BLOCK}}"), so the variable must carry
+        // BACKSLASH-ESCAPED JSON (no outer quotes) for the wire body to stay
+        // valid JSON. Operator-pasted values must follow the same contract.
         if (completed === credTypes.length) {
           const credBlockJson = JSON.stringify(credBlocks);
-          pm.variables.set("UPI_CRED_BLOCK", credBlockJson);
+          pm.variables.set("UPI_CRED_BLOCK", JSON.stringify(credBlockJson).slice(1, -1));
           const mpinCred = credBlocks.mpincred || credBlocks.newcred;
           if (mpinCred) {
             pm.variables.set("MPIN_CRED_ENCRYPTED_BASE64", mpinCred.data.encryptedBase64String);
@@ -274,15 +278,43 @@ def test_script(
     if extract:
         lines += ["// auto-extraction: make response ids available to later requests"]
         for env_key, path in extract.items():
-            lines += [
+            path_str = str(path)
+            url_encode = False
+            if path_str.endswith("@urlencode"):
+                # capture with percent-encoding applied at CAPTURE time (the
+                # encoded value is what downstream GET query interpolation
+                # expects — e.g. smsContent containing spaces/&/*/() ).
+                url_encode = True
+                path_str = path_str[: -len("@urlencode")]
+            if path_str == "@text":
+                # capture the whole body; when the body IS a JSON string
+                # (e.g. "NPCI,20150822,2.0|..."), capture its parsed value.
+                lines += [
+                    f"pm.test('captures {env_key} when present', function () {{",
+                    "  try {",
+                    "    let value = pm.response.text();",
+                    "    try { const parsed = JSON.parse(value); if (typeof parsed === 'string') value = parsed; } catch (e) {}",
+                    f"    if (value) pm.environment.set({json.dumps(env_key)}, value);",
+                    "  } catch (e) {}",
+                    "});",
+                ]
+                continue
+            block = [
                 f"pm.test('captures {env_key} when present', function () {{",
                 "  try {",
                 "    const parsed = pm.response.json();",
-                f"    const value = {json.dumps(str(path))}.split('.').reduce((acc, part) => acc && acc[part], parsed);",
+                f"    let value = {json.dumps(path_str)}.split('.').reduce((acc, part) => acc && acc[part], parsed);",
+            ]
+            if url_encode:
+                block.append(
+                    "    if (typeof value === 'string') value = encodeURIComponent(value);"
+                )
+            block += [
                 f"    if (value !== undefined && value !== null && value !== '') pm.environment.set({json.dumps(env_key)}, String(value));",
                 "  } catch (e) {}",
                 "});",
             ]
+            lines += block
     lines += [
         "pm.test('response envelope parses as JSON', function () {",
         "  pm.expect(() => pm.response.json()).to.not.throw;",
@@ -349,20 +381,53 @@ def build_request(
     name = (
         f"{row['TC ID']} [{','.join(expected_codes(rc))}] — {row['Description'][:72]}"
     )
+    raw_path = str(template["path"])
+    # endpoints may target a different service (e.g. the local CL cred service)
+    base_url_var = str(template.get("base_url_var") or "BASE_URL")
+    base_ref = "{{" + base_url_var + "}}"
+    url: dict[str, object] = {
+        "raw": base_ref + raw_path,
+        "host": [base_ref],
+    }
+    if "?" in raw_path:
+        path_part, query_part = raw_path.split("?", 1)
+        url["path"] = path_part.lstrip("/").split("/")
+        url["query"] = [
+            {
+                "key": pair.split("=", 1)[0],
+                "value": pair.split("=", 1)[1] if "=" in pair else "",
+            }
+            for pair in query_part.split("&")
+            if pair
+        ]
+    else:
+        url["path"] = raw_path.lstrip("/").split("/")
     request: dict[str, object] = {
         "method": template["method"],
         "header": [
             {"key": key, "value": value, "type": "text"}
             for key, value in (template.get("headers") or {}).items()
         ],
-        "url": {
-            "raw": "{{BASE_URL}}" + template["path"],
-            "host": ["{{BASE_URL}}"],
-            "path": template["path"].lstrip("/").split("/"),
-        },
+        "url": url,
     }
     body = template.get("body")
-    if body is not None:
+    if isinstance(body, str):
+        # raw verbatim body (XML/text payloads, e.g. the NPCI-simulator HBT row):
+        # token resolution across the whole string; no key-level overrides.
+        raw_body = body.replace("__TC_ID__", row["TC ID"]).replace(
+            "__TEST_DATA_AS_VPA__", row["Test Data"].strip() or "{{CUSTOMER_VPA}}"
+        )
+        raw_language = (
+            (template.get("raw_language") or "text")
+            if isinstance(template, dict)
+            else "text"
+        )
+        request["body"] = {
+            "mode": "raw",
+            "raw": raw_body,
+            "options": {"raw": {"language": raw_language}},
+        }
+    elif body is not None:
         resolved = resolve_token(body, row)
         assert isinstance(resolved, dict)
         for key, value in (route.get("body") or {}).items():
